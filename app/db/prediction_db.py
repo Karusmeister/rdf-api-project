@@ -281,6 +281,8 @@ def _init_schema() -> None:
     }
 
     index_defs = [
+        ("idx_companies_pkd",       "CREATE INDEX idx_companies_pkd ON companies(pkd_code)"),
+        ("idx_companies_nip",       "CREATE INDEX idx_companies_nip ON companies(nip)"),
         ("idx_line_items_tag",      "CREATE INDEX idx_line_items_tag ON financial_line_items(tag_path)"),
         ("idx_reports_krs",         "CREATE INDEX idx_reports_krs ON financial_reports(krs)"),
         ("idx_reports_year",        "CREATE INDEX idx_reports_year ON financial_reports(fiscal_year)"),
