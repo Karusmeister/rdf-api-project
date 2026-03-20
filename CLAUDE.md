@@ -1,24 +1,25 @@
-# RDF API Proxy + Bankruptcy Prediction Engine
+# RDF API Project
 
 ## What this is
 
-PoC backend proxy for Repozytorium Dokumentow Finansowych (rdf-przegladarka.ms.gov.pl).
-FastAPI service that handles KRS encryption, proxies requests to the government API,
-scrapes financial statements, and runs bankruptcy prediction models.
+FastAPI service around Repozytorium Dokumentow Finansowych (`rdf-przegladarka.ms.gov.pl`).
+The repository currently contains:
 
-## Key context files - READ THESE FIRST
+- RDF proxy endpoints for entity lookup, document search, metadata, and ZIP download
+- Financial statement analysis endpoints
+- A bulk scraper that stores data in DuckDB and on local disk
+- ETL and feature-engineering building blocks for a prediction pipeline
 
-- `docs/RDF_API_DOCUMENTATION.md` - Full upstream API docs (endpoints, payloads, responses)
-- `docs/AGENT_INSTRUCTIONS.md` - Step-by-step build guide with architecture decisions
-- `docs/LOVABLE_UI_SPEC.md` - Frontend spec (for understanding what the API serves)
-- `docs/PREDICTION_SCHEMA_DESIGN.md` - Database schema for the prediction engine (5 layers: entities, financial data, features, models, predictions)
-- `docs/SCRAPER_ARCHITECTURE.md` - Scraper design and DuckDB schema
+## Key context files - read these first
+
+- `README.md` - current project overview, setup, architecture, and API summary
+- `docs/RDF_API_DOCUMENTATION.md` - reverse-engineered upstream RDF API contract
+- `docs/PREDICTION_SCHEMA_DESIGN.md` - detailed prediction schema and lineage design
 
 ## Tech stack
 
 - Python 3.12, FastAPI, uvicorn, httpx (async), pycryptodome, pydantic v2
 - DuckDB for all persistence (scraper + prediction tables in same DB file)
-- scikit-learn, xgboost, optuna for ML models
 - NO requests library - everything async with httpx
 - NO manual threading - use async + uvicorn --workers
 - NO PostgreSQL - DuckDB only
@@ -26,7 +27,7 @@ scrapes financial statements, and runs bankruptcy prediction models.
 ## Critical: KRS encryption
 
 The `/dokumenty/wyszukiwanie` endpoint requires AES-128-CBC encrypted KRS token.
-Full algorithm is in `docs/RDF_API_DOCUMENTATION.md` section 3 and `docs/AGENT_INSTRUCTIONS.md` step 3.
+Full algorithm is in `docs/RDF_API_DOCUMENTATION.md` and implemented in `app/crypto.py`.
 Short version:
 
 ```
@@ -55,30 +56,21 @@ app/
       schemas.py       - Pydantic models for analysis
     scraper/
       routes.py        - /api/scraper/* (status dashboard)
-    assess/
-      routes.py        - /api/assess/* (prediction orchestration - see below)
+    etl/
+      routes.py        - /api/etl/ingest
   services/
     xml_parser.py      - e-Sprawozdanie XML parser (~1300 TAG_LABELS for Bilans, RZiS, CF)
     etl.py             - XML-to-DuckDB ingestion pipeline
     feature_engine.py  - Computes financial ratios from line items
-    scoring.py         - Generic model scoring service
-    training_data.py   - Assembles wide-format training datasets
-    assessment_pipeline.py - Async orchestrator (download -> parse -> compute -> score)
   db/
     connection.py      - Shared DuckDB connection manager (single lifecycle)
     prediction_db.py   - DuckDB schema init + CRUD for prediction tables
-  models/
-    maczynska.py       - Maczynska MDA discriminant model (baseline)
-    random_forest.py   - sklearn RandomForest pipeline
-    xgboost_model.py   - XGBoost with Optuna tuning + SHAP
   scraper/
     db.py              - DuckDB schema + CRUD for scraper tables (existing)
     job.py             - Scraper job logic
     storage.py         - Document storage abstraction
 scripts/
   seed_features.py     - Populate feature_definitions and feature_sets
-  train_rf.py          - Train Random Forest model
-  train_xgboost.py     - Train XGBoost model
 tests/
   test_crypto.py
   test_endpoints.py
@@ -87,7 +79,7 @@ tests/
   test_storage.py
 data/
   scraper.duckdb       - Single DuckDB file for ALL tables (scraper + prediction)
-  models/              - Serialized model artifacts (.pkl, .json)
+  documents/           - Extracted RDF files + manifest.json
 ```
 
 ## Database: DuckDB tables
@@ -109,13 +101,13 @@ Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
 - `financial_reports` - One row per ingested statement. Links to krs_documents.
 - `raw_financial_data` - JSON per section (balance_sheet, income_statement, cash_flow).
 - `financial_line_items` - THE WORKHORSE. Flattened tag/value pairs. PK = (report_id, section, tag_path).
-  - tag_path uses dot notation matching TAG_LABELS: 'Bilans.Aktywa.A.I', 'RZiS.A'
+  - tag_path examples: `Aktywa`, `Pasywa_A`, `RZiS.A`, `CF.D`
 
 **Layer 3 - Features:**
 - `feature_definitions` - Feature metadata (formula, required tags). PK = short code ('roa', 'current_ratio').
 - `feature_sets` - Named groups ('maczynska_6', 'basic_20').
 - `feature_set_members` - Many-to-many with ordinal.
-- `computed_features` - Cached feature values (EAV pattern). PK = (report_id, feature_definition_id, version).
+- `computed_features` - Cached feature values (EAV pattern). PK = (report_id, feature_definition_id, computation_version).
 
 **Layer 4 - Models & Predictions:**
 - `model_registry` - Trained model metadata + artifact paths.
@@ -142,20 +134,12 @@ One shared DuckDB connection managed by `app/db/connection.py`:
 ### XML parsing
 `app/services/xml_parser.py` has ~1300 TAG_LABELS mapping XML tags to Polish labels.
 It parses e-Sprawozdania into hierarchical trees with kwota_a (current) and kwota_b (previous).
-The ETL flattens these trees into financial_line_items using dot-notation tag_paths.
+The ETL flattens these trees into financial_line_items using tag paths such as `Aktywa`, `Pasywa_A`, `RZiS.A`, and `CF.D`.
 
 ### Feature computation
 Features are defined as metadata rows in feature_definitions, not hardcoded columns.
 Adding a new feature = INSERT into feature_definitions + re-run compute. No schema changes.
 computation_logic types: 'ratio' (num/denom), 'difference', 'raw_value', 'custom' (Python function).
-
-### Async assessment pipeline
-The main UI integration point is `POST /api/assess/{krs}`:
-1. Check if predictions exist (cached) -> return immediately
-2. If not, create assessment_job, kick off background pipeline via asyncio.create_task()
-3. UI polls `GET /api/assess/status/{job_id}` for progress
-4. Pipeline stages: downloading -> parsing -> computing_features -> scoring -> completed
-5. When done, `GET /api/assess/{krs}/details` returns full prediction profile
 
 ## Commands
 
@@ -177,10 +161,6 @@ pytest tests/test_crypto.py -v
 
 # Seed feature definitions
 python scripts/seed_features.py
-
-# Train models
-python scripts/train_rf.py
-python scripts/train_xgboost.py
 ```
 
 ## API endpoints
@@ -190,7 +170,7 @@ python scripts/train_xgboost.py
 |--------|------|----------|-------|
 | POST | /api/podmiot/lookup | dane-podstawowe | Plain KRS |
 | POST | /api/podmiot/document-types | rodzajeDokWyszukiwanie | Plain KRS |
-| POST | /api/dokumenty/search | wyszukiwanie | ENCRYPTED KRS |
+| POST | /api/dokumenty/search | wyszukiwanie | Client sends plain KRS; service encrypts internally |
 | GET | /api/dokumenty/metadata/{id} | dokumenty/{id} | URL-encode Base64 ID |
 | POST | /api/dokumenty/download | dokumenty/tresc | Returns ZIP |
 | GET | /health | - | Simple healthcheck |
@@ -203,23 +183,11 @@ python scripts/train_xgboost.py
 | POST | /api/analysis/time-series | Track fields across years |
 | GET | /api/analysis/available-periods/{krs} | List statement periods |
 
-### Assessment (prediction engine)
+### Scraper + ETL (existing)
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | /api/assess/{krs} | Start assessment or return cached results |
-| GET | /api/assess/status/{job_id} | Poll pipeline progress |
-| GET | /api/assess/{krs}/details | Full prediction profile |
-| POST | /api/predictions/score | Score specific companies with specific model |
-| GET | /api/predictions/{krs} | Latest prediction |
-| GET | /api/predictions/{krs}/history | Prediction history |
+| GET | /api/scraper/status | Aggregate scraper stats + last run |
 | POST | /api/etl/ingest | Trigger document ingestion |
-| GET | /api/training/dataset-stats | Training data quality summary |
-
-## Linear project: Bankruptcy Prediction Engine
-
-All tasks are tracked in Linear under project "Bankruptcy Prediction Engine".
-Execute in dependency order: PKR-5 -> 6 -> 7 -> 8 -> 9 -> 10 -> 11 -> 12 -> 13 -> 14 -> 15 -> 16 -> 17 -> 18 -> 19.
-Each issue has full requirements, acceptance criteria, and explicit depends-on references.
 
 ## Gotchas
 
@@ -231,5 +199,5 @@ Each issue has full requirements, acceptance criteria, and explicit depends-on r
 6. KRS is VARCHAR(10) everywhere - the natural join key across all tables
 7. DuckDB JSON type (not JSONB) - use json_extract() for queries
 8. Feature store uses EAV pattern - pivot to wide format for ML training
-9. Assessment pipeline must be non-blocking - use asyncio.create_task(), never block the API
+9. `STORAGE_BACKEND=gcs` is not implemented yet
 10. Generate fresh encryption token for EVERY search request - never cache

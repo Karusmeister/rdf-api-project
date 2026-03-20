@@ -338,7 +338,7 @@ class TestScraperDDL:
         assert "idx_documents_not_downloaded" in indexes
 
     def test_all_documented_indexes_exist(self, isolated_db):
-        """All indexes from SCRAPER_ARCHITECTURE.md are present."""
+        """All scraper indexes expected by the implementation are present."""
         conn = db_conn.get_conn()
         indexes = {
             row[0]
