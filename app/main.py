@@ -9,6 +9,7 @@ from app import rdf_client
 from app.config import settings
 from app.routers.rdf import router as rdf_router
 from app.routers.analysis import router as analysis_router
+from app.routers.scraper import router as scraper_router
 
 
 @asynccontextmanager
@@ -30,6 +31,7 @@ app.add_middleware(
 
 app.include_router(rdf_router)
 app.include_router(analysis_router)
+app.include_router(scraper_router)
 
 
 @app.exception_handler(httpx.HTTPStatusError)

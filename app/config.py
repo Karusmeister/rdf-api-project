@@ -15,5 +15,23 @@ class Settings(BaseSettings):
     cors_origins: List[str] = ["*"]
     workers: int = 4
 
+    # --- Scraper ---
+    scraper_db_path: str = "data/scraper.duckdb"
+
+    # Storage
+    storage_backend: str = "local"           # 'local' or 'gcs'
+    storage_local_path: str = "data/documents"
+    storage_gcs_bucket: str = ""
+    storage_gcs_prefix: str = "krs/"
+
+    # Scraper behavior
+    scraper_order_strategy: str = "priority_then_oldest"
+    scraper_delay_between_krs: float = 2.0
+    scraper_delay_between_requests: float = 0.5
+    scraper_max_krs_per_run: int = 0          # 0 = unlimited
+    scraper_max_errors_before_skip: int = 3
+    scraper_error_backoff_hours: int = 24
+    scraper_download_timeout: int = 60
+
 
 settings = Settings()
