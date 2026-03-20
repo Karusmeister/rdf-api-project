@@ -43,6 +43,8 @@ Configured via env var:
 SCRAPER_DB_PATH=data/scraper.duckdb    # local default
 ```
 
+This is the shared DuckDB file for both scraper tables and prediction/ETL tables. The project uses one physical database file and one shared connection lifecycle, not separate databases per subsystem.
+
 ### Schema
 
 ```sql
@@ -79,7 +81,7 @@ CREATE TABLE krs_registry (
 -- ============================================================
 CREATE TABLE krs_documents (
     document_id         VARCHAR PRIMARY KEY,       -- Base64 ID from RDF API
-    krs                 VARCHAR(10) NOT NULL,      -- FK to krs_registry
+    krs                 VARCHAR(10) NOT NULL,      -- logical FK to krs_registry (see note below)
     
     -- Document metadata (from /search response)
     rodzaj              VARCHAR NOT NULL,           -- doc type code: '18', '3', '4', etc.
@@ -110,8 +112,10 @@ CREATE TABLE krs_documents (
     metadata_fetched_at TIMESTAMP,                  -- when we fetched extended metadata
     download_error      VARCHAR,                    -- last download error if any
     
-    -- Referential
-    FOREIGN KEY (krs) REFERENCES krs_registry(krs)
+    -- NOTE: No SQL-level FK to krs_registry. DuckDB FK enforcement blocks
+    -- UPDATE on the parent row when child rows exist (a DuckDB limitation).
+    -- Referential integrity is enforced by application logic: the scraper job
+    -- always upserts krs_registry before inserting documents.
 );
 
 -- ============================================================
@@ -145,7 +149,10 @@ CREATE TABLE scraper_runs (
 CREATE INDEX idx_registry_last_checked ON krs_registry(last_checked_at);
 CREATE INDEX idx_registry_priority ON krs_registry(check_priority DESC, last_checked_at ASC);
 CREATE INDEX idx_documents_krs ON krs_documents(krs);
-CREATE INDEX idx_documents_not_downloaded ON krs_documents(is_downloaded) WHERE is_downloaded = false;
+CREATE INDEX idx_documents_not_downloaded ON krs_documents(is_downloaded);
+-- NOTE: DuckDB does not support partial indexes (WHERE clause). A full index
+-- on is_downloaded is used instead. The column has low cardinality so the
+-- performance tradeoff is negligible.
 CREATE INDEX idx_runs_started ON scraper_runs(started_at DESC);
 ```
 

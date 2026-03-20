@@ -392,7 +392,7 @@ Use this to populate a year-selector in a UI before calling the heavier endpoint
 | `is_ifrs`         | boolean | Always `false` (IFRS excluded) |
 | `filename`        | string  | Original XML filename |
 
-> If multiple filings exist for the same period, only the correction is returned (preferred over the original).
+> If multiple filings exist for the same period, the storage layer keeps all filings. Read paths that need one record per period should prefer the latest correction.
 
 ---
 

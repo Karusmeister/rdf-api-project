@@ -7,6 +7,7 @@
 3. **EAV for features, wide-format via PIVOT for training** - Store flexibly, query efficiently.
 4. **Separate raw from computed** - Raw XML extractions preserved immutably; computed features are reproducible and versioned.
 5. **DuckDB throughout** - Extends the existing scraper DB. Columnar storage is ideal for analytical queries over financial data. No need for a separate PostgreSQL instance.
+6. **Append-only analytical facts** - Source filings, ETL extractions, and computed features are insert-only. Current-state reads come from “latest” views, not destructive overwrites.
 
 ## Relationship to Existing System
 
@@ -21,6 +22,8 @@ The existing DuckDB database (`data/scraper.duckdb`) already has `krs_registry`,
                                                         v
                                                 [Feature Engine] --> [Model Training/Scoring]
 ```
+
+`krs_registry` and `scraper_runs` remain operational control-plane tables for scheduling and monitoring. The append-only requirement applies to analytical source data and derived data, where auditability and reproducibility matter most.
 
 ---
 
@@ -74,10 +77,13 @@ CREATE SEQUENCE IF NOT EXISTS seq_company_identifiers START 1;
 ### Layer 2: Financial Data (Raw + Structured Extraction)
 
 ```sql
--- Metadata for each ingested financial report
--- Links to krs_documents.document_id from the scraper
+-- Metadata for each ingested financial report.
+-- Multiple filings for the same business period are preserved via report_version.
 CREATE TABLE IF NOT EXISTS financial_reports (
-    id              VARCHAR PRIMARY KEY,            -- can reuse krs_documents.document_id
+    id              VARCHAR PRIMARY KEY,            -- source filing id, usually krs_documents.document_id
+    logical_key     VARCHAR NOT NULL,               -- stable business key: krs + source + type + fiscal period
+    report_version  INTEGER NOT NULL DEFAULT 1,     -- 1 = first seen filing, 2+ = corrections/amendments
+    supersedes_report_id VARCHAR,                   -- previous latest filing for the same logical_key
     krs             VARCHAR(10) NOT NULL,
     data_source_id  VARCHAR NOT NULL DEFAULT 'KRS',
     report_type     VARCHAR(20) NOT NULL DEFAULT 'annual',
@@ -90,36 +96,36 @@ CREATE TABLE IF NOT EXISTS financial_reports (
     ingestion_status VARCHAR(20) DEFAULT 'pending', -- pending, processing, completed, failed
     ingestion_error  VARCHAR,
     created_at       TIMESTAMP DEFAULT current_timestamp,
-    UNIQUE(krs, data_source_id, fiscal_year, period_end, report_type)
+    UNIQUE(logical_key, report_version)
 );
 
--- Raw JSON storage - preserves original parsed structure per section
--- DuckDB handles JSON natively with json_extract, json_keys, etc.
+-- Raw JSON storage - one row per report section per ETL extraction_version.
 CREATE TABLE IF NOT EXISTS raw_financial_data (
     report_id       VARCHAR NOT NULL,               -- FK to financial_reports.id
     section         VARCHAR(30) NOT NULL,            -- 'balance_sheet', 'income_statement', 'cash_flow'
+    extraction_version INTEGER NOT NULL DEFAULT 1,   -- ETL/parser reruns append new versions
     data_json       JSON NOT NULL,                   -- full parsed tree as nested dict
     taxonomy_version VARCHAR(50),
     created_at      TIMESTAMP DEFAULT current_timestamp,
-    PRIMARY KEY(report_id, section)
+    PRIMARY KEY(report_id, section, extraction_version)
 );
 
--- Flattened line items - THE WORKHORSE TABLE for feature computation
--- Each row = one financial position from one report
--- Columnar storage in DuckDB makes aggregations across companies/years very fast
+-- Flattened line items - one row per tag per report per extraction_version.
 CREATE TABLE IF NOT EXISTS financial_line_items (
     report_id       VARCHAR NOT NULL,               -- FK to financial_reports.id
     section         VARCHAR(30) NOT NULL,            -- 'Bilans', 'RZiS', 'CF'
     tag_path        VARCHAR(200) NOT NULL,           -- hierarchical: 'Bilans.Aktywa.A.I'
+    extraction_version INTEGER NOT NULL DEFAULT 1,
     label_pl        VARCHAR(500),                    -- Polish label from TAG_LABELS
     value_current   DOUBLE,                          -- kwota_a (current period)
     value_previous  DOUBLE,                          -- kwota_b (previous period)
     currency        VARCHAR(3) DEFAULT 'PLN',
-    PRIMARY KEY(report_id, section, tag_path)
+    PRIMARY KEY(report_id, section, tag_path, extraction_version)
 );
 
 -- Indexes for common query patterns
 CREATE INDEX IF NOT EXISTS idx_line_items_tag ON financial_line_items(tag_path);
+CREATE INDEX IF NOT EXISTS idx_reports_logical ON financial_reports(logical_key, report_version);
 CREATE INDEX IF NOT EXISTS idx_reports_krs ON financial_reports(krs);
 CREATE INDEX IF NOT EXISTS idx_reports_year ON financial_reports(fiscal_year);
 ```
@@ -160,8 +166,8 @@ CREATE TABLE IF NOT EXISTS feature_set_members (
     PRIMARY KEY(feature_set_id, feature_definition_id)
 );
 
--- Computed feature values (EAV pattern - one row per feature per report)
--- This is the CACHE that avoids recomputing ratios every time
+-- Computed feature values (EAV pattern - one row per feature per report per computation_version).
+-- Each record also remembers which extraction_version it was computed from.
 CREATE TABLE IF NOT EXISTS computed_features (
     report_id               VARCHAR NOT NULL,          -- FK to financial_reports.id
     feature_definition_id   VARCHAR NOT NULL,           -- FK to feature_definitions.id
@@ -170,6 +176,7 @@ CREATE TABLE IF NOT EXISTS computed_features (
     value                   DOUBLE,                      -- NULL if computation failed
     is_valid                BOOLEAN DEFAULT true,
     error_message           VARCHAR,                     -- 'division_by_zero', 'missing_tag', etc.
+    source_extraction_version INTEGER NOT NULL DEFAULT 1,
     computation_version     INTEGER DEFAULT 1,
     computed_at             TIMESTAMP DEFAULT current_timestamp,
     PRIMARY KEY(report_id, feature_definition_id, computation_version)
@@ -178,6 +185,51 @@ CREATE TABLE IF NOT EXISTS computed_features (
 CREATE INDEX IF NOT EXISTS idx_features_krs ON computed_features(krs);
 CREATE INDEX IF NOT EXISTS idx_features_year ON computed_features(fiscal_year);
 ```
+
+### Current-state views
+
+```sql
+CREATE OR REPLACE VIEW latest_financial_reports AS
+SELECT *
+FROM (
+    SELECT
+        fr.*,
+        row_number() OVER (
+            PARTITION BY fr.logical_key
+            ORDER BY fr.report_version DESC, fr.created_at DESC
+        ) AS version_rank
+    FROM financial_reports fr
+) ranked
+WHERE version_rank = 1;
+
+CREATE OR REPLACE VIEW latest_financial_line_items AS
+SELECT *
+FROM (
+    SELECT
+        fli.*,
+        row_number() OVER (
+            PARTITION BY fli.report_id, fli.section, fli.tag_path
+            ORDER BY fli.extraction_version DESC
+        ) AS version_rank
+    FROM financial_line_items fli
+) ranked
+WHERE version_rank = 1;
+
+CREATE OR REPLACE VIEW latest_computed_features AS
+SELECT *
+FROM (
+    SELECT
+        cf.*,
+        row_number() OVER (
+            PARTITION BY cf.report_id, cf.feature_definition_id
+            ORDER BY cf.computation_version DESC, cf.computed_at DESC
+        ) AS version_rank
+    FROM computed_features cf
+) ranked
+WHERE version_rank = 1;
+```
+
+These views keep API/query ergonomics simple while preserving the full audit trail in the base tables.
 
 ### Layer 4: Model Registry and Predictions
 

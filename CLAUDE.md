@@ -65,6 +65,7 @@ app/
     training_data.py   - Assembles wide-format training datasets
     assessment_pipeline.py - Async orchestrator (download -> parse -> compute -> score)
   db/
+    connection.py      - Shared DuckDB connection manager (single lifecycle)
     prediction_db.py   - DuckDB schema init + CRUD for prediction tables
   models/
     maczynska.py       - Maczynska MDA discriminant model (baseline)
@@ -129,11 +130,13 @@ Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
 
 ## Key patterns
 
-### DuckDB CRUD pattern
-Follow the existing pattern in `app/scraper/db.py`:
-- Module-level `_conn` singleton
-- `connect()` / `close()` / `get_conn()` functions
-- `_init_schema()` with CREATE TABLE IF NOT EXISTS
+### DuckDB connection pattern
+One shared DuckDB connection managed by `app/db/connection.py`:
+- `app/db/connection.py` owns the connection lifecycle (connect/close/reset)
+- `app/scraper/db.py` and `app/db/prediction_db.py` delegate to the shared connection
+- Each module has `connect()` (ensures schema), `get_conn()` (returns shared conn), `close()` (no-op)
+- `app/main.py` lifespan calls `db_conn.connect()` + both schema inits at startup
+- `db_conn.close()` at shutdown closes the single shared connection
 - Plain SQL with parameterized queries, no ORM
 
 ### XML parsing

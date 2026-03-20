@@ -4,19 +4,22 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import patch
 
 from app.config import settings
+from app.db import connection as db_conn
 from app.scraper import db as scraper_db
 
 
 @pytest.fixture(autouse=True)
 def isolated_db(tmp_path):
-    """Override DB path to a temp file and reset the module-level connection."""
+    """Override DB path to a temp file and reset the shared connection."""
     db_path = str(tmp_path / "test.duckdb")
+    db_conn.reset()
+    scraper_db._schema_initialized = False
     with patch.object(settings, "scraper_db_path", db_path):
-        scraper_db._conn = None
         scraper_db.connect()
         yield
-        scraper_db.close()
-        scraper_db._conn = None
+        db_conn.close()
+    db_conn.reset()
+    scraper_db._schema_initialized = False
 
 
 def test_schema_creation():

@@ -1,41 +1,38 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from typing import Optional
 
 import duckdb
 
-from app.config import settings
+from app.db import connection as shared_conn
 
-_conn: Optional[duckdb.DuckDBPyConnection] = None
+_schema_initialized = False
 
 
 def connect() -> None:
-    """Open DB connection and ensure prediction schema exists. Call once at startup."""
-    global _conn
-    if _conn is not None:
-        return
-    db_path = settings.scraper_db_path
-    if db_path != ":memory:":
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    _conn = duckdb.connect(db_path)
-    _init_schema()
+    """Ensure shared connection is open and prediction schema exists."""
+    shared_conn.connect()
+    _ensure_schema()
 
 
 def close() -> None:
-    """Close DB connection."""
-    global _conn
-    if _conn:
-        _conn.close()
-        _conn = None
+    """No-op. Connection lifecycle is managed by app.db.connection."""
+    pass
 
 
-def get_conn() -> duckdb.DuckDBPyConnection:  # type: ignore[return]
-    if _conn is None:
-        raise RuntimeError("Prediction DB not connected - call connect() first")
-    return _conn
+def get_conn() -> duckdb.DuckDBPyConnection:
+    """Return the shared DuckDB connection."""
+    return shared_conn.get_conn()
+
+
+def _ensure_schema() -> None:
+    global _schema_initialized
+    if _schema_initialized:
+        return
+    _init_schema()
+    _schema_initialized = True
 
 
 def _init_schema() -> None:
@@ -97,6 +94,9 @@ def _init_schema() -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS financial_reports (
             id              VARCHAR PRIMARY KEY,
+            logical_key     VARCHAR NOT NULL,
+            report_version  INTEGER NOT NULL DEFAULT 1,
+            supersedes_report_id VARCHAR,
             krs             VARCHAR(10) NOT NULL,
             data_source_id  VARCHAR NOT NULL DEFAULT 'KRS',
             report_type     VARCHAR(20) NOT NULL DEFAULT 'annual',
@@ -109,7 +109,7 @@ def _init_schema() -> None:
             ingestion_status VARCHAR(20) DEFAULT 'pending',
             ingestion_error  VARCHAR,
             created_at       TIMESTAMP DEFAULT current_timestamp,
-            UNIQUE(krs, data_source_id, fiscal_year, period_end, report_type)
+            UNIQUE(logical_key, report_version)
         )
     """)
 
@@ -117,10 +117,11 @@ def _init_schema() -> None:
         CREATE TABLE IF NOT EXISTS raw_financial_data (
             report_id       VARCHAR NOT NULL,
             section         VARCHAR(30) NOT NULL,
+            extraction_version INTEGER NOT NULL DEFAULT 1,
             data_json       JSON NOT NULL,
             taxonomy_version VARCHAR(50),
             created_at      TIMESTAMP DEFAULT current_timestamp,
-            PRIMARY KEY(report_id, section)
+            PRIMARY KEY(report_id, section, extraction_version)
         )
     """)
 
@@ -129,11 +130,12 @@ def _init_schema() -> None:
             report_id       VARCHAR NOT NULL,
             section         VARCHAR(30) NOT NULL,
             tag_path        VARCHAR(200) NOT NULL,
+            extraction_version INTEGER NOT NULL DEFAULT 1,
             label_pl        VARCHAR(500),
             value_current   DOUBLE,
             value_previous  DOUBLE,
             currency        VARCHAR(3) DEFAULT 'PLN',
-            PRIMARY KEY(report_id, section, tag_path)
+            PRIMARY KEY(report_id, section, tag_path, extraction_version)
         )
     """)
 
@@ -184,6 +186,7 @@ def _init_schema() -> None:
             value                   DOUBLE,
             is_valid                BOOLEAN DEFAULT true,
             error_message           VARCHAR,
+            source_extraction_version INTEGER NOT NULL DEFAULT 1,
             computation_version     INTEGER DEFAULT 1,
             computed_at             TIMESTAMP DEFAULT current_timestamp,
             PRIMARY KEY(report_id, feature_definition_id, computation_version)
@@ -284,6 +287,7 @@ def _init_schema() -> None:
         ("idx_companies_pkd",       "CREATE INDEX idx_companies_pkd ON companies(pkd_code)"),
         ("idx_companies_nip",       "CREATE INDEX idx_companies_nip ON companies(nip)"),
         ("idx_line_items_tag",      "CREATE INDEX idx_line_items_tag ON financial_line_items(tag_path)"),
+        ("idx_reports_logical",     "CREATE INDEX idx_reports_logical ON financial_reports(logical_key, report_version)"),
         ("idx_reports_krs",         "CREATE INDEX idx_reports_krs ON financial_reports(krs)"),
         ("idx_reports_year",        "CREATE INDEX idx_reports_year ON financial_reports(fiscal_year)"),
         ("idx_features_krs",        "CREATE INDEX idx_features_krs ON computed_features(krs)"),
@@ -299,10 +303,143 @@ def _init_schema() -> None:
         if name not in existing:
             conn.execute(sql)
 
+    conn.execute("""
+        CREATE OR REPLACE VIEW latest_financial_reports AS
+        SELECT
+            id,
+            logical_key,
+            report_version,
+            supersedes_report_id,
+            krs,
+            data_source_id,
+            report_type,
+            fiscal_year,
+            period_start,
+            period_end,
+            taxonomy_version,
+            source_document_id,
+            source_file_path,
+            ingestion_status,
+            ingestion_error,
+            created_at
+        FROM (
+            SELECT
+                fr.*,
+                row_number() OVER (
+                    PARTITION BY fr.logical_key
+                    ORDER BY fr.report_version DESC, fr.created_at DESC, fr.id DESC
+                ) AS version_rank
+            FROM financial_reports fr
+        ) ranked
+        WHERE version_rank = 1
+    """)
+
+    conn.execute("""
+        CREATE OR REPLACE VIEW latest_raw_financial_data AS
+        SELECT
+            report_id,
+            section,
+            extraction_version,
+            data_json,
+            taxonomy_version,
+            created_at
+        FROM (
+            SELECT
+                rfd.*,
+                row_number() OVER (
+                    PARTITION BY rfd.report_id, rfd.section
+                    ORDER BY rfd.extraction_version DESC, rfd.created_at DESC
+                ) AS version_rank
+            FROM raw_financial_data rfd
+        ) ranked
+        WHERE version_rank = 1
+    """)
+
+    conn.execute("""
+        CREATE OR REPLACE VIEW latest_financial_line_items AS
+        SELECT
+            report_id,
+            section,
+            tag_path,
+            extraction_version,
+            label_pl,
+            value_current,
+            value_previous,
+            currency
+        FROM (
+            SELECT
+                fli.*,
+                row_number() OVER (
+                    PARTITION BY fli.report_id, fli.section, fli.tag_path
+                    ORDER BY fli.extraction_version DESC
+                ) AS version_rank
+            FROM financial_line_items fli
+        ) ranked
+        WHERE version_rank = 1
+    """)
+
+    conn.execute("""
+        CREATE OR REPLACE VIEW latest_computed_features AS
+        SELECT
+            report_id,
+            feature_definition_id,
+            krs,
+            fiscal_year,
+            value,
+            is_valid,
+            error_message,
+            source_extraction_version,
+            computation_version,
+            computed_at
+        FROM (
+            SELECT
+                cf.*,
+                row_number() OVER (
+                    PARTITION BY cf.report_id, cf.feature_definition_id
+                    ORDER BY cf.computation_version DESC, cf.computed_at DESC
+                ) AS version_rank
+            FROM computed_features cf
+        ) ranked
+        WHERE version_rank = 1
+    """)
+
 
 # ---------------------------------------------------------------------------
 # CRUD helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_logical_report_key(
+    krs: str,
+    data_source_id: str,
+    report_type: str,
+    fiscal_year: int,
+    period_end: str,
+) -> str:
+    return f"{krs}|{data_source_id}|{report_type}|{fiscal_year}|{period_end}"
+
+
+def get_latest_extraction_version(report_id: str) -> int:
+    conn = get_conn()
+    row = conn.execute("""
+        WITH extraction_versions AS (
+            SELECT coalesce(max(extraction_version), 0) AS version
+            FROM raw_financial_data
+            WHERE report_id = ?
+
+            UNION ALL
+
+            SELECT coalesce(max(extraction_version), 0) AS version
+            FROM financial_line_items
+            WHERE report_id = ?
+        )
+        SELECT coalesce(max(version), 0) FROM extraction_versions
+    """, [report_id, report_id]).fetchone()
+    return int(row[0] or 0)
+
+
+def get_next_extraction_version(report_id: str) -> int:
+    return get_latest_extraction_version(report_id) + 1
 
 # --- data_sources ---
 
@@ -366,17 +503,60 @@ def create_financial_report(report_id: str, krs: str, fiscal_year: int, period_s
                              data_source_id: str = "KRS",
                              taxonomy_version: Optional[str] = None,
                              source_document_id: Optional[str] = None,
-                             source_file_path: Optional[str] = None) -> None:
+                             source_file_path: Optional[str] = None) -> Optional[str]:
+    """Create a financial report and preserve correction history.
+
+    Handles three cases:
+    1. Same report_id (retry/re-ingest): refresh mutable ETL status fields in place.
+    2. Different report_id, same business key (correction): insert a new report_version
+       row and keep the earlier filing available for audit/history queries.
+    3. Brand new report: insert report_version = 1.
+
+    Returns the previous latest report_id for the same logical report, if any.
+    """
     conn = get_conn()
     now = datetime.now(timezone.utc)
+    logical_key = _build_logical_report_key(krs, data_source_id, report_type, fiscal_year, period_end)
+
+    existing_by_id = conn.execute("""
+        SELECT id, logical_key, report_version, supersedes_report_id
+        FROM financial_reports
+        WHERE id = ?
+    """, [report_id]).fetchone()
+
+    if existing_by_id is not None:
+        conn.execute("""
+            UPDATE financial_reports
+            SET ingestion_status = 'pending',
+                ingestion_error = NULL,
+                source_file_path = ?,
+                taxonomy_version = ?,
+                source_document_id = coalesce(?, source_document_id)
+            WHERE id = ?
+        """, [source_file_path, taxonomy_version, source_document_id, report_id])
+        return existing_by_id[3]
+
+    previous_latest = conn.execute("""
+        SELECT id, report_version
+        FROM latest_financial_reports
+        WHERE logical_key = ?
+    """, [logical_key]).fetchone()
+
+    superseded_id = previous_latest[0] if previous_latest is not None else None
+    report_version = (int(previous_latest[1]) + 1) if previous_latest is not None else 1
+
     conn.execute("""
         INSERT INTO financial_reports
-            (id, krs, data_source_id, report_type, fiscal_year, period_start, period_end,
-             taxonomy_version, source_document_id, source_file_path, ingestion_status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-        ON CONFLICT (krs, data_source_id, fiscal_year, period_end, report_type) DO NOTHING
-    """, [report_id, krs, data_source_id, report_type, fiscal_year, period_start, period_end,
-          taxonomy_version, source_document_id, source_file_path, now])
+            (id, logical_key, report_version, supersedes_report_id, krs, data_source_id,
+             report_type, fiscal_year, period_start, period_end, taxonomy_version,
+             source_document_id, source_file_path, ingestion_status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        ON CONFLICT (id) DO NOTHING
+    """, [report_id, logical_key, report_version, superseded_id, krs, data_source_id,
+          report_type, fiscal_year, period_start, period_end, taxonomy_version,
+          source_document_id, source_file_path, now])
+
+    return superseded_id
 
 
 def update_report_status(report_id: str, status: str, error: Optional[str] = None) -> None:
@@ -389,58 +569,96 @@ def update_report_status(report_id: str, status: str, error: Optional[str] = Non
 def get_financial_report(report_id: str) -> Optional[dict]:
     conn = get_conn()
     row = conn.execute("""
-        SELECT id, krs, data_source_id, report_type, fiscal_year, period_start, period_end,
+        SELECT id, logical_key, report_version, supersedes_report_id, krs, data_source_id,
+               report_type, fiscal_year, period_start, period_end,
                ingestion_status, ingestion_error, source_document_id
         FROM financial_reports WHERE id = ?
     """, [report_id]).fetchone()
     if row is None:
         return None
-    cols = ["id", "krs", "data_source_id", "report_type", "fiscal_year", "period_start",
-            "period_end", "ingestion_status", "ingestion_error", "source_document_id"]
+    cols = [
+        "id",
+        "logical_key",
+        "report_version",
+        "supersedes_report_id",
+        "krs",
+        "data_source_id",
+        "report_type",
+        "fiscal_year",
+        "period_start",
+        "period_end",
+        "ingestion_status",
+        "ingestion_error",
+        "source_document_id",
+    ]
     return dict(zip(cols, row))
 
 
 def get_reports_for_krs(krs: str) -> list[dict]:
     conn = get_conn()
     rows = conn.execute("""
-        SELECT id, fiscal_year, period_start, period_end, report_type, ingestion_status
-        FROM financial_reports WHERE krs = ? ORDER BY fiscal_year DESC
+        SELECT id, logical_key, report_version, supersedes_report_id,
+               fiscal_year, period_start, period_end, report_type, ingestion_status
+        FROM financial_reports
+        WHERE krs = ?
+        ORDER BY period_end DESC, report_version DESC, created_at DESC
     """, [krs]).fetchall()
-    cols = ["id", "fiscal_year", "period_start", "period_end", "report_type", "ingestion_status"]
+    cols = [
+        "id",
+        "logical_key",
+        "report_version",
+        "supersedes_report_id",
+        "fiscal_year",
+        "period_start",
+        "period_end",
+        "report_type",
+        "ingestion_status",
+    ]
     return [dict(zip(cols, row)) for row in rows]
 
 
 # --- raw_financial_data ---
 
 def upsert_raw_financial_data(report_id: str, section: str, data: dict,
-                               taxonomy_version: Optional[str] = None) -> None:
+                               taxonomy_version: Optional[str] = None,
+                               extraction_version: Optional[int] = None) -> None:
     conn = get_conn()
     now = datetime.now(timezone.utc)
+    if extraction_version is None:
+        extraction_version = get_next_extraction_version(report_id)
     conn.execute("""
-        INSERT INTO raw_financial_data (report_id, section, data_json, taxonomy_version, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT (report_id, section) DO UPDATE SET
-            data_json        = excluded.data_json,
-            taxonomy_version = excluded.taxonomy_version
-    """, [report_id, section, json.dumps(data), taxonomy_version, now])
+        INSERT INTO raw_financial_data
+            (report_id, section, extraction_version, data_json, taxonomy_version, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (report_id, section, extraction_version) DO NOTHING
+    """, [report_id, section, extraction_version, json.dumps(data), taxonomy_version, now])
 
 
 # --- financial_line_items ---
 
-def batch_insert_line_items(items: list[dict]) -> None:
+def batch_insert_line_items(items: list[dict], extraction_version: Optional[int] = None) -> None:
     """Insert line items in bulk. Each dict: report_id, section, tag_path, label_pl, value_current, value_previous, currency."""
+    if not items:
+        return
+
     conn = get_conn()
+    report_ids = {item["report_id"] for item in items}
+    if len(report_ids) != 1:
+        raise ValueError("batch_insert_line_items expects items for a single report_id")
+
+    report_id = next(iter(report_ids))
+    if extraction_version is None:
+        extraction_version = get_next_extraction_version(report_id)
+
     for item in items:
         conn.execute("""
             INSERT INTO financial_line_items
-                (report_id, section, tag_path, label_pl, value_current, value_previous, currency)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (report_id, section, tag_path) DO UPDATE SET
-                label_pl       = excluded.label_pl,
-                value_current  = excluded.value_current,
-                value_previous = excluded.value_previous
+                (report_id, section, tag_path, extraction_version, label_pl, value_current, value_previous, currency)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (report_id, section, tag_path, extraction_version) DO NOTHING
         """, [
             item["report_id"], item["section"], item["tag_path"],
+            extraction_version,
             item.get("label_pl"), item.get("value_current"), item.get("value_previous"),
             item.get("currency", "PLN"),
         ])
@@ -450,15 +668,19 @@ def get_line_items(report_id: str, section: Optional[str] = None) -> list[dict]:
     conn = get_conn()
     if section:
         rows = conn.execute("""
-            SELECT report_id, section, tag_path, label_pl, value_current, value_previous, currency
-            FROM financial_line_items WHERE report_id = ? AND section = ?
+            SELECT report_id, section, tag_path, extraction_version,
+                   label_pl, value_current, value_previous, currency
+            FROM latest_financial_line_items
+            WHERE report_id = ? AND section = ?
         """, [report_id, section]).fetchall()
     else:
         rows = conn.execute("""
-            SELECT report_id, section, tag_path, label_pl, value_current, value_previous, currency
-            FROM financial_line_items WHERE report_id = ?
+            SELECT report_id, section, tag_path, extraction_version,
+                   label_pl, value_current, value_previous, currency
+            FROM latest_financial_line_items
+            WHERE report_id = ?
         """, [report_id]).fetchall()
-    cols = ["report_id", "section", "tag_path", "label_pl", "value_current", "value_previous", "currency"]
+    cols = ["report_id", "section", "tag_path", "extraction_version", "label_pl", "value_current", "value_previous", "currency"]
     return [dict(zip(cols, row)) for row in rows]
 
 
@@ -547,36 +769,86 @@ def get_feature_set_members(set_id: str) -> list[dict]:
 def upsert_computed_feature(report_id: str, feature_definition_id: str, krs: str,
                              fiscal_year: int, value: Optional[float],
                              is_valid: bool = True, error_message: Optional[str] = None,
-                             computation_version: int = 1) -> None:
+                             computation_version: Optional[int] = None,
+                             source_extraction_version: Optional[int] = None) -> None:
     conn = get_conn()
     now = datetime.now(timezone.utc)
+    if computation_version is None:
+        row = conn.execute("""
+            SELECT coalesce(max(computation_version), 0)
+            FROM computed_features
+            WHERE report_id = ? AND feature_definition_id = ?
+        """, [report_id, feature_definition_id]).fetchone()
+        computation_version = int(row[0] or 0) + 1
+
+    if source_extraction_version is None:
+        source_extraction_version = get_latest_extraction_version(report_id)
+
     conn.execute("""
         INSERT INTO computed_features
             (report_id, feature_definition_id, krs, fiscal_year, value,
-             is_valid, error_message, computation_version, computed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (report_id, feature_definition_id, computation_version) DO UPDATE SET
-            value           = excluded.value,
-            is_valid        = excluded.is_valid,
-            error_message   = excluded.error_message,
-            computed_at     = excluded.computed_at
+             is_valid, error_message, source_extraction_version, computation_version, computed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (report_id, feature_definition_id, computation_version) DO NOTHING
     """, [report_id, feature_definition_id, krs, fiscal_year, value,
-          is_valid, error_message, computation_version, now])
+          is_valid, error_message, source_extraction_version, computation_version, now])
+
+
+def get_computed_features_for_report(report_id: str, valid_only: bool = True) -> list[dict]:
+    conn = get_conn()
+    where = "WHERE report_id = ?" if not valid_only else "WHERE report_id = ? AND is_valid = true"
+    rows = conn.execute(f"""
+        SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid,
+               error_message, source_extraction_version, computation_version
+        FROM latest_computed_features
+        {where}
+        ORDER BY feature_definition_id
+    """, [report_id]).fetchall()
+    cols = [
+        "report_id",
+        "feature_definition_id",
+        "krs",
+        "fiscal_year",
+        "value",
+        "is_valid",
+        "error_message",
+        "source_extraction_version",
+        "computation_version",
+    ]
+    return [dict(zip(cols, row)) for row in rows]
 
 
 def get_computed_features(krs: str, fiscal_year: Optional[int] = None) -> list[dict]:
     conn = get_conn()
     if fiscal_year is not None:
         rows = conn.execute("""
-            SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid, error_message
-            FROM computed_features WHERE krs = ? AND fiscal_year = ? AND is_valid = true
+            SELECT cf.report_id, cf.feature_definition_id, cf.krs, cf.fiscal_year, cf.value,
+                   cf.is_valid, cf.error_message, cf.source_extraction_version, cf.computation_version
+            FROM latest_computed_features cf
+            JOIN latest_financial_reports fr ON fr.id = cf.report_id
+            WHERE cf.krs = ? AND cf.fiscal_year = ? AND cf.is_valid = true
+            ORDER BY cf.report_id, cf.feature_definition_id
         """, [krs, fiscal_year]).fetchall()
     else:
         rows = conn.execute("""
-            SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid, error_message
-            FROM computed_features WHERE krs = ? AND is_valid = true
+            SELECT cf.report_id, cf.feature_definition_id, cf.krs, cf.fiscal_year, cf.value,
+                   cf.is_valid, cf.error_message, cf.source_extraction_version, cf.computation_version
+            FROM latest_computed_features cf
+            JOIN latest_financial_reports fr ON fr.id = cf.report_id
+            WHERE cf.krs = ? AND cf.is_valid = true
+            ORDER BY cf.report_id, cf.feature_definition_id
         """, [krs]).fetchall()
-    cols = ["report_id", "feature_definition_id", "krs", "fiscal_year", "value", "is_valid", "error_message"]
+    cols = [
+        "report_id",
+        "feature_definition_id",
+        "krs",
+        "fiscal_year",
+        "value",
+        "is_valid",
+        "error_message",
+        "source_extraction_version",
+        "computation_version",
+    ]
     return [dict(zip(cols, row)) for row in rows]
 
 

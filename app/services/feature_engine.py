@@ -172,6 +172,7 @@ def compute_features_for_report(
     values: dict[str, Optional[float]] = {}
     for item in items:
         values[item["tag_path"]] = item["value_current"]
+    source_extraction_version = max((int(item["extraction_version"]) for item in items), default=0)
 
     # Determine which features to compute
     if feature_set_id:
@@ -197,6 +198,7 @@ def compute_features_for_report(
             value=value,
             is_valid=is_valid,
             error_message=error_msg,
+            source_extraction_version=source_extraction_version,
         )
 
         results[fdef["id"]] = value
@@ -226,20 +228,30 @@ def get_features_for_report(report_id: str) -> dict[str, Optional[float]]:
     if report is None:
         raise ValueError(f"Report {report_id} not found")
 
-    features = prediction_db.get_computed_features(report["krs"], report["fiscal_year"])
+    features = prediction_db.get_computed_features_for_report(report["id"])
     return {f["feature_definition_id"]: f["value"] for f in features}
 
 
 def compute_all_pending() -> dict:
-    """Find reports with no computed features and compute for all."""
+    """Find reports whose latest extraction version has no computed features yet."""
     conn = prediction_db.get_conn()
     rows = conn.execute("""
+        WITH latest_line_items AS (
+            SELECT report_id, max(extraction_version) AS latest_extraction_version
+            FROM financial_line_items
+            GROUP BY report_id
+        ),
+        latest_feature_inputs AS (
+            SELECT report_id, max(source_extraction_version) AS latest_feature_extraction_version
+            FROM computed_features
+            GROUP BY report_id
+        )
         SELECT fr.id
-        FROM financial_reports fr
+        FROM latest_financial_reports fr
+        JOIN latest_line_items lli ON lli.report_id = fr.id
+        LEFT JOIN latest_feature_inputs lfi ON lfi.report_id = fr.id
         WHERE fr.ingestion_status = 'completed'
-          AND fr.id NOT IN (
-              SELECT DISTINCT report_id FROM computed_features
-          )
+          AND coalesce(lfi.latest_feature_extraction_version, 0) < lli.latest_extraction_version
     """).fetchall()
 
     results = {"total": len(rows), "computed": 0, "failed": 0, "errors": []}
@@ -257,7 +269,5 @@ def compute_all_pending() -> dict:
 
 
 def recompute(report_id: str) -> dict:
-    """Invalidate old features and recompute fresh."""
-    conn = prediction_db.get_conn()
-    conn.execute("DELETE FROM computed_features WHERE report_id = ?", [report_id])
+    """Recompute features and append a new computation version."""
     return compute_features_for_report(report_id)

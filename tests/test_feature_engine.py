@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from app.config import settings
+from app.db import connection as db_conn
 from app.db import prediction_db
 from app.scraper import db as scraper_db
 from app.services import feature_engine
@@ -17,18 +18,19 @@ def isolated_db(tmp_path):
     """Set up isolated DuckDB for both scraper and prediction tables."""
     db_path = str(tmp_path / "test.duckdb")
 
-    scraper_db._conn = None
-    prediction_db._conn = None
+    db_conn.reset()
+    scraper_db._schema_initialized = False
+    prediction_db._schema_initialized = False
 
     with patch.object(settings, "scraper_db_path", db_path):
         scraper_db.connect()
         prediction_db.connect()
         yield tmp_path
-        scraper_db.close()
-        prediction_db.close()
+        db_conn.close()
 
-    scraper_db._conn = None
-    prediction_db._conn = None
+    db_conn.reset()
+    scraper_db._schema_initialized = False
+    prediction_db._schema_initialized = False
 
 
 @pytest.fixture
@@ -291,7 +293,7 @@ class TestMissingTags:
 
 
 class TestRecompute:
-    def test_recompute_replaces_values(self, report_with_data):
+    def test_recompute_appends_new_feature_version(self, report_with_data):
         ctx = report_with_data
 
         result1 = feature_engine.compute_features_for_report(ctx["report_id"])
@@ -306,6 +308,12 @@ class TestRecompute:
         result2 = feature_engine.recompute(ctx["report_id"])
         # New ROA = 100000 / 1000000 = 0.1
         assert result2["features"]["roa"] == pytest.approx(0.1, abs=1e-4)
+        conn = prediction_db.get_conn()
+        history_count = conn.execute("""
+            SELECT count(*) FROM computed_features
+            WHERE report_id = ? AND feature_definition_id = 'roa'
+        """, [ctx["report_id"]]).fetchone()[0]
+        assert history_count == 2
 
 
 class TestComputeAllPending:

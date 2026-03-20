@@ -3,19 +3,22 @@ import pytest
 from unittest.mock import patch
 
 from app.config import settings
+from app.db import connection as db_conn
 from app.db import prediction_db as db
 
 
 @pytest.fixture(autouse=True)
 def isolated_db(tmp_path):
-    """Override DB path to a temp file and reset the module-level connection."""
+    """Override DB path to a temp file and reset the shared connection."""
     db_path = str(tmp_path / "test_prediction.duckdb")
+    db_conn.reset()
+    db._schema_initialized = False
     with patch.object(settings, "scraper_db_path", db_path):
-        db._conn = None
         db.connect()
         yield
-        db.close()
-        db._conn = None
+        db_conn.close()
+    db_conn.reset()
+    db._schema_initialized = False
 
 
 # ---------------------------------------------------------------------------
@@ -122,16 +125,40 @@ def test_create_financial_report():
     assert report["ingestion_status"] == "pending"
 
 
-def test_create_financial_report_unique_constraint():
+def test_create_financial_report_correction_preserves_history():
+    """A correction becomes a new report version and preserves the original."""
     db.upsert_company("0000000011")
     db.create_financial_report("rpt-002", "0000000011", 2022, "2022-01-01", "2022-12-31")
-    # Same unique key (krs, data_source_id, fiscal_year, period_end, report_type) -> do nothing
-    db.create_financial_report("rpt-002b", "0000000011", 2022, "2022-01-01", "2022-12-31")
+
+    # Insert child data for the original
+    db.batch_insert_line_items([
+        {"report_id": "rpt-002", "section": "Bilans", "tag_path": "Aktywa",
+         "value_current": 100.0},
+    ])
+
+    # Correction with different ID but same business key
+    superseded = db.create_financial_report("rpt-002b", "0000000011", 2022, "2022-01-01", "2022-12-31")
+    assert superseded == "rpt-002"
+
     conn = db.get_conn()
     count = conn.execute(
         "SELECT count(*) FROM financial_reports WHERE krs = '0000000011'"
     ).fetchone()[0]
-    assert count == 1
+    assert count == 2
+
+    original = db.get_financial_report("rpt-002")
+    assert original is not None
+    assert original["report_version"] == 1
+
+    # Correction becomes the latest version for the same logical report
+    report = db.get_financial_report("rpt-002b")
+    assert report is not None
+    assert report["report_version"] == 2
+    assert report["supersedes_report_id"] == "rpt-002"
+
+    # Original child data is preserved for audit/history
+    items = db.get_line_items("rpt-002")
+    assert len(items) == 1
 
 
 def test_update_report_status():
@@ -215,6 +242,11 @@ def test_line_items_pk_constraint():
     result = db.get_line_items("rpt-010")
     assert len(result) == 1
     assert result[0]["value_current"] == 999.0
+    conn = db.get_conn()
+    history_count = conn.execute(
+        "SELECT count(*) FROM financial_line_items WHERE report_id = 'rpt-010' AND tag_path = 'Bilans.Aktywa'"
+    ).fetchone()[0]
+    assert history_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +328,11 @@ def test_computed_feature_pk_upsert():
     feats = db.get_computed_features("0000000021", 2023)
     assert len(feats) == 1
     assert feats[0]["value"] == pytest.approx(0.18)
+    conn = db.get_conn()
+    history_count = conn.execute(
+        "SELECT count(*) FROM computed_features WHERE report_id = 'rpt-013' AND feature_definition_id = 'roe'"
+    ).fetchone()[0]
+    assert history_count == 2
 
 
 # ---------------------------------------------------------------------------

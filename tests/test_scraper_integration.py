@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.config import settings
+from app.db import connection as db_conn
 from app.scraper import db as scraper_db
 from app.scraper.storage import LocalStorage
 
@@ -27,9 +28,12 @@ def temp_env(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "storage_local_path", str(tmp_path / "documents"))
     monkeypatch.setattr(settings, "scraper_delay_between_krs", 0.0)
     monkeypatch.setattr(settings, "scraper_delay_between_requests", 0.0)
-    scraper_db._conn = None
+    db_conn.reset()
+    scraper_db._schema_initialized = False
     yield tmp_path
-    scraper_db._conn = None
+    db_conn.close()
+    db_conn.reset()
+    scraper_db._schema_initialized = False
 
 
 @pytest.fixture

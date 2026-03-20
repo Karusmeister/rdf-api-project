@@ -10,4 +10,4 @@ dist/
 .claude/
 .vscode/
 
-./data
+data/

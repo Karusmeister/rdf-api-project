@@ -1,40 +1,44 @@
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Optional
 
 import duckdb
 
 from app.config import settings
+from app.db import connection as shared_conn
 
-_conn: Optional[duckdb.DuckDBPyConnection] = None
+_schema_initialized = False
+
+# Backward-compat: tests set ``_conn = None`` to force reconnect.
+# This property-like attribute is kept so existing test code that writes
+# ``scraper_db._conn = None`` continues to work by resetting the shared
+# connection instead.  (Module-level __setattr__ is not possible, so we
+# provide a reset helper that tests should migrate toward.)
 
 
 def connect() -> None:
-    """Open DB connection and ensure schema exists. Call once at startup."""
-    global _conn
-    if _conn is not None:
-        return
-    db_path = settings.scraper_db_path
-    if db_path != ":memory:":
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    _conn = duckdb.connect(db_path)
-    _init_schema()
+    """Ensure shared connection is open and scraper schema exists."""
+    shared_conn.connect()
+    _ensure_schema()
 
 
 def close() -> None:
-    """Close DB connection."""
-    global _conn
-    if _conn:
-        _conn.close()
-        _conn = None
+    """No-op. Connection lifecycle is managed by app.db.connection."""
+    pass
 
 
-def get_conn() -> duckdb.DuckDBPyConnection:  # type: ignore[return]
-    if _conn is None:
-        raise RuntimeError("Scraper DB not connected - call connect() first")
-    return _conn
+def get_conn() -> duckdb.DuckDBPyConnection:
+    """Return the shared DuckDB connection."""
+    return shared_conn.get_conn()
+
+
+def _ensure_schema() -> None:
+    global _schema_initialized
+    if _schema_initialized:
+        return
+    _init_schema()
+    _schema_initialized = True
 
 
 def _init_schema() -> None:
@@ -89,6 +93,11 @@ def _init_schema() -> None:
             discovered_at       TIMESTAMP NOT NULL,
             metadata_fetched_at TIMESTAMP,
             download_error      VARCHAR
+
+            -- NOTE: No FK to krs_registry. DuckDB FK enforcement blocks UPDATE
+            -- on the parent row when child rows exist (a known DuckDB limitation).
+            -- Referential integrity is enforced by application logic instead:
+            -- scraper job always upserts krs_registry before inserting documents.
         )
     """)
 
@@ -125,6 +134,7 @@ def _init_schema() -> None:
         ("idx_registry_last_checked", "CREATE INDEX idx_registry_last_checked ON krs_registry(last_checked_at)"),
         ("idx_registry_priority", "CREATE INDEX idx_registry_priority ON krs_registry(check_priority DESC, last_checked_at ASC)"),
         ("idx_documents_krs", "CREATE INDEX idx_documents_krs ON krs_documents(krs)"),
+        ("idx_documents_not_downloaded", "CREATE INDEX idx_documents_not_downloaded ON krs_documents(is_downloaded)"),
         ("idx_runs_started", "CREATE INDEX idx_runs_started ON scraper_runs(started_at DESC)"),
     ]
 

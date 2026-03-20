@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from app.config import settings
+from app.db import connection as db_conn
 from app.db import prediction_db
 from app.scraper import db as scraper_db
 from app.scraper.storage import LocalStorage
@@ -134,18 +135,19 @@ def isolated_db(tmp_path):
     """Set up isolated DuckDB for both scraper and prediction tables."""
     db_path = str(tmp_path / "test.duckdb")
 
-    scraper_db._conn = None
-    prediction_db._conn = None
+    db_conn.reset()
+    scraper_db._schema_initialized = False
+    prediction_db._schema_initialized = False
 
     with patch.object(settings, "scraper_db_path", db_path):
         scraper_db.connect()
         prediction_db.connect()
         yield tmp_path
-        scraper_db.close()
-        prediction_db.close()
+        db_conn.close()
 
-    scraper_db._conn = None
-    prediction_db._conn = None
+    db_conn.reset()
+    scraper_db._schema_initialized = False
+    prediction_db._schema_initialized = False
 
 
 @pytest.fixture
@@ -163,7 +165,9 @@ def storage_with_xml(isolated_db):
     target.mkdir(parents=True, exist_ok=True)
     (target / "sprawozdanie.xml").write_text(SAMPLE_XML, encoding="utf-8")
 
-    # Register in scraper DB
+    # Register in scraper DB (KRS first due to FK constraint)
+    scraper_db.upsert_krs(krs, "Test Company Sp. z o.o.", "SP_Z_OO", True)
+
     now = datetime.now(timezone.utc)
     scraper_db.get_conn().execute("""
         INSERT INTO krs_documents
@@ -172,8 +176,6 @@ def storage_with_xml(isolated_db):
         VALUES (?, ?, '18', 'NIEUSUNIETY', 'test', '2023-01-01', '2023-12-31',
                 true, ?, ?)
     """, [doc_id, krs, doc_dir, now])
-
-    scraper_db.upsert_krs(krs, "Test Company Sp. z o.o.", "SP_Z_OO", True)
 
     return {"storage": storage, "krs": krs, "document_id": doc_id, "doc_dir": doc_dir}
 
@@ -285,6 +287,7 @@ class TestIngestDocument:
             etl.ingest_document("nonexistent-doc")
 
     def test_ingest_not_downloaded(self, isolated_db):
+        scraper_db.upsert_krs("0000099999", None, None, True)
         now = datetime.now(timezone.utc)
         scraper_db.get_conn().execute("""
             INSERT INTO krs_documents
@@ -297,18 +300,30 @@ class TestIngestDocument:
 
 
 class TestReIngest:
-    def test_re_ingest_replaces_data(self, storage_with_xml):
+    def test_re_ingest_appends_new_extraction_version(self, storage_with_xml):
         ctx = storage_with_xml
         result1 = etl.ingest_document(ctx["document_id"], storage=ctx["storage"])
         count1 = result1["line_items_count"]
+        items1 = prediction_db.get_line_items(ctx["document_id"])
+        version1 = max(i["extraction_version"] for i in items1)
 
         result2 = etl.re_ingest(ctx["document_id"], storage=ctx["storage"])
         assert result2["status"] == "completed"
         assert result2["line_items_count"] == count1
+        items2 = prediction_db.get_line_items(ctx["document_id"])
+        version2 = max(i["extraction_version"] for i in items2)
+        assert version2 == version1 + 1
 
         # Still only one report
         reports = prediction_db.get_reports_for_krs(ctx["krs"])
         assert len(reports) == 1
+        conn = prediction_db.get_conn()
+        history_versions = conn.execute("""
+            SELECT count(DISTINCT extraction_version)
+            FROM financial_line_items
+            WHERE report_id = ?
+        """, [ctx["document_id"]]).fetchone()[0]
+        assert history_versions == 2
 
 
 class TestIngestAllPending:

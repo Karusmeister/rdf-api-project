@@ -92,6 +92,9 @@ def ingest_document(document_id: str, storage: Optional[LocalStorage] = None) ->
 
     Returns dict with report_id and counts.
     """
+    scraper_db.connect()
+    prediction_db.connect()
+
     if storage is None:
         from app.scraper.storage import create_storage
         storage = create_storage()
@@ -166,17 +169,33 @@ def ingest_document(document_id: str, storage: Optional[LocalStorage] = None) ->
         source_file_path=xml_path,
     )
     prediction_db.update_report_status(report_id, "processing")
+    extraction_version = prediction_db.get_next_extraction_version(report_id)
 
     # 6. Store raw JSON per section
     bilans = parsed.get("bilans", {})
     if bilans.get("aktywa") or bilans.get("pasywa"):
-        prediction_db.upsert_raw_financial_data(report_id, "balance_sheet", bilans)
+        prediction_db.upsert_raw_financial_data(
+            report_id,
+            "balance_sheet",
+            bilans,
+            extraction_version=extraction_version,
+        )
 
     if parsed.get("rzis"):
-        prediction_db.upsert_raw_financial_data(report_id, "income_statement", parsed["rzis"])
+        prediction_db.upsert_raw_financial_data(
+            report_id,
+            "income_statement",
+            parsed["rzis"],
+            extraction_version=extraction_version,
+        )
 
     if parsed.get("cash_flow"):
-        prediction_db.upsert_raw_financial_data(report_id, "cash_flow", parsed["cash_flow"])
+        prediction_db.upsert_raw_financial_data(
+            report_id,
+            "cash_flow",
+            parsed["cash_flow"],
+            extraction_version=extraction_version,
+        )
 
     # 7. Flatten into line_items
     line_items = []
@@ -193,7 +212,7 @@ def ingest_document(document_id: str, storage: Optional[LocalStorage] = None) ->
         line_items.extend(_flatten_tree(node, "CF", report_id))
 
     if line_items:
-        prediction_db.batch_insert_line_items(line_items)
+        prediction_db.batch_insert_line_items(line_items, extraction_version=extraction_version)
 
     # 8. Mark completed
     prediction_db.update_report_status(report_id, "completed")
@@ -222,6 +241,9 @@ def ingest_all_pending(storage: Optional[LocalStorage] = None) -> dict:
     Find all downloaded but not-yet-ingested documents, process each.
     Returns summary of results.
     """
+    scraper_db.connect()
+    prediction_db.connect()
+
     if storage is None:
         from app.scraper.storage import create_storage
         storage = create_storage()
@@ -234,6 +256,7 @@ def ingest_all_pending(storage: Optional[LocalStorage] = None) -> dict:
           AND d.document_id NOT IN (
               SELECT fr.source_document_id FROM financial_reports fr
               WHERE fr.source_document_id IS NOT NULL
+                AND fr.ingestion_status = 'completed'
           )
     """).fetchall()
 
@@ -256,13 +279,5 @@ def ingest_all_pending(storage: Optional[LocalStorage] = None) -> dict:
 
 
 def re_ingest(document_id: str, storage: Optional[LocalStorage] = None) -> dict:
-    """Delete existing line items for a document and re-parse from raw XML."""
-    conn = prediction_db.get_conn()
-
-    # Delete existing data for this report
-    conn.execute("DELETE FROM financial_line_items WHERE report_id = ?", [document_id])
-    conn.execute("DELETE FROM raw_financial_data WHERE report_id = ?", [document_id])
-    conn.execute("DELETE FROM computed_features WHERE report_id = ?", [document_id])
-    conn.execute("DELETE FROM financial_reports WHERE id = ?", [document_id])
-
+    """Re-parse a document and append a new extraction version."""
     return ingest_document(document_id, storage=storage)
