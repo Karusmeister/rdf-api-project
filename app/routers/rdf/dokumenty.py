@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
 from app import rdf_client
-from app.schemas import (
+from app.routers.rdf.schemas import (
     DocumentItem,
     DownloadRequest,
     PaginationMeta,
@@ -10,7 +10,7 @@ from app.schemas import (
     SearchResponse,
 )
 
-router = APIRouter(prefix="/api/dokumenty", tags=["dokumenty"])
+router = APIRouter(prefix="/api/dokumenty", tags=["rdf - dokumenty"])
 
 
 @router.post("/search", response_model=SearchResponse)

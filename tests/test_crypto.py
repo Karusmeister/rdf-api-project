@@ -37,18 +37,21 @@ def test_token_is_not_empty():
 
 
 def test_can_decrypt_to_verify_structure():
-    """Decrypt our own token to verify plaintext format."""
+    """Decrypt our own token to verify plaintext format. Time is frozen to avoid
+    an hour-boundary race between encrypt_nrkrs() and the key reconstruction here."""
     from datetime import datetime
+    from unittest.mock import patch
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import unpad
 
     krs = "0000694720"
-    now = datetime.now()
+    frozen_now = datetime(2024, 1, 15, 10, 30, 45)
 
-    token = encrypt_nrkrs(krs)
+    with patch("app.crypto.datetime") as mock_dt:
+        mock_dt.now.return_value = frozen_now
+        token = encrypt_nrkrs(krs)
 
-    # Reconstruct key (same hour)
-    key = now.strftime("%Y-%m-%d-%H").rjust(16, "1").encode("utf-8")
+    key = frozen_now.strftime("%Y-%m-%d-%H").rjust(16, "1").encode("utf-8")
     cipher = AES.new(key, AES.MODE_CBC, iv=key)
     decrypted = unpad(cipher.decrypt(base64.b64decode(token)), AES.block_size)
     plaintext = decrypted.decode("utf-8")

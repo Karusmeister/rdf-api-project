@@ -1,14 +1,14 @@
 from fastapi import APIRouter
 
 from app import rdf_client
-from app.schemas import (
+from app.routers.rdf.schemas import (
     DocumentTypeResponse,
     KrsRequest,
     LookupResponse,
     PodmiotInfo,
 )
 
-router = APIRouter(prefix="/api/podmiot", tags=["podmiot"])
+router = APIRouter(prefix="/api/podmiot", tags=["rdf - podmiot"])
 
 
 @router.post("/lookup", response_model=LookupResponse)

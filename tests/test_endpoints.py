@@ -1,10 +1,61 @@
 """Integration tests for FastAPI endpoints - upstream calls are mocked with httpx."""
 
+import httpx
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+
+# ---------------------------------------------------------------------------
+# Shared helpers for analysis tests
+# ---------------------------------------------------------------------------
+
+_SEARCH_PAGE = {
+    "content": [
+        {
+            "id": "doc-2024",
+            "rodzaj": "18",
+            "status": "NIEUSUNIETY",
+            "statusBezpieczenstwa": None,
+            "nazwa": None,
+            "okresSprawozdawczyPoczatek": "2024-01-01",
+            "okresSprawozdawczyKoniec": "2024-12-31",
+            "dataUsunieciaDokumentu": "",
+        }
+    ],
+    "metadaneWynikow": {
+        "numerStrony": 0,
+        "rozmiarStrony": 100,
+        "liczbaStron": 1,
+        "calkowitaLiczbaObiektow": 1,
+    },
+}
+
+_META = {
+    "czyMSR": False,
+    "czyKorekta": False,
+    "dataDodania": "2025-03-01",
+    "nazwaPliku": "sprawozdanie.zip",
+}
+
+_PARSED_STMT = {
+    "company": {
+        "name": "TEST SP. Z O.O.",
+        "krs": "0000694720",
+        "nip": "1234567890",
+        "pkd": "62.01.Z",
+        "period_start": "2024-01-01",
+        "period_end": "2024-12-31",
+        "date_prepared": "2025-03-01",
+        "schema_type": "JednostkaInna",
+        "rzis_variant": "porownawczy",
+        "cf_method": "posrednia",
+    },
+    "bilans": {"aktywa": None, "pasywa": None},
+    "rzis": [],
+    "cash_flow": [],
+}
 
 
 @pytest.fixture
@@ -131,3 +182,192 @@ async def test_download_returns_zip(client, monkeypatch):
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/zip"
     assert resp.content == fake_zip
+
+
+# ---------------------------------------------------------------------------
+# Transport error handling (CR-004)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_transport_error_returns_502(client, monkeypatch):
+    """httpx.RequestError (timeout, DNS failure, etc.) must surface as 502, not 500."""
+    from app import rdf_client
+
+    async def raise_timeout(krs):
+        req = httpx.Request("POST", "http://upstream/fake")
+        raise httpx.ConnectTimeout("timed out", request=req)
+
+    monkeypatch.setattr(rdf_client, "dane_podstawowe", raise_timeout)
+
+    resp = await client.post("/api/podmiot/lookup", json={"krs": "694720"})
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["detail"] == "Upstream connection error"
+    assert body["error_type"] == "ConnectTimeout"
+
+
+# ---------------------------------------------------------------------------
+# Analysis endpoints (CR-006)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_available_periods(client, monkeypatch):
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    monkeypatch.setattr(rdf_client, "dane_podstawowe", lambda krs: _async(_LOOKUP_DATA))
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(_SEARCH_PAGE))
+    monkeypatch.setattr(rdf_client, "metadata", lambda doc_id: _async(_META))
+
+    resp = await client.get("/api/analysis/available-periods/694720")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["krs"] == "0000694720"
+    assert len(body["periods"]) == 1
+    assert body["periods"][0]["period_end"] == "2024-12-31"
+
+
+@pytest.mark.asyncio
+async def test_available_periods_no_docs(client, monkeypatch):
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    empty_page = {**_SEARCH_PAGE, "content": [], "metadaneWynikow": {**_SEARCH_PAGE["metadaneWynikow"], "calkowitaLiczbaObiektow": 0}}
+    monkeypatch.setattr(rdf_client, "dane_podstawowe", lambda krs: _async(_LOOKUP_DATA))
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(empty_page))
+
+    resp = await client.get("/api/analysis/available-periods/694720")
+    assert resp.status_code == 200
+    assert resp.json()["periods"] == []
+
+
+@pytest.mark.asyncio
+async def test_statement_endpoint(client, monkeypatch):
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(_SEARCH_PAGE))
+    monkeypatch.setattr(rdf_client, "metadata", lambda doc_id: _async(_META))
+    monkeypatch.setattr(rdf_client, "download", lambda doc_ids: _async(b"fake"))
+    monkeypatch.setattr(xml_parser, "extract_xml_from_zip", lambda b: "<fake/>")
+    monkeypatch.setattr(xml_parser, "parse_statement", lambda s: _PARSED_STMT)
+
+    resp = await client.post("/api/analysis/statement", json={"krs": "694720"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["company"]["name"] == "TEST SP. Z O.O."
+
+
+@pytest.mark.asyncio
+async def test_statement_period_not_found(client, monkeypatch):
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(_SEARCH_PAGE))
+    monkeypatch.setattr(rdf_client, "metadata", lambda doc_id: _async(_META))
+
+    resp = await client.post(
+        "/api/analysis/statement",
+        json={"krs": "694720", "period_end": "2020-12-31"},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_compare_endpoint(client, monkeypatch):
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    search_two_pages = {
+        "content": [
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2024", "okresSprawozdawczyKoniec": "2024-12-31"},
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2023", "okresSprawozdawczyKoniec": "2023-12-31",
+             "okresSprawozdawczyPoczatek": "2023-01-01"},
+        ],
+        "metadaneWynikow": {**_SEARCH_PAGE["metadaneWynikow"], "calkowitaLiczbaObiektow": 2},
+    }
+    stmt_2023 = {**_PARSED_STMT, "company": {**_PARSED_STMT["company"], "period_start": "2023-01-01", "period_end": "2023-12-31"}}
+
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(search_two_pages))
+    monkeypatch.setattr(rdf_client, "metadata", lambda doc_id: _async(_META))
+    monkeypatch.setattr(rdf_client, "download", lambda doc_ids: _async(b"fake"))
+    monkeypatch.setattr(xml_parser, "extract_xml_from_zip", lambda b: "<fake/>")
+
+    call_count = {"n": 0}
+    def fake_parse(s):
+        call_count["n"] += 1
+        return _PARSED_STMT if call_count["n"] % 2 == 1 else stmt_2023
+    monkeypatch.setattr(xml_parser, "parse_statement", fake_parse)
+
+    resp = await client.post(
+        "/api/analysis/compare",
+        json={"krs": "694720", "period_end_current": "2024-12-31", "period_end_previous": "2023-12-31"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["current_period"]["end"] == "2024-12-31"
+    assert body["previous_period"]["end"] == "2023-12-31"
+    # Two-statement compare must never include kwota_b data
+    assert body["bilans"] == {"aktywa": None, "pasywa": None}
+
+
+@pytest.mark.asyncio
+async def test_metadata_failure_not_cached(client, monkeypatch):
+    """A transient metadata failure must not poison the cache with an empty list."""
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    call_count = {"n": 0}
+
+    async def flaky_metadata(doc_id):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            req = httpx.Request("GET", "http://upstream/fake")
+            raise httpx.ConnectTimeout("timeout", request=req)
+        return _META
+
+    monkeypatch.setattr(rdf_client, "dane_podstawowe", lambda krs: _async(_LOOKUP_DATA))
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(_SEARCH_PAGE))
+    monkeypatch.setattr(rdf_client, "metadata", flaky_metadata)
+
+    # First call: metadata fails → result not cached
+    resp1 = await client.get("/api/analysis/available-periods/694720")
+    assert resp1.status_code == 200
+    assert resp1.json()["periods"] == []  # doc was skipped due to error
+
+    # Second call: metadata succeeds → full result returned (not the empty cached result)
+    resp2 = await client.get("/api/analysis/available-periods/694720")
+    assert resp2.status_code == 200
+    assert len(resp2.json()["periods"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_LOOKUP_DATA = {
+    "podmiot": {
+        "numerKRS": "0000694720",
+        "nazwaPodmiotu": "TEST SP. Z O.O.",
+        "formaPrawna": "SPÓŁKA Z OGRANICZONĄ ODPOWIEDZIALNOŚCIĄ",
+        "wykreslenie": "",
+    },
+    "czyPodmiotZnaleziony": True,
+    "komunikatBledu": None,
+}
+
+
+async def _async(value):
+    return value

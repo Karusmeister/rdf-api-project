@@ -4,38 +4,15 @@ All XML downloading/parsing happens server-side.
 """
 
 import asyncio
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
 
 from app import rdf_client
+from app.routers.analysis.schemas import CompareRequest, StatementRequest, TimeSeriesRequest
 from app.services import xml_parser
 
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
-
-
-# ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
-
-class StatementRequest(BaseModel):
-    krs: str = Field(..., pattern=r"^\d{1,10}$")
-    period_end: Optional[str] = Field(None, description="YYYY-MM-DD — omit for most recent")
-
-
-class CompareRequest(BaseModel):
-    krs: str = Field(..., pattern=r"^\d{1,10}$")
-    period_end_current: str = Field(..., description="YYYY-MM-DD")
-    period_end_previous: str = Field(..., description="YYYY-MM-DD")
-
-
-class TimeSeriesRequest(BaseModel):
-    krs: str = Field(..., pattern=r"^\d{1,10}$")
-    fields: List[str] = Field(..., min_length=1)
-    period_ends: Optional[List[str]] = Field(
-        None, description="Filter to these period end dates. Omit for all available years."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -46,17 +23,28 @@ async def _get_available_periods(krs: str) -> list[dict]:
     """
     Return available Polish-GAAP financial statement periods for a KRS,
     preferring corrections over originals for the same period.
-    Cached for CACHE_TTL seconds.
+    Paginates through all search pages so companies with > 100 filings are complete.
+    Only caches the result when all metadata calls succeed; transient upstream
+    failures are not persisted as empty/partial period lists.
     """
     cache_key = f"periods:{krs}"
     cached = xml_parser.cache_get(cache_key)
     if cached is not None:
         return cached
 
-    # Fetch all documents (rodzaj 18) — page_size=100 covers almost all companies
-    search_data = await rdf_client.wyszukiwanie(krs, page=0, page_size=100)
+    # Paginate through all search pages
+    all_docs: list[dict] = []
+    page = 0
+    while True:
+        search_data = await rdf_client.wyszukiwanie(krs, page=page, page_size=100)
+        all_docs.extend(search_data["content"])
+        total_pages = search_data["metadaneWynikow"]["liczbaStron"]
+        if page + 1 >= total_pages:
+            break
+        page += 1
+
     docs = [
-        d for d in search_data["content"]
+        d for d in all_docs
         if d["rodzaj"] == "18" and d["status"] == "NIEUSUNIETY"
     ]
 
@@ -69,6 +57,8 @@ async def _get_available_periods(krs: str) -> list[dict]:
         *[rdf_client.metadata(d["id"]) for d in docs],
         return_exceptions=True,
     )
+
+    has_errors = any(isinstance(m, Exception) for m in metas)
 
     period_map: dict[str, dict] = {}
     for doc, meta in zip(docs, metas):
@@ -93,7 +83,10 @@ async def _get_available_periods(krs: str) -> list[dict]:
             }
 
     periods = sorted(period_map.values(), key=lambda x: x["period_end"])
-    xml_parser.cache_set(cache_key, periods)
+    # Only cache when every metadata call succeeded to avoid poisoning the cache
+    # with a partial list caused by transient upstream failures.
+    if not has_errors:
+        xml_parser.cache_set(cache_key, periods)
     return periods
 
 

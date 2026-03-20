@@ -285,29 +285,70 @@ TAG_LABELS: dict[str, str] = {
 
 _cache: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 3600.0
+CACHE_MAX_SIZE = 512
 
 
 def cache_get(key: str) -> Any:
     entry = _cache.get(key)
-    if entry and (time.time() - entry[0]) < CACHE_TTL:
-        return entry[1]
-    return None
+    if entry is None:
+        return None
+    if (time.time() - entry[0]) >= CACHE_TTL:
+        del _cache[key]
+        return None
+    return entry[1]
 
 
 def cache_set(key: str, value: Any) -> None:
-    _cache[key] = (time.time(), value)
+    now = time.time()
+    # Evict all expired entries first
+    expired = [k for k, (ts, _) in _cache.items() if now - ts >= CACHE_TTL]
+    for k in expired:
+        del _cache[k]
+    # If still at capacity, evict the oldest entries
+    if len(_cache) >= CACHE_MAX_SIZE:
+        oldest = sorted(_cache.keys(), key=lambda k: _cache[k][0])
+        for k in oldest[: len(_cache) - CACHE_MAX_SIZE + 1]:
+            del _cache[k]
+    _cache[key] = (now, value)
 
 
 # ---------------------------------------------------------------------------
 # ZIP / XML helpers
 # ---------------------------------------------------------------------------
 
+_STATEMENT_MARKERS = frozenset({"Bilans", "RZiS", "RachPrzeplywow"})
+
+
 def extract_xml_from_zip(zip_bytes: bytes) -> str:
+    """
+    Return the financial statement XML from a ZIP archive.
+    Prefers any XML whose parsed tree contains Bilans, RZiS, or RachPrzeplywow
+    over other XML files (e.g. digital signatures) that may be in the archive.
+    """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        for name in sorted(zf.namelist()):
-            if name.lower().endswith(".xml"):
-                return zf.read(name).decode("utf-8", errors="replace")
-    raise ValueError("No XML file found in ZIP")
+        xml_names = sorted(n for n in zf.namelist() if n.lower().endswith(".xml"))
+        if not xml_names:
+            raise ValueError("No XML file found in ZIP")
+
+        first_content: Optional[str] = None
+        for name in xml_names:
+            content = zf.read(name).decode("utf-8", errors="replace")
+            if first_content is None:
+                first_content = content
+            try:
+                root = ET.fromstring(content)
+                # Strip namespaces from tag names for the marker check
+                def _local(tag: str) -> str:
+                    return tag.split("}", 1)[1] if "}" in tag else tag
+                if any(
+                    _local(el.tag) in _STATEMENT_MARKERS
+                    for el in root.iter()
+                ):
+                    return content
+            except ET.ParseError:
+                continue
+
+        raise ValueError(f"No parseable financial statement XML found in ZIP (files: {xml_names})")
 
 
 def parse_xml_no_ns(xml_string: str) -> ET.Element:
@@ -571,17 +612,23 @@ def node_to_comparison(
     parent_current: Optional[float] = None,
     parent_previous: Optional[float] = None,
     previous_node: Optional[dict] = None,
+    use_kwota_b_fallback: bool = True,
 ) -> dict:
     """
     Convert a FinancialNode to a ComparisonNode.
     If previous_node is provided, uses its kwota_a as the previous value.
-    Otherwise, uses node.kwota_b (embedded comparison column).
+    If use_kwota_b_fallback is True and previous_node is absent, falls back to
+    node.kwota_b (embedded prior-year column) — correct only for single-statement mode.
+    If use_kwota_b_fallback is False and previous_node is absent, previous is None
+    and all derived change/share fields are also None — correct for two-statement mode.
     """
     current = node.get("kwota_a", 0.0)
     if previous_node is not None:
-        previous = previous_node.get("kwota_a", 0.0)
-    else:
+        previous: Optional[float] = previous_node.get("kwota_a", 0.0)
+    elif use_kwota_b_fallback:
         previous = node.get("kwota_b", 0.0)
+    else:
+        previous = None
 
     prev_children_map: dict[str, dict] = {}
     if previous_node:
@@ -592,18 +639,27 @@ def node_to_comparison(
     for child in node.get("children", []):
         prev_child = prev_children_map.get(child["tag"]) if previous_node else None
         children.append(
-            node_to_comparison(child, current, previous, prev_child)
+            node_to_comparison(child, current, previous, prev_child, use_kwota_b_fallback)
         )
+
+    if previous is not None:
+        change_absolute: Optional[float] = round(current - previous, 2)
+        change_percent = _safe_pct(current, previous)
+        share_prev = _safe_share(previous, parent_previous)
+    else:
+        change_absolute = None
+        change_percent = None
+        share_prev = None
 
     return {
         "tag": node["tag"],
         "label": node["label"],
         "current": current,
         "previous": previous,
-        "change_absolute": round(current - previous, 2),
-        "change_percent": _safe_pct(current, previous),
+        "change_absolute": change_absolute,
+        "change_percent": change_percent,
         "share_of_parent_current": _safe_share(current, parent_current),
-        "share_of_parent_previous": _safe_share(previous, parent_previous),
+        "share_of_parent_previous": share_prev,
         "depth": node["depth"],
         "is_w_tym": node["is_w_tym"],
         "children": children,
@@ -617,7 +673,12 @@ def build_comparison(
     """
     Build a full comparison structure from one or two parsed statements.
     If previous_stmt is None, uses kwota_b (embedded column) from current_stmt.
+    If previous_stmt is provided, only that statement's kwota_a is used as the
+    previous value — kwota_b from current_stmt is never read.
     """
+    # Use kwota_b fallback only in single-statement mode
+    use_kwota_b = previous_stmt is None
+
     def _find_node(stmt: dict, tag: str) -> Optional[dict]:
         for section in (stmt["bilans"]["aktywa"], stmt["bilans"]["pasywa"]):
             result = _find_in_tree(section, tag)
@@ -644,30 +705,30 @@ def build_comparison(
                 return result
         return None
 
-    def cmp_tree(node: Optional[dict], section: str) -> Optional[dict]:
+    def cmp_tree(node: Optional[dict]) -> Optional[dict]:
         if node is None:
             return None
         prev_node = None
         if previous_stmt is not None:
             prev_node = _find_node(previous_stmt, node["tag"])
-        return node_to_comparison(node, None, None, prev_node)
+        return node_to_comparison(node, None, None, prev_node, use_kwota_b)
 
-    def cmp_list(nodes: list[dict], prev_stmt: Optional[dict]) -> list[dict]:
+    def cmp_list(nodes: list[dict]) -> list[dict]:
         result = []
         for node in nodes:
             prev_node = None
-            if prev_stmt is not None:
-                prev_node = _find_node(prev_stmt, node["tag"])
-            result.append(node_to_comparison(node, None, None, prev_node))
+            if previous_stmt is not None:
+                prev_node = _find_node(previous_stmt, node["tag"])
+            result.append(node_to_comparison(node, None, None, prev_node, use_kwota_b))
         return result
 
     return {
         "bilans": {
-            "aktywa": cmp_tree(current_stmt["bilans"]["aktywa"], "bilans"),
-            "pasywa": cmp_tree(current_stmt["bilans"]["pasywa"], "bilans"),
+            "aktywa": cmp_tree(current_stmt["bilans"]["aktywa"]),
+            "pasywa": cmp_tree(current_stmt["bilans"]["pasywa"]),
         },
-        "rzis": cmp_list(current_stmt["rzis"], previous_stmt),
-        "cash_flow": cmp_list(current_stmt["cash_flow"], previous_stmt),
+        "rzis": cmp_list(current_stmt["rzis"]),
+        "cash_flow": cmp_list(current_stmt["cash_flow"]),
     }
 
 

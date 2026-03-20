@@ -7,7 +7,8 @@ from fastapi.responses import JSONResponse
 
 from app import rdf_client
 from app.config import settings
-from app.routers import analysis, dokumenty, podmiot
+from app.routers.rdf import router as rdf_router
+from app.routers.analysis import router as analysis_router
 
 
 @asynccontextmanager
@@ -27,9 +28,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(podmiot.router)
-app.include_router(dokumenty.router)
-app.include_router(analysis.router)
+app.include_router(rdf_router)
+app.include_router(analysis_router)
 
 
 @app.exception_handler(httpx.HTTPStatusError)
@@ -40,6 +40,18 @@ async def upstream_error_handler(request: Request, exc: httpx.HTTPStatusError):
             "detail": "Upstream API error",
             "upstream_status": exc.response.status_code,
             "upstream_url": str(exc.request.url),
+        },
+    )
+
+
+@app.exception_handler(httpx.RequestError)
+async def upstream_request_error_handler(request: Request, exc: httpx.RequestError):
+    return JSONResponse(
+        status_code=502,
+        content={
+            "detail": "Upstream connection error",
+            "error_type": type(exc).__name__,
+            "upstream_url": str(exc.request.url) if exc.request else None,
         },
     )
 
