@@ -44,6 +44,7 @@ Decision comments should be short: what was decided, why, and what alternatives 
 - `README.md` - current project overview, setup, architecture, and API summary
 - `docs/RDF_API_DOCUMENTATION.md` - reverse-engineered upstream RDF API contract
 - `docs/PREDICTION_SCHEMA_DESIGN.md` - detailed prediction schema and lineage design
+- `docs/KRS_OPEN_API.md` - official MS KRS Open API reference (endpoints, response structure, GDPR)
 
 ## Tech stack
 
@@ -74,7 +75,12 @@ app/
   main.py              - FastAPI app, lifespan, CORS, exception handlers
   config.py            - pydantic-settings (env vars)
   crypto.py            - encrypt_nrkrs()
-  rdf_client.py        - httpx.AsyncClient wrapper (singleton, created in lifespan)
+  rdf_client.py        - httpx.AsyncClient wrapper for RDF upstream (singleton, created in lifespan)
+  krs_client.py        - Resilient httpx client for KRS Open API (retry, backoff, polite pacing)
+  adapters/
+    base.py            - KrsSourceAdapter Protocol (get_entity, search, health_check)
+    models.py          - KrsEntity, SearchResult, SearchResponse, AdapterHealth
+    registry.py        - Adapter registry keyed by source name
   routers/
     rdf/
       podmiot.py       - /api/podmiot/* (entity lookup)
@@ -112,6 +118,8 @@ tests/
   test_scraper_db.py
   test_scraper_integration.py
   test_storage.py
+  test_krs_client.py       - KRS client retry/backoff tests (respx mocks)
+  test_adapters.py         - Adapter interface + FakeKrsAdapter tests
 data/
   scraper.duckdb       - Single DuckDB file for ALL tables (scraper + prediction)
   documents/           - Extracted RDF files + manifest.json
