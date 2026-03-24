@@ -81,6 +81,8 @@ app/
     base.py            - KrsSourceAdapter Protocol (get_entity, search, health_check)
     models.py          - KrsEntity, SearchResult, SearchResponse, AdapterHealth
     registry.py        - Adapter registry keyed by source name
+    ms_gov.py          - MsGovKrsAdapter — concrete adapter for api-krs.ms.gov.pl
+    exceptions.py      - Common adapter exceptions (AdapterError, EntityNotFoundError, etc.)
   routers/
     rdf/
       podmiot.py       - /api/podmiot/* (entity lookup)
@@ -97,6 +99,10 @@ app/
     xml_parser.py      - e-Sprawozdanie XML parser (~1300 TAG_LABELS for Bilans, RZiS, CF)
     etl.py             - XML-to-DuckDB ingestion pipeline
     feature_engine.py  - Computes financial ratios from line items
+  monitoring/
+    metrics.py         - Per-call metrics ring buffer, record_api_call(), get_stats()
+  repositories/
+    krs_repo.py        - DuckDB CRUD for krs_entities + krs_sync_log tables
   db/
     connection.py      - Shared DuckDB connection manager (single lifecycle)
     prediction_db.py   - DuckDB schema init + CRUD for prediction tables
@@ -120,6 +126,9 @@ tests/
   test_storage.py
   test_krs_client.py       - KRS client retry/backoff tests (respx mocks)
   test_adapters.py         - Adapter interface + FakeKrsAdapter tests
+  test_ms_gov_adapter.py   - MsGovKrsAdapter tests (respx mocks)
+  test_krs_repo.py         - KRS entity repository CRUD tests
+  test_monitoring.py       - Metrics ring buffer + adapter integration tests
 data/
   scraper.duckdb       - Single DuckDB file for ALL tables (scraper + prediction)
   documents/           - Extracted RDF files + manifest.json
@@ -131,6 +140,10 @@ data/
 - `krs_registry` - KRS master list, scraper priority/scheduling
 - `krs_documents` - Documents per KRS, download status, storage paths
 - `scraper_runs` - Scraper run history
+
+### KRS entity tables (app/repositories/krs_repo.py)
+- `krs_entities` - Cached KRS entity data from adapters. PK = krs VARCHAR(10). GDPR: PESEL stays in `raw` JSON only.
+- `krs_sync_log` - Sync run history (started_at, counts, status).
 
 ### Prediction tables (app/db/prediction_db.py)
 Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
@@ -217,6 +230,8 @@ python scripts/seed_features.py
 | GET | /api/dokumenty/metadata/{id} | dokumenty/{id} | URL-encode Base64 ID |
 | POST | /api/dokumenty/download | dokumenty/tresc | Returns ZIP |
 | GET | /health | - | Simple healthcheck |
+| GET | /health/krs | - | KRS adapter health (200 or 503) |
+| GET | /metrics/krs | - | Per-call stats: p50/p95 latency, error rate |
 
 ### Analysis (existing)
 | Method | Path | Notes |
