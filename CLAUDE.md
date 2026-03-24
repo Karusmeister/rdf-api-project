@@ -10,6 +10,35 @@ The repository currently contains:
 - A bulk scraper that stores data in DuckDB and on local disk
 - ETL and feature-engineering building blocks for a prediction pipeline
 
+## Agent autonomy
+
+Agents should operate autonomously without blocking on user approvals. Permissions are pre-configured in `.claude/settings.json` (shared) and `.claude/settings.local.json` (personal).
+
+### Boundaries
+
+- **Stay inside the project folder.** Never read, write, or execute outside `/Users/piotrkraus/piotr/rdf-api-project/` except for the Claude memory directory.
+- **Never delete files** without explicit user request. Use `git mv` for renames, not rm + create.
+- **Never write secrets** (.env, API keys, credentials) to tracked files. `.env` is gitignored; keep it that way.
+- **No force-push, hard-reset, or clean -fd.** These are denied in settings.json.
+- **Commit often, push only when asked.**
+
+### Decision logging
+
+When making non-trivial implementation decisions, document them so the user can review asynchronously:
+
+1. **Issue-specific decisions** (e.g., "chose approach A over B for PKR-12"): add a comment on the Linear issue via MCP (`save_comment`).
+2. **Architectural or cross-cutting decisions** (e.g., "switched from EAV to wide table for X"): save to Claude memory as a `project` type memory file.
+3. **Session progress**: update `project_backlog_state.md` memory at end of session.
+
+Decision comments should be short: what was decided, why, and what alternatives were rejected.
+
+### Session workflow
+
+1. **Start**: read Claude memory + check Linear backlog (via MCP) to orient.
+2. **Plan**: if the task maps to a Linear issue, read the full issue spec with `get_issue`. If multi-step, break into sub-tasks.
+3. **Execute**: implement, test, commit. Log decisions per the rules above.
+4. **Close**: update Linear issue status, update memory, update CLAUDE.md/README if project surface changed.
+
 ## Key context files - read these first
 
 - `README.md` - current project overview, setup, architecture, and API summary
@@ -66,16 +95,22 @@ app/
     connection.py      - Shared DuckDB connection manager (single lifecycle)
     prediction_db.py   - DuckDB schema init + CRUD for prediction tables
   scraper/
+    cli.py             - Scraper CLI (import-krs, import-range, run, status)
     db.py              - DuckDB schema + CRUD for scraper tables (existing)
     job.py             - Scraper job logic
     storage.py         - Document storage abstraction
 scripts/
   seed_features.py     - Populate feature_definitions and feature_sets
 tests/
+  test_code_review_fixes.py
   test_crypto.py
   test_endpoints.py
+  test_etl.py
+  test_feature_engine.py
+  test_pipeline_e2e.py     - requires --e2e flag (hits live RDF)
   test_prediction_db.py
   test_scraper_db.py
+  test_scraper_integration.py
   test_storage.py
 data/
   scraper.duckdb       - Single DuckDB file for ALL tables (scraper + prediction)
@@ -201,3 +236,14 @@ python scripts/seed_features.py
 8. Feature store uses EAV pattern - pivot to wide format for ML training
 9. `STORAGE_BACKEND=gcs` is not implemented yet
 10. Generate fresh encryption token for EVERY search request - never cache
+
+## Keeping docs current
+
+After completing a Linear issue or making structural changes (new files, endpoints, tables, commands), update this file and the Claude memory system before finishing the conversation:
+
+1. **This file (CLAUDE.md):** update project structure, endpoint tables, database tables, commands, or gotchas if any of those changed.
+2. **README.md:** update if user-facing information changed (new endpoints, new CLI commands, new config options).
+3. **Claude memory (`project_backlog_state.md`):** update which Linear issues are done vs in-progress.
+4. **Linear issues:** move completed issues to Done, add implementation notes as comments.
+
+Check the Linear backlog at the start of each session to orient on what's next.
