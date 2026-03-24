@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import rdf_client
+from app import krs_client, rdf_client
 from app.config import settings
 from app.db import connection as db_conn
 from app.db import prediction_db
@@ -22,7 +22,9 @@ async def lifespan(app: FastAPI):
     scraper_db.connect()
     prediction_db.connect()
     await rdf_client.start()
+    await krs_client.start()
     yield
+    await krs_client.stop()
     await rdf_client.stop()
     db_conn.close()
 

@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     cors_origins: List[str] = ["*"]
     workers: int = 4
 
+    # --- KRS Open API ---
+    krs_api_base_url: str = "https://api-krs.ms.gov.pl/api/krs"
+    krs_request_timeout: int = 15
+    krs_max_retries: int = 5
+    krs_request_delay_ms: int = 1500  # polite delay between sequential requests
+
     # --- Scraper ---
     scraper_db_path: str = "data/scraper.duckdb"
 
