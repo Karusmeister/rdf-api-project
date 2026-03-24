@@ -4,6 +4,7 @@ from datetime import date, datetime
 from typing import Optional
 
 import pytest
+from pydantic import ValidationError
 
 from app.adapters.base import KrsSourceAdapter
 from app.adapters.models import (
@@ -181,15 +182,32 @@ async def test_health_check(fake_adapter):
 
 
 def test_krs_entity_model():
-    entity = KrsEntity(krs="0000000001", name="Test Corp", raw={})
+    entity = KrsEntity(krs="1", name="Test Corp", raw={})
     assert entity.krs == "0000000001"
     assert entity.legal_form is None
     assert entity.raw == {}
 
 
 def test_krs_entity_rejects_empty_krs():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         KrsEntity(krs="", name="Test", raw={})
+
+
+@pytest.mark.parametrize("bad_krs", ["abc", "12-34", "12345678901"])
+def test_krs_entity_rejects_non_numeric_or_overlong_krs(bad_krs):
+    with pytest.raises(ValidationError):
+        KrsEntity(krs=bad_krs, name="Test", raw={})
+
+
+def test_search_result_normalizes_krs():
+    result = SearchResult(krs="42", name="Test")
+    assert result.krs == "0000000042"
+
+
+@pytest.mark.parametrize("bad_krs", ["abc", "12345678901"])
+def test_search_result_rejects_invalid_krs(bad_krs):
+    with pytest.raises(ValidationError):
+        SearchResult(krs=bad_krs, name="Test")
 
 
 def test_adapter_health_model():

@@ -12,7 +12,7 @@ import asyncio
 import logging
 import random
 import time
-from typing import Any, Optional
+from typing import Any, Collection, Optional
 
 import httpx
 
@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 _client: Optional[httpx.AsyncClient] = None
 _last_request_time: float = 0.0
+_rate_limit_lock: Optional[asyncio.Lock] = None
+_rate_limit_lock_loop: Optional[asyncio.AbstractEventLoop] = None
 
 _BASE_URL = settings.krs_api_base_url
 _TIMEOUT = settings.krs_request_timeout
@@ -38,7 +40,7 @@ _HEADERS = {
 
 async def start() -> None:
     """Create the shared httpx.AsyncClient. Call once at app startup."""
-    global _client
+    global _client, _last_request_time, _rate_limit_lock, _rate_limit_lock_loop
     _client = httpx.AsyncClient(
         base_url=_BASE_URL,
         headers=_HEADERS,
@@ -46,14 +48,20 @@ async def start() -> None:
         limits=httpx.Limits(max_connections=10),
         follow_redirects=True,
     )
+    _last_request_time = 0.0
+    _rate_limit_lock = None
+    _rate_limit_lock_loop = None
 
 
 async def stop() -> None:
     """Close the shared client. Call once at app shutdown."""
-    global _client
+    global _client, _last_request_time, _rate_limit_lock, _rate_limit_lock_loop
     if _client is not None:
         await _client.aclose()
         _client = None
+    _last_request_time = 0.0
+    _rate_limit_lock = None
+    _rate_limit_lock_loop = None
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -62,14 +70,27 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+def _get_rate_limit_lock() -> asyncio.Lock:
+    global _rate_limit_lock, _rate_limit_lock_loop
+    loop = asyncio.get_running_loop()
+    if _rate_limit_lock is None or _rate_limit_lock_loop is not loop:
+        _rate_limit_lock = asyncio.Lock()
+        _rate_limit_lock_loop = loop
+    return _rate_limit_lock
+
+
 async def _polite_wait() -> None:
-    """Wait until at least _DELAY_S has passed since the last request."""
+    """Reserve a request slot so concurrent callers stay spaced apart."""
     global _last_request_time
-    if _last_request_time > 0:
-        elapsed = time.monotonic() - _last_request_time
-        remaining = _DELAY_S - elapsed
-        if remaining > 0:
-            await asyncio.sleep(remaining)
+
+    async with _get_rate_limit_lock():
+        now = time.monotonic()
+        send_at = max(now, _last_request_time + _DELAY_S)
+        _last_request_time = send_at
+
+    remaining = send_at - time.monotonic()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
 
 
 async def request(
@@ -77,6 +98,7 @@ async def request(
     path: str,
     *,
     params: Optional[dict[str, Any]] = None,
+    allowed_statuses: Optional[Collection[int]] = None,
 ) -> httpx.Response:
     """Make an HTTP request with retry, backoff, and structured logging.
 
@@ -84,12 +106,12 @@ async def request(
     Emits a structured log line for every attempt.
 
     Returns the httpx.Response on success.
-    Raises httpx.HTTPStatusError for non-retryable 4xx errors.
+    Raises httpx.HTTPStatusError for 4xx errors unless explicitly allowed.
     Raises httpx.RequestError if all retries are exhausted on connection errors.
     """
-    global _last_request_time
     client = _get_client()
     last_exc: BaseException | None = None
+    allowed = set(allowed_statuses or ())
 
     for attempt in range(1, _MAX_RETRIES + 1):
         await _polite_wait()
@@ -98,7 +120,6 @@ async def request(
         try:
             resp = await client.request(method, path, params=params)
             latency_ms = int((time.monotonic() - t0) * 1000)
-            _last_request_time = time.monotonic()
 
             logger.info(
                 "krs_api_call",
@@ -132,11 +153,13 @@ async def request(
 
                 resp.raise_for_status()
 
+            if resp.is_client_error and resp.status_code not in allowed:
+                resp.raise_for_status()
+
             return resp
 
         except httpx.RequestError as exc:
             latency_ms = int((time.monotonic() - t0) * 1000)
-            _last_request_time = time.monotonic()
             last_exc = exc
 
             logger.warning(
@@ -169,10 +192,18 @@ def _backoff_delay(attempt: int) -> float:
 
 
 async def get(
-    path: str, *, params: Optional[dict[str, Any]] = None
+    path: str,
+    *,
+    params: Optional[dict[str, Any]] = None,
+    allowed_statuses: Optional[Collection[int]] = None,
 ) -> httpx.Response:
     """Shorthand for GET requests."""
-    return await request("GET", path, params=params)
+    return await request(
+        "GET",
+        path,
+        params=params,
+        allowed_statuses=allowed_statuses,
+    )
 
 
 async def health_check() -> dict[str, Any]:
@@ -186,6 +217,7 @@ async def health_check() -> dict[str, Any]:
         resp = await get(
             "/OdpisAktualny/0000000001",
             params={"rejestr": "P", "format": "json"},
+            allowed_statuses={404},
         )
         latency_ms = int((time.monotonic() - t0) * 1000)
         # 200 or 404 both mean the API is reachable

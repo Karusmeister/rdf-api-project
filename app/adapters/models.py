@@ -1,15 +1,32 @@
 """Shared Pydantic models for KRS source adapters."""
 
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
+
+
+def _normalize_krs(value: Any) -> Any:
+    if isinstance(value, int):
+        value = str(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if value.isdigit():
+            return value.zfill(10)
+    return value
+
+
+KrsNumber = Annotated[
+    str,
+    BeforeValidator(_normalize_krs),
+    Field(pattern=r"^\d{10}$", description="Zero-padded 10-digit KRS number"),
+]
 
 
 class KrsEntity(BaseModel):
     """Canonical representation of a KRS-registered entity."""
 
-    krs: str = Field(..., min_length=1, max_length=10, description="KRS number (up to 10 digits)")
+    krs: KrsNumber
     name: str
     legal_form: Optional[str] = None
     status: Optional[str] = None
@@ -26,7 +43,7 @@ class KrsEntity(BaseModel):
 class SearchResult(BaseModel):
     """A single hit from a search query."""
 
-    krs: str
+    krs: KrsNumber
     name: str
     legal_form: Optional[str] = None
     registered_at: Optional[date] = None

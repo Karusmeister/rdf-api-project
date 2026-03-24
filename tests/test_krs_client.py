@@ -1,6 +1,7 @@
 """Tests for app.krs_client — resilient async HTTP client for KRS Open API."""
 
 import asyncio
+import time
 
 import httpx
 import pytest
@@ -17,6 +18,8 @@ async def _setup_client(monkeypatch):
     monkeypatch.setattr(krs_client, "_MAX_RETRIES", 3)
     monkeypatch.setattr(krs_client, "_BASE_URL", "https://api-krs.ms.gov.pl/api/krs")
     monkeypatch.setattr(krs_client, "_last_request_time", 0.0)
+    monkeypatch.setattr(krs_client, "_rate_limit_lock", None)
+    monkeypatch.setattr(krs_client, "_rate_limit_lock_loop", None)
 
     krs_client._client = httpx.AsyncClient(
         base_url="https://api-krs.ms.gov.pl/api/krs",
@@ -65,9 +68,27 @@ async def test_404_not_retried():
     resp = await krs_client.get(
         "/OdpisAktualny/9999999999",
         params={"rejestr": "P", "format": "json"},
+        allowed_statuses={404},
     )
     assert resp.status_code == 404
     assert route.call_count == 1
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403])
+@respx.mock
+@pytest.mark.asyncio
+async def test_non_retryable_4xx_raises(status_code):
+    respx.get("https://api-krs.ms.gov.pl/api/krs/OdpisAktualny/0000694720").mock(
+        return_value=httpx.Response(status_code, json={"status": status_code})
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await krs_client.get(
+            "/OdpisAktualny/0000694720",
+            params={"rejestr": "P", "format": "json"},
+        )
+
+    assert exc_info.value.response.status_code == status_code
 
 
 @respx.mock
@@ -186,6 +207,39 @@ async def test_health_check_down(monkeypatch):
     result = await krs_client.health_check()
     assert result["ok"] is False
     assert result["source"] == "krs_open_api"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_concurrent_requests_are_paced(monkeypatch):
+    monkeypatch.setattr(krs_client, "_DELAY_S", 0.05)
+
+    call_times: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_times.append(time.monotonic())
+        return httpx.Response(200, json=SAMPLE_RESPONSE)
+
+    respx.get("https://api-krs.ms.gov.pl/api/krs/OdpisAktualny/0000694720").mock(
+        side_effect=handler
+    )
+
+    responses = await asyncio.gather(
+        *(
+            krs_client.get(
+                "/OdpisAktualny/0000694720",
+                params={"rejestr": "P", "format": "json"},
+            )
+            for _ in range(3)
+        )
+    )
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert len(call_times) == 3
+
+    call_times.sort()
+    assert call_times[1] - call_times[0] >= 0.04
+    assert call_times[2] - call_times[1] >= 0.04
 
 
 def test_backoff_delay_increases():
