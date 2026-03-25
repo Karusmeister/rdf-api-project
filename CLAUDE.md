@@ -83,6 +83,8 @@ app/
     registry.py        - Adapter registry keyed by source name
     ms_gov.py          - MsGovKrsAdapter — concrete adapter for api-krs.ms.gov.pl
     exceptions.py      - Common adapter exceptions (AdapterError, EntityNotFoundError, etc.)
+  jobs/
+    krs_sync.py        - Scheduled KRS entity sync job (discovery + re-enrichment)
   routers/
     rdf/
       podmiot.py       - /api/podmiot/* (entity lookup)
@@ -93,6 +95,8 @@ app/
       schemas.py       - Pydantic models for analysis
     scraper/
       routes.py        - /api/scraper/* (status dashboard)
+    jobs/
+      routes.py        - /jobs/krs-sync/* (status, trigger)
     etl/
       routes.py        - /api/etl/ingest
   services/
@@ -129,6 +133,7 @@ tests/
   test_ms_gov_adapter.py   - MsGovKrsAdapter tests (respx mocks)
   test_krs_repo.py         - KRS entity repository CRUD tests
   test_monitoring.py       - Metrics ring buffer + adapter integration tests
+  test_krs_pipeline.py     - KRS sync pipeline integration tests (respx mocks)
 data/
   scraper.duckdb       - Single DuckDB file for ALL tables (scraper + prediction)
   documents/           - Extracted RDF files + manifest.json
@@ -246,6 +251,12 @@ python scripts/seed_features.py
 |--------|------|-------|
 | GET | /api/scraper/status | Aggregate scraper stats + last run |
 | POST | /api/etl/ingest | Trigger document ingestion |
+
+### KRS sync job
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | /jobs/krs-sync/status | Last sync run summary (time, counts, errors) |
+| POST | /jobs/krs-sync/trigger | Queue a sync run (202 accepted, 409 if already running) |
 
 ## Gotchas
 

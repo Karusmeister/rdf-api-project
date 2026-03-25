@@ -10,3 +10,4 @@ duckdb>=1.2
 aiofiles>=24.1
 click>=8.1
 respx>=0.22
+apscheduler>=3.10,<4

@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     krs_max_retries: int = 5
     krs_request_delay_ms: int = 1500  # polite delay between sequential requests
 
+    # --- KRS Sync Job ---
+    krs_sync_cron: str = "0 3 * * *"  # default 3am daily
+    krs_sync_batch_size: int = 100     # max entities per run
+    krs_sync_stale_hours: int = 168    # re-sync entities older than 7 days
+
     # --- Scraper ---
     scraper_db_path: str = "data/scraper.duckdb"
 

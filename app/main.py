@@ -3,6 +3,8 @@ import time
 from contextlib import asynccontextmanager
 
 import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -14,6 +16,7 @@ from app.adapters.registry import register as register_adapter
 from app.config import settings
 from app.db import connection as db_conn
 from app.db import prediction_db
+from app.jobs import krs_sync
 from app.logging_config import configure_logging
 from app.monitoring import metrics
 from app.repositories import krs_repo
@@ -22,6 +25,7 @@ from app.routers.rdf import router as rdf_router
 from app.routers.analysis import router as analysis_router
 from app.routers.scraper import router as scraper_router
 from app.routers.etl.routes import router as etl_router
+from app.routers.jobs.routes import router as jobs_router
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +41,25 @@ async def lifespan(app: FastAPI):
     await rdf_client.start()
     await krs_client.start()
     register_adapter("ms_gov", MsGovKrsAdapter())
+
+    # Start KRS sync scheduler
+    scheduler = AsyncIOScheduler()
+    cron_expr = settings.krs_sync_cron
+    try:
+        trigger = CronTrigger.from_crontab(cron_expr)
+        scheduler.add_job(krs_sync.run_sync, trigger, id="krs_sync", replace_existing=True)
+        scheduler.start()
+        logger.info("scheduler_started", extra={
+            "event": "scheduler_started", "krs_sync_cron": cron_expr,
+        })
+    except Exception:
+        logger.exception("scheduler_start_failed", extra={"event": "scheduler_start_failed"})
+
     logger.info("app_ready", extra={"event": "ready"})
     yield
     logger.info("app_shutdown", extra={"event": "shutdown"})
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
     await krs_client.stop()
     await rdf_client.stop()
     db_conn.close()
@@ -91,6 +111,7 @@ app.include_router(rdf_router)
 app.include_router(analysis_router)
 app.include_router(scraper_router)
 app.include_router(etl_router)
+app.include_router(jobs_router)
 
 
 @app.exception_handler(httpx.HTTPStatusError)
