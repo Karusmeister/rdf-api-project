@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     krs_sync_batch_size: int = 100     # max entities per run
     krs_sync_stale_hours: int = 168    # re-sync entities older than 7 days
 
+    # --- KRS Sequential Scanner ---
+    krs_scan_batch_size: int = 500     # probes per run
+    krs_scan_cron: str = "0 1 * * *"  # 1am daily (separate from krs_sync_cron)
+
     # --- Scraper ---
     scraper_db_path: str = "data/scraper.duckdb"
 

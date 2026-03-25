@@ -204,3 +204,73 @@ def test_sync_log_error_status():
     last = krs_repo.get_last_sync()
     assert last["status"] == "failed"
     assert last["error_count"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Scan cursor (PKR-39)
+# ---------------------------------------------------------------------------
+
+
+def test_get_cursor_returns_1_on_fresh_db():
+    assert krs_repo.get_cursor() == 1
+
+
+def test_advance_cursor():
+    krs_repo.advance_cursor(42)
+    assert krs_repo.get_cursor() == 42
+
+
+def test_advance_cursor_idempotent():
+    krs_repo.advance_cursor(42)
+    krs_repo.advance_cursor(42)
+    assert krs_repo.get_cursor() == 42
+
+
+# ---------------------------------------------------------------------------
+# Scan runs (PKR-39)
+# ---------------------------------------------------------------------------
+
+
+def test_scan_run_lifecycle():
+    run_id = krs_repo.open_scan_run(krs_from=1)
+    assert isinstance(run_id, int)
+
+    krs_repo.update_scan_run(run_id, probed_count=50, valid_count=30, error_count=2)
+
+    krs_repo.close_scan_run(
+        run_id,
+        status="completed",
+        krs_to=50,
+        stopped_reason="batch_limit",
+        probed_count=50,
+        valid_count=30,
+        error_count=2,
+    )
+
+    last = krs_repo.get_last_scan_run()
+    assert last is not None
+    assert last["id"] == run_id
+    assert last["status"] == "completed"
+    assert last["krs_from"] == 1
+    assert last["krs_to"] == 50
+    assert last["probed_count"] == 50
+    assert last["valid_count"] == 30
+    assert last["error_count"] == 2
+    assert last["stopped_reason"] == "batch_limit"
+    assert last["finished_at"] is not None
+
+
+def test_get_last_scan_run_no_runs():
+    assert krs_repo.get_last_scan_run() is None
+
+
+def test_multiple_scan_runs_returns_latest():
+    run1 = krs_repo.open_scan_run(krs_from=1)
+    krs_repo.close_scan_run(run1, status="completed", krs_to=100, stopped_reason="batch_limit")
+
+    run2 = krs_repo.open_scan_run(krs_from=101)
+    krs_repo.close_scan_run(run2, status="completed", krs_to=200, stopped_reason="batch_limit")
+
+    last = krs_repo.get_last_scan_run()
+    assert last["id"] == run2
+    assert last["krs_from"] == 101

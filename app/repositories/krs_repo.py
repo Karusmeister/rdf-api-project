@@ -84,6 +84,38 @@ def _init_schema() -> None:
         )
     """)
 
+    # --- Sequential scanner tables (PKR-39) ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS krs_scan_cursor (
+            id          BOOLEAN PRIMARY KEY DEFAULT TRUE,
+            next_krs_int INTEGER NOT NULL DEFAULT 1,
+            updated_at  TIMESTAMP NOT NULL DEFAULT current_timestamp
+        )
+    """)
+    # Seed the single-row cursor if it doesn't exist
+    conn.execute("""
+        INSERT OR IGNORE INTO krs_scan_cursor (id, next_krs_int) VALUES (TRUE, 1)
+    """)
+
+    conn.execute("""
+        CREATE SEQUENCE IF NOT EXISTS seq_krs_scan_runs START 1
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS krs_scan_runs (
+            id              INTEGER PRIMARY KEY DEFAULT nextval('seq_krs_scan_runs'),
+            started_at      TIMESTAMP NOT NULL DEFAULT current_timestamp,
+            finished_at     TIMESTAMP,
+            status          VARCHAR NOT NULL DEFAULT 'running',
+            krs_from        INTEGER NOT NULL,
+            krs_to          INTEGER,
+            probed_count    INTEGER NOT NULL DEFAULT 0,
+            valid_count     INTEGER NOT NULL DEFAULT 0,
+            error_count     INTEGER NOT NULL DEFAULT 0,
+            stopped_reason  VARCHAR
+        )
+    """)
+
 
 def _ensure_krs_entities_columns(conn) -> None:
     existing_columns = {
@@ -251,6 +283,133 @@ def log_sync_finish(
         """,
         [now, krs_count, new_count, updated_count, error_count, status, sync_id],
     )
+
+
+# ---------------------------------------------------------------------------
+# CRUD — krs_scan_cursor
+# ---------------------------------------------------------------------------
+
+
+def get_cursor() -> int:
+    """Return the next KRS integer to probe."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT next_krs_int FROM krs_scan_cursor WHERE id = TRUE"
+    ).fetchone()
+    return row[0] if row else 1
+
+
+def advance_cursor(next_krs_int: int) -> None:
+    """Update the single-row cursor. Idempotent for the same value."""
+    conn = get_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        UPDATE krs_scan_cursor
+        SET next_krs_int = ?, updated_at = ?
+        WHERE id = TRUE
+        """,
+        [next_krs_int, now],
+    )
+
+
+# ---------------------------------------------------------------------------
+# CRUD — krs_scan_runs
+# ---------------------------------------------------------------------------
+
+
+def open_scan_run(krs_from: int) -> int:
+    """Insert a new scan run row and return its id."""
+    conn = get_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    result = conn.execute(
+        """
+        INSERT INTO krs_scan_runs (started_at, krs_from)
+        VALUES (?, ?)
+        RETURNING id
+        """,
+        [now, krs_from],
+    ).fetchone()
+    return result[0]
+
+
+def update_scan_run(
+    run_id: int,
+    *,
+    probed_count: int | None = None,
+    valid_count: int | None = None,
+    error_count: int | None = None,
+) -> None:
+    """Update stats on a running scan."""
+    conn = get_conn()
+    sets: list[str] = []
+    params: list[Any] = []
+    if probed_count is not None:
+        sets.append("probed_count = ?")
+        params.append(probed_count)
+    if valid_count is not None:
+        sets.append("valid_count = ?")
+        params.append(valid_count)
+    if error_count is not None:
+        sets.append("error_count = ?")
+        params.append(error_count)
+    if not sets:
+        return
+    params.append(run_id)
+    conn.execute(
+        f"UPDATE krs_scan_runs SET {', '.join(sets)} WHERE id = ?",
+        params,
+    )
+
+
+def close_scan_run(
+    run_id: int,
+    *,
+    status: str,
+    krs_to: int,
+    stopped_reason: str | None = None,
+    probed_count: int | None = None,
+    valid_count: int | None = None,
+    error_count: int | None = None,
+) -> None:
+    """Finalise a scan run."""
+    conn = get_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        UPDATE krs_scan_runs
+        SET finished_at = ?, status = ?, krs_to = ?, stopped_reason = ?,
+            probed_count = COALESCE(?, probed_count),
+            valid_count  = COALESCE(?, valid_count),
+            error_count  = COALESCE(?, error_count)
+        WHERE id = ?
+        """,
+        [now, status, krs_to, stopped_reason,
+         probed_count, valid_count, error_count, run_id],
+    )
+
+
+def get_last_scan_run() -> Optional[dict]:
+    """Return the most recent scan run."""
+    conn = get_conn()
+    row = conn.execute(
+        """
+        SELECT * FROM krs_scan_runs
+        ORDER BY started_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    columns = [desc[0] for desc in conn.execute(
+        "SELECT * FROM krs_scan_runs LIMIT 0"
+    ).description]
+    return dict(zip(columns, row))
+
+
+# ---------------------------------------------------------------------------
+# CRUD — krs_sync_log
+# ---------------------------------------------------------------------------
 
 
 def get_last_sync(source: str = "ms_gov") -> Optional[dict]:

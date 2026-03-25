@@ -85,6 +85,7 @@ app/
     exceptions.py      - Common adapter exceptions (AdapterError, EntityNotFoundError, etc.)
   jobs/
     krs_sync.py        - Scheduled KRS entity sync job (discovery + re-enrichment)
+    krs_scanner.py     - Resumable sequential KRS integer scanner (probes 1,2,3…)
   routers/
     rdf/
       podmiot.py       - /api/podmiot/* (entity lookup)
@@ -134,6 +135,7 @@ tests/
   test_krs_repo.py         - KRS entity repository CRUD tests
   test_monitoring.py       - Metrics ring buffer + adapter integration tests
   test_krs_pipeline.py     - KRS sync pipeline integration tests (respx mocks)
+  test_krs_scanner.py      - KRS sequential scanner tests (respx mocks)
 data/
   scraper.duckdb       - Single DuckDB file for ALL tables (scraper + prediction)
   documents/           - Extracted RDF files + manifest.json
@@ -149,6 +151,8 @@ data/
 ### KRS entity tables (app/repositories/krs_repo.py)
 - `krs_entities` - Cached KRS entity data from adapters. PK = krs VARCHAR(10). GDPR: PESEL stays in `raw` JSON only.
 - `krs_sync_log` - Sync run history (started_at, counts, status).
+- `krs_scan_cursor` - Single-row table tracking next KRS integer to probe. PK = boolean TRUE.
+- `krs_scan_runs` - One row per scanner invocation (krs_from/to, probed/valid/error counts, stopped_reason).
 
 ### Prediction tables (app/db/prediction_db.py)
 Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
@@ -257,6 +261,14 @@ python scripts/seed_features.py
 |--------|------|-------|
 | GET | /jobs/krs-sync/status | Last sync run summary (time, counts, errors) |
 | POST | /jobs/krs-sync/trigger | Queue a sync run (202 accepted, 409 if already running) |
+
+### KRS sequential scanner
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | /jobs/krs-scan/status | Cursor position, is_running, last run stats, total entities |
+| POST | /jobs/krs-scan/trigger | Fire scan in background (202 accepted, 409 if running) |
+| POST | /jobs/krs-scan/stop | Signal running scan to stop after current probe |
+| POST | /jobs/krs-scan/reset-cursor | Body: `{"next_krs_int": N}`. Rejected 409 if running |
 
 ## Gotchas
 

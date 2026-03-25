@@ -16,7 +16,7 @@ from app.adapters.registry import register as register_adapter
 from app.config import settings
 from app.db import connection as db_conn
 from app.db import prediction_db
-from app.jobs import krs_sync
+from app.jobs import krs_scanner, krs_sync
 from app.logging_config import configure_logging
 from app.monitoring import metrics
 from app.repositories import krs_repo
@@ -42,15 +42,20 @@ async def lifespan(app: FastAPI):
     await krs_client.start()
     register_adapter("ms_gov", MsGovKrsAdapter())
 
-    # Start KRS sync scheduler
+    # Start KRS schedulers (sync + scanner)
     scheduler = AsyncIOScheduler()
-    cron_expr = settings.krs_sync_cron
     try:
-        trigger = CronTrigger.from_crontab(cron_expr)
-        scheduler.add_job(krs_sync.run_sync, trigger, id="krs_sync", replace_existing=True)
+        sync_trigger = CronTrigger.from_crontab(settings.krs_sync_cron)
+        scheduler.add_job(krs_sync.run_sync, sync_trigger, id="krs_sync", replace_existing=True)
+
+        scan_trigger = CronTrigger.from_crontab(settings.krs_scan_cron)
+        scheduler.add_job(krs_scanner.run_scan, scan_trigger, id="krs_scan", replace_existing=True)
+
         scheduler.start()
         logger.info("scheduler_started", extra={
-            "event": "scheduler_started", "krs_sync_cron": cron_expr,
+            "event": "scheduler_started",
+            "krs_sync_cron": settings.krs_sync_cron,
+            "krs_scan_cron": settings.krs_scan_cron,
         })
     except Exception:
         logger.exception("scheduler_start_failed", extra={"event": "scheduler_start_failed"})
