@@ -1,5 +1,6 @@
 """Allow `python -m batch` to run the batch runner."""
 
-from batch.runner import main
+if __name__ == "__main__":
+    from batch.runner import main
 
-main()
+    main()

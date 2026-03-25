@@ -118,7 +118,8 @@ async def _process_krs_with_backoff(
                 },
                 "nrKRS": encrypted,
             }
-            await client.post("/dokumenty/wyszukiwanie", json=doc_payload)
+            doc_resp = await client.post("/dokumenty/wyszukiwanie", json=doc_payload)
+            doc_resp.raise_for_status()
             # TODO: insert into DB / trigger analysis pipeline here
             return "found"
 
@@ -168,13 +169,17 @@ async def _worker_loop(
     delay: float,
     db_path: str,
 ) -> None:
-    """Main async loop for a single worker process."""
+    """Main async loop for a single worker process.
+
+    Launches up to `concurrency` tasks in parallel using a semaphore to
+    bound in-flight requests.  A feeder coroutine continuously schedules
+    new KRS numbers while existing tasks are still running.
+    """
     store = ProgressStore(db_path)
     stats = WorkerStats()
     sem = asyncio.Semaphore(concurrency)
 
     async with _make_client(connection) as client:
-        krs = start_krs
 
         async def _handle_one(krs_num: int) -> None:
             krs_str = str(krs_num).zfill(10)
@@ -199,9 +204,28 @@ async def _worker_loop(
             if stats.found > 0 and stats.found % 100 == 0:
                 stats.log(worker_id)
 
+        pending: set[asyncio.Task] = set()
+        krs = start_krs
+
         while True:
-            await _handle_one(krs)
-            krs += stride
+            # Fill up to `concurrency` in-flight tasks
+            while len(pending) < concurrency:
+                task = asyncio.create_task(_handle_one(krs))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+                krs += stride
+
+            # Wait for at least one task to finish before scheduling more
+            if pending:
+                done, _ = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Re-raise any unexpected exceptions from completed tasks
+                for t in done:
+                    if t.exception() is not None:
+                        logger.error(
+                            "worker=%d task_error %s", worker_id, t.exception(),
+                        )
 
 
 def run_worker(

@@ -119,7 +119,13 @@ def run_batch(
         p.join()
         logger.info("joined %s exitcode=%s", p.name, p.exitcode)
 
-    logger.info("batch_complete all workers exited")
+    failed = [p for p in processes if p.exitcode != 0]
+    if failed:
+        names = ", ".join(f"{p.name} (exit={p.exitcode})" for p in failed)
+        logger.error("batch_failed workers_crashed: %s", names)
+        raise SystemExit(1)
+
+    logger.info("batch_complete all workers exited successfully")
 
 
 def _build_parser() -> argparse.ArgumentParser:

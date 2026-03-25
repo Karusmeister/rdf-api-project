@@ -1,5 +1,6 @@
 """Tests for batch/progress.py — DuckDB progress store."""
 
+import multiprocessing
 import pytest
 import duckdb
 
@@ -56,3 +57,36 @@ def test_batch_progress_table_coexists_with_other_tables(tmp_path):
     store = ProgressStore(db)
     store.mark(1, "found", worker_id=0)
     assert store.is_done(1) is True
+
+
+def _worker_mark(db_path: str, krs: int, worker_id: int):
+    """Helper for multiprocessing test — runs in a child process."""
+    store = ProgressStore(db_path)
+    store.mark(krs, "found", worker_id)
+
+
+def test_multi_process_writes_do_not_deadlock(tmp_path):
+    """Two separate OS processes can write to the same DB file without lock errors.
+
+    This was the core bug in finding #1 — persistent DuckDB connections
+    held exclusive locks, preventing multi-worker operation.
+    """
+    db = str(tmp_path / "test.duckdb")
+    # Ensure schema exists before spawning
+    ProgressStore(db)
+
+    p1 = multiprocessing.Process(target=_worker_mark, args=(db, 1, 0))
+    p2 = multiprocessing.Process(target=_worker_mark, args=(db, 2, 1))
+
+    p1.start()
+    p2.start()
+    p1.join(timeout=10)
+    p2.join(timeout=10)
+
+    assert p1.exitcode == 0, f"Worker 0 crashed with exit code {p1.exitcode}"
+    assert p2.exitcode == 0, f"Worker 1 crashed with exit code {p2.exitcode}"
+
+    # Both writes visible
+    store = ProgressStore(db)
+    assert store.is_done(1) is True
+    assert store.is_done(2) is True

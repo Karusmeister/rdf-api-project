@@ -49,10 +49,11 @@ def test_make_client_direct():
     assert isinstance(client, httpx.AsyncClient)
 
 
-def test_make_client_with_proxy_url_stored():
-    """Verify that a proxy connection stores the proxy_url (can't create transport without socksio)."""
+def test_make_client_with_socks5_proxy():
+    """SOCKS5 proxy client can be constructed (socksio is installed)."""
     conn = Connection(name="pl192", proxy_url="socks5://u:p@pl192.nordvpn.com:1080")
-    assert conn.proxy_url == "socks5://u:p@pl192.nordvpn.com:1080"
+    client = _make_client(conn)
+    assert isinstance(client, httpx.AsyncClient)
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,21 @@ async def test_process_krs_found(rdf_base):
         async with httpx.AsyncClient(base_url=rdf_base) as client:
             result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "found"
+
+
+@pytest.mark.asyncio
+async def test_process_krs_found_but_doc_lookup_fails(rdf_base):
+    """Entity exists but document search returns 500 → 'error', not 'found'."""
+    with respx.mock:
+        respx.post(f"{rdf_base}/podmioty/wyszukiwanie/dane-podstawowe").mock(
+            return_value=httpx.Response(200, json={"numerKRS": "0000000001", "nazwa": "Test"})
+        )
+        respx.post(f"{rdf_base}/dokumenty/wyszukiwanie").mock(
+            return_value=httpx.Response(500)
+        )
+        async with httpx.AsyncClient(base_url=rdf_base) as client:
+            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+    assert result == "error"
 
 
 @pytest.mark.asyncio

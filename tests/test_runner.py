@@ -166,3 +166,17 @@ def test_run_batch_vpn_validation_fails(monkeypatch):
     monkeypatch.setattr(settings, "nordvpn_servers", [])
     with pytest.raises(RuntimeError, match="NORDVPN_USERNAME is empty"):
         run_batch(use_vpn=True)
+
+
+@patch("batch.runner.multiprocessing.Process")
+def test_run_batch_raises_on_worker_crash(mock_process_cls, monkeypatch):
+    """run_batch raises SystemExit(1) when any worker exits non-zero."""
+    monkeypatch.setattr(settings, "nordvpn_servers", [])
+    mock_proc = MagicMock()
+    mock_proc.pid = 1
+    mock_proc.exitcode = 1  # simulate crash
+    mock_proc.name = "krs-worker-0"
+    mock_process_cls.return_value = mock_proc
+
+    with pytest.raises(SystemExit):
+        run_batch(start_krs=1, workers=1, use_vpn=False, db_path="/tmp/test.duckdb")
