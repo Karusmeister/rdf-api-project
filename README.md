@@ -330,6 +330,14 @@ pytest tests/ -v --e2e
 
 Without `--e2e`, those tests are skipped by default.
 
+Run the dedicated live regression suite for the KRS Open API integration and RDF endpoints:
+
+```bash
+./scripts/run_regression_tests.sh
+```
+
+Those tests live under `tests/regression/` and are kept separate from the regular unit/integration suite.
+
 ## Further Reading
 
 - [`docs/RDF_API_DOCUMENTATION.md`](/Users/piotrkraus/piotr/rdf-api-project/docs/RDF_API_DOCUMENTATION.md) for the upstream RDF API contract

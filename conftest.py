@@ -7,6 +7,7 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "e2e: end-to-end test requiring network access")
+    config.addinivalue_line("markers", "regression: live upstream regression coverage")
 
 
 def pytest_collection_modifyitems(config, items):

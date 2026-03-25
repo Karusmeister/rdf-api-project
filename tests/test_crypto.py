@@ -1,11 +1,12 @@
-"""Tests for KRS AES encryption - run these first to validate crypto works."""
+"""Tests for RDF KRS encryption used by the live wyszukiwanie endpoint."""
 
 import base64
-import time
+from unittest.mock import patch
 
-import pytest
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
-from app.crypto import encrypt_nrkrs
+from app.crypto import _PERM_KEY, encrypt_nrkrs
 
 
 def test_output_is_valid_base64():
@@ -14,21 +15,16 @@ def test_output_is_valid_base64():
     assert len(decoded) % 16 == 0, "Ciphertext should be multiple of AES block size"
 
 
-def test_different_seconds_produce_different_tokens():
+def test_different_calls_produce_different_tokens():
     t1 = encrypt_nrkrs("0000694720")
-    time.sleep(1.1)
     t2 = encrypt_nrkrs("0000694720")
-    assert t1 != t2, "Tokens should differ when generated in different seconds"
+    assert t1 != t2, "Tokens should differ when generated with different random request keys"
 
 
 def test_krs_padding():
-    """Both '694720' and '0000694720' should produce the same plaintext prefix."""
-    # We can't easily compare ciphertexts (timestamp differs),
-    # but at least verify both produce valid tokens.
-    t1 = encrypt_nrkrs("694720")
-    t2 = encrypt_nrkrs("0000694720")
-    assert base64.b64decode(t1)  # valid base64
-    assert base64.b64decode(t2)  # valid base64
+    """Both short and zero-padded KRS inputs should encrypt successfully."""
+    assert base64.b64decode(encrypt_nrkrs("694720"))
+    assert base64.b64decode(encrypt_nrkrs("0000694720"))
 
 
 def test_token_is_not_empty():
@@ -37,24 +33,20 @@ def test_token_is_not_empty():
 
 
 def test_can_decrypt_to_verify_structure():
-    """Decrypt our own token to verify plaintext format. Time is frozen to avoid
-    an hour-boundary race between encrypt_nrkrs() and the key reconstruction here."""
-    from datetime import datetime
-    from unittest.mock import patch
-    from Crypto.Cipher import AES
-    from Crypto.Util.Padding import unpad
-
     krs = "0000694720"
-    frozen_now = datetime(2024, 1, 15, 10, 30, 45)
+    request_key = "0000123456789012"
 
-    with patch("app.crypto.datetime") as mock_dt:
-        mock_dt.now.return_value = frozen_now
+    with patch("app.crypto._random_request_key", return_value=request_key):
         token = encrypt_nrkrs(krs)
 
-    key = frozen_now.strftime("%Y-%m-%d-%H").rjust(16, "1").encode("utf-8")
-    cipher = AES.new(key, AES.MODE_CBC, iv=key)
-    decrypted = unpad(cipher.decrypt(base64.b64decode(token)), AES.block_size)
-    plaintext = decrypted.decode("utf-8")
+    perm_cipher = AES.new(_PERM_KEY, AES.MODE_CBC, iv=_PERM_KEY)
+    outer_plaintext = unpad(perm_cipher.decrypt(base64.b64decode(token)), AES.block_size).decode("utf-8")
+    inner_base64, outer_request_key = outer_plaintext.split(".", 1)
 
-    assert plaintext.startswith("0000694720"), f"Plaintext should start with KRS, got: {plaintext}"
-    assert len(plaintext) == 29, f"Expected 10 (KRS) + 19 (timestamp) = 29 chars, got {len(plaintext)}"
+    assert outer_request_key == request_key
+
+    request_key_bytes = request_key.encode("utf-8")
+    inner_cipher = AES.new(request_key_bytes, AES.MODE_CBC, iv=request_key_bytes)
+    plaintext = unpad(inner_cipher.decrypt(base64.b64decode(inner_base64)), AES.block_size).decode("utf-8")
+
+    assert plaintext == krs
