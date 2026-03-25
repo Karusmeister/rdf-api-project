@@ -1,7 +1,8 @@
 """Multiprocessing orchestrator for the batch KRS scanner.
 
-Spawns N worker processes, assigns stride-offset starting KRS numbers,
-and routes each worker through either a direct or VPN connection.
+Spawns N worker processes with stride-offset starting KRS numbers.
+VPN is handled at the OS level (e.g. `nordvpn connect pl157`) before
+running the batch — all workers share the same tunnel.
 
 Usage:
     python -m batch.runner [options]
@@ -13,53 +14,17 @@ import argparse
 import logging
 import multiprocessing
 import signal
-import sys
 
 from app.config import settings
-from batch.connections import Connection, build_pool
 from batch.worker import run_worker
 
 logger = logging.getLogger(__name__)
-
-
-def _pick_connection(worker_id: int, use_vpn: bool) -> Connection:
-    """Assign a connection to a worker. Direct if VPN disabled; round-robin VPN otherwise."""
-    pool = build_pool()
-    if not use_vpn:
-        return pool[0]  # direct
-    vpn_conns = [c for c in pool if c.proxy_url is not None]
-    if not vpn_conns:
-        raise RuntimeError(
-            "BATCH_USE_VPN=true but NORDVPN_SERVERS is empty. "
-            "Set NORDVPN_SERVERS in .env."
-        )
-    return vpn_conns[worker_id % len(vpn_conns)]
-
-
-def _validate_vpn_config() -> None:
-    """Raise RuntimeError if VPN is enabled but credentials/servers are missing."""
-    if not settings.nordvpn_username:
-        raise RuntimeError(
-            "BATCH_USE_VPN=true but NORDVPN_USERNAME is empty. "
-            "Set NordVPN service credentials in .env."
-        )
-    if not settings.nordvpn_password:
-        raise RuntimeError(
-            "BATCH_USE_VPN=true but NORDVPN_PASSWORD is empty. "
-            "Set NordVPN service credentials in .env."
-        )
-    if not settings.nordvpn_servers:
-        raise RuntimeError(
-            "BATCH_USE_VPN=true but NORDVPN_SERVERS is empty. "
-            "Set NORDVPN_SERVERS in .env (JSON array of server hostnames)."
-        )
 
 
 def run_batch(
     *,
     start_krs: int | None = None,
     workers: int | None = None,
-    use_vpn: bool | None = None,
     concurrency: int | None = None,
     delay: float | None = None,
     db_path: str | None = None,
@@ -70,22 +35,17 @@ def run_batch(
     """
     _start = start_krs if start_krs is not None else settings.batch_start_krs
     _workers = workers if workers is not None else settings.batch_workers
-    _vpn = use_vpn if use_vpn is not None else settings.batch_use_vpn
     _concurrency = concurrency if concurrency is not None else settings.batch_concurrency_per_worker
     _delay = delay if delay is not None else settings.batch_delay_seconds
     _db = db_path if db_path is not None else settings.batch_db_path
 
-    if _vpn:
-        _validate_vpn_config()
-
     logger.info(
-        "batch_start workers=%d start_krs=%d vpn=%s concurrency=%d delay=%.1f db=%s",
-        _workers, _start, _vpn, _concurrency, _delay, _db,
+        "batch_start workers=%d start_krs=%d concurrency=%d delay=%.1f db=%s",
+        _workers, _start, _concurrency, _delay, _db,
     )
 
     processes: list[multiprocessing.Process] = []
     for worker_id in range(_workers):
-        conn = _pick_connection(worker_id, _vpn)
         p = multiprocessing.Process(
             target=run_worker,
             name=f"krs-worker-{worker_id}",
@@ -93,7 +53,6 @@ def run_batch(
                 worker_id=worker_id,
                 start_krs=_start + worker_id,  # stride offset
                 stride=_workers,
-                connection=conn,
                 concurrency=_concurrency,
                 delay=_delay,
                 db_path=_db,
@@ -131,7 +90,7 @@ def run_batch(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m batch.runner",
-        description="Batch KRS scanner — multiprocess runner with optional VPN rotation.",
+        description="Batch KRS scanner — multiprocess runner. Connect VPN at OS level before running.",
     )
     parser.add_argument(
         "--start", type=int, default=None,
@@ -141,17 +100,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--workers", type=int, default=None,
         help=f"Number of parallel worker processes (default: {settings.batch_workers})",
     )
-
-    vpn_group = parser.add_mutually_exclusive_group()
-    vpn_group.add_argument(
-        "--vpn", action="store_true", default=None,
-        help="Enable VPN connections (overrides BATCH_USE_VPN=false)",
-    )
-    vpn_group.add_argument(
-        "--no-vpn", action="store_true", default=None,
-        help="Disable VPN connections (overrides BATCH_USE_VPN=true)",
-    )
-
     parser.add_argument(
         "--concurrency", type=int, default=None,
         help=f"Async concurrency per worker (default: {settings.batch_concurrency_per_worker})",
@@ -175,16 +123,9 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    use_vpn: bool | None = None
-    if args.vpn:
-        use_vpn = True
-    elif args.no_vpn:
-        use_vpn = False
-
     run_batch(
         start_krs=args.start,
         workers=args.workers,
-        use_vpn=use_vpn,
         concurrency=args.concurrency,
         delay=args.delay,
         db_path=args.db,

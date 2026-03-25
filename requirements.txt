@@ -1,6 +1,6 @@
 fastapi>=0.115
 uvicorn[standard]>=0.34
-httpx[socks]>=0.28
+httpx>=0.28
 pycryptodome>=3.21
 pydantic>=2.10
 pydantic-settings>=2.7
