@@ -1,7 +1,8 @@
 """DuckDB repository for KRS entity data and sync logging.
 
-Tables are created via _init_schema() at app startup. GDPR note: PESEL and
-personal addresses stay in the ``raw`` JSON column only — never normalised.
+Tables are created via _init_schema() at app startup. Company-level address
+fields used by the adapter contract are stored in columns; sensitive personal
+data stays only in the ``raw`` JSON payload.
 """
 
 from __future__ import annotations
@@ -52,11 +53,14 @@ def _init_schema() -> None:
             nip             VARCHAR(13),
             regon           VARCHAR(14),
             address_city    VARCHAR,
+            address_street  VARCHAR,
+            address_postal_code VARCHAR,
             raw             JSON,
             source          VARCHAR NOT NULL DEFAULT 'ms_gov',
             synced_at       TIMESTAMP NOT NULL DEFAULT current_timestamp
         )
     """)
+    _ensure_krs_entities_columns(conn)
 
     conn.execute("""
         CREATE SEQUENCE IF NOT EXISTS seq_krs_sync_log START 1
@@ -77,6 +81,18 @@ def _init_schema() -> None:
     """)
 
 
+def _ensure_krs_entities_columns(conn) -> None:
+    existing_columns = {
+        row[0] for row in conn.execute("DESCRIBE krs_entities").fetchall()
+    }
+    for name, definition in (
+        ("address_street", "VARCHAR"),
+        ("address_postal_code", "VARCHAR"),
+    ):
+        if name not in existing_columns:
+            conn.execute(f"ALTER TABLE krs_entities ADD COLUMN {name} {definition}")
+
+
 # ---------------------------------------------------------------------------
 # CRUD — krs_entities
 # ---------------------------------------------------------------------------
@@ -93,20 +109,23 @@ def upsert_entity(
     nip: str | None = None,
     regon: str | None = None,
     address_city: str | None = None,
+    address_street: str | None = None,
+    address_postal_code: str | None = None,
     raw: dict | None = None,
     source: str = "ms_gov",
 ) -> None:
     """Insert or update a KRS entity. Idempotent on krs."""
     conn = get_conn()
-    raw_json = json.dumps(raw) if raw else None
+    raw_json = json.dumps(raw, ensure_ascii=False) if raw is not None else None
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
         """
         INSERT INTO krs_entities
             (krs, name, legal_form, status, registered_at, last_changed_at,
-             nip, regon, address_city, raw, source, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             nip, regon, address_city, address_street, address_postal_code,
+             raw, source, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (krs) DO UPDATE SET
             name            = excluded.name,
             legal_form      = excluded.legal_form,
@@ -116,13 +135,16 @@ def upsert_entity(
             nip             = excluded.nip,
             regon           = excluded.regon,
             address_city    = excluded.address_city,
+            address_street  = excluded.address_street,
+            address_postal_code = excluded.address_postal_code,
             raw             = excluded.raw,
             source          = excluded.source,
             synced_at       = excluded.synced_at
         """,
         [
             krs, name, legal_form, status, registered_at, last_changed_at,
-            nip, regon, address_city, raw_json, source, now,
+            nip, regon, address_city, address_street, address_postal_code,
+            raw_json, source, now,
         ],
     )
 
@@ -139,6 +161,8 @@ def upsert_from_krs_entity(entity, *, source: str = "ms_gov") -> None:
         nip=entity.nip,
         regon=entity.regon,
         address_city=entity.address_city,
+        address_street=entity.address_street,
+        address_postal_code=entity.address_postal_code,
         raw=entity.raw,
         source=source,
     )
@@ -155,7 +179,11 @@ def get_entity(krs: str) -> Optional[dict]:
     columns = [desc[0] for desc in conn.execute(
         "SELECT * FROM krs_entities LIMIT 0"
     ).description]
-    return dict(zip(columns, result))
+    row = dict(zip(columns, result))
+    raw = row.get("raw")
+    if isinstance(raw, str):
+        row["raw"] = json.loads(raw)
+    return row
 
 
 def list_stale(older_than: datetime) -> list[dict]:

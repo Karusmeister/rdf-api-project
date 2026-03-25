@@ -9,7 +9,7 @@ import respx
 
 from app import krs_client
 from app.adapters.base import KrsSourceAdapter
-from app.adapters.exceptions import RateLimitedError, UpstreamUnavailableError
+from app.adapters.exceptions import InvalidKrsError, RateLimitedError, UpstreamUnavailableError
 from app.adapters.ms_gov import MsGovKrsAdapter
 
 # ---------------------------------------------------------------------------
@@ -151,6 +151,24 @@ async def test_get_entity_not_found(adapter):
 
     entity = await adapter.get_entity("9999999999")
     assert entity is None
+
+
+@pytest.mark.parametrize("bad_krs", ["", "abc", "12-34", "12345678901"])
+@pytest.mark.asyncio
+async def test_get_entity_rejects_invalid_krs_without_upstream_call(adapter, monkeypatch, bad_krs):
+    called = False
+
+    async def fail_if_called(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("krs_client.get should not be called for invalid input")
+
+    monkeypatch.setattr(krs_client, "get", fail_if_called)
+
+    with pytest.raises(InvalidKrsError):
+        await adapter.get_entity(bad_krs)
+
+    assert called is False
 
 
 @respx.mock

@@ -33,6 +33,9 @@ def test_upsert_entity_insert():
         legal_form="SP. Z O.O.",
         nip="5842734981",
         regon="22204956600000",
+        address_city="GDANSK",
+        address_street="UL. MYSLIWSKA",
+        address_postal_code="80-175",
         registered_at=date(2017, 9, 19),
         raw={"foo": "bar"},
     )
@@ -43,6 +46,10 @@ def test_upsert_entity_insert():
     assert entity["name"] == "Test Corp"
     assert entity["legal_form"] == "SP. Z O.O."
     assert entity["nip"] == "5842734981"
+    assert entity["address_city"] == "GDANSK"
+    assert entity["address_street"] == "UL. MYSLIWSKA"
+    assert entity["address_postal_code"] == "80-175"
+    assert entity["raw"] == {"foo": "bar"}
     assert entity["source"] == "ms_gov"
 
 
@@ -63,6 +70,8 @@ def test_upsert_from_krs_entity():
         name="Test Corp",
         legal_form="SP. Z O.O.",
         nip="5842734981",
+        address_street="UL. MYSLIWSKA",
+        address_postal_code="80-175",
         raw={"odpis": {}},
     )
     krs_repo.upsert_from_krs_entity(entity)
@@ -71,6 +80,17 @@ def test_upsert_from_krs_entity():
     assert row is not None
     assert row["name"] == "Test Corp"
     assert row["nip"] == "5842734981"
+    assert row["address_street"] == "UL. MYSLIWSKA"
+    assert row["address_postal_code"] == "80-175"
+    assert row["raw"] == {"odpis": {}}
+
+
+def test_upsert_entity_preserves_empty_raw_dict():
+    krs_repo.upsert_entity(krs="0000000001", name="Test Corp", raw={})
+
+    entity = krs_repo.get_entity("0000000001")
+    assert entity is not None
+    assert entity["raw"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +100,36 @@ def test_upsert_from_krs_entity():
 
 def test_get_entity_not_found():
     assert krs_repo.get_entity("9999999999") is None
+
+
+def test_connect_migrates_existing_krs_entities_table():
+    conn = db_conn.get_conn()
+    conn.execute("DROP TABLE krs_entities")
+    conn.execute("""
+        CREATE TABLE krs_entities (
+            krs             VARCHAR(10) PRIMARY KEY,
+            name            VARCHAR NOT NULL,
+            legal_form      VARCHAR,
+            status          VARCHAR,
+            registered_at   DATE,
+            last_changed_at DATE,
+            nip             VARCHAR(13),
+            regon           VARCHAR(14),
+            address_city    VARCHAR,
+            raw             JSON,
+            source          VARCHAR NOT NULL DEFAULT 'ms_gov',
+            synced_at       TIMESTAMP NOT NULL DEFAULT current_timestamp
+        )
+    """)
+
+    krs_repo._schema_initialized = False
+    krs_repo.connect()
+
+    columns = {
+        row[0] for row in conn.execute("DESCRIBE krs_entities").fetchall()
+    }
+    assert "address_street" in columns
+    assert "address_postal_code" in columns
 
 
 # ---------------------------------------------------------------------------

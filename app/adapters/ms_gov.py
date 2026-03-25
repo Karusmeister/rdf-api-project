@@ -10,18 +10,21 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
+from pydantic import TypeAdapter, ValidationError
 
 from app import krs_client
 from app.adapters.exceptions import (
+    InvalidKrsError,
     RateLimitedError,
     UpstreamUnavailableError,
 )
-from app.adapters.models import AdapterHealth, KrsEntity, SearchResponse
+from app.adapters.models import AdapterHealth, KrsEntity, KrsNumber, SearchResponse
 from app.monitoring.metrics import record_api_call
 
 logger = logging.getLogger(__name__)
 
 SOURCE = "ms_gov"
+_KRS_NUMBER_ADAPTER = TypeAdapter(KrsNumber)
 
 
 def _parse_date_dd_mm_yyyy(value: str | None) -> Optional[object]:
@@ -71,6 +74,14 @@ def _extract_entity(krs: str, payload: dict) -> KrsEntity:
     )
 
 
+def _normalize_requested_krs(krs: str) -> str:
+    """Validate and canonicalize adapter input before any upstream call."""
+    try:
+        return _KRS_NUMBER_ADAPTER.validate_python(krs)
+    except ValidationError as exc:
+        raise InvalidKrsError(SOURCE, krs) from exc
+
+
 class MsGovKrsAdapter:
     """Adapter for the official MS KRS Open API at api-krs.ms.gov.pl.
 
@@ -83,7 +94,7 @@ class MsGovKrsAdapter:
         Returns None if the entity does not exist (404).
         Raises on transient/network errors.
         """
-        padded = krs.strip().zfill(10)
+        padded = _normalize_requested_krs(krs)
         t0 = time.monotonic()
         try:
             resp = await krs_client.get(

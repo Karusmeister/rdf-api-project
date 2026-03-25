@@ -21,6 +21,14 @@ class EntityNotFoundError(AdapterError):
         super().__init__(source, f"Entity {krs} not found")
 
 
+class InvalidKrsError(AdapterError):
+    """The provided KRS identifier is malformed."""
+
+    def __init__(self, source: str, krs: object) -> None:
+        self.krs = krs
+        super().__init__(source, f"Invalid KRS {krs!r}; expected 1 to 10 digits")
+
+
 class UpstreamUnavailableError(AdapterError):
     """The upstream data source is unreachable or returning errors."""
 
