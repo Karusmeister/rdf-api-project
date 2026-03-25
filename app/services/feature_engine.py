@@ -208,8 +208,13 @@ def compute_features_for_report(
             failed += 1
 
     logger.info(
-        "Computed features for report %s: %d ok, %d failed",
-        report_id, computed, failed,
+        "features_computed",
+        extra={
+            "event": "features_computed",
+            "report_id": report_id,
+            "computed": computed,
+            "failed": failed,
+        },
     )
 
     return {
@@ -263,7 +268,11 @@ def compute_all_pending() -> dict:
         except Exception as e:
             results["failed"] += 1
             results["errors"].append({"report_id": report_id, "error": str(e)})
-            logger.error("Failed to compute features for %s: %s", report_id, e)
+            logger.error(
+                "feature_compute_failed",
+                extra={"event": "feature_compute_failed", "report_id": report_id, "error": str(e)},
+                exc_info=True,
+            )
 
     return results
 

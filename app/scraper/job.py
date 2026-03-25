@@ -12,7 +12,7 @@ from app.config import settings
 from app.scraper import db
 from app.scraper.storage import create_storage, make_doc_dir
 
-logger = logging.getLogger("scraper")
+logger = logging.getLogger(__name__)
 
 
 async def run_scraper(
@@ -66,21 +66,33 @@ async def run_scraper(
                 error_backoff_hours=settings.scraper_error_backoff_hours,
             )
 
-        logger.info(f"Run {run_id}: processing {len(krs_list)} KRS entries (mode={mode})")
+        logger.info(
+            "scraper_run_started",
+            extra={"event": "scraper_run_started", "run_id": run_id, "mode": mode, "krs_count": len(krs_list)},
+        )
 
         for i, krs_entry in enumerate(krs_list):
             krs = krs_entry["krs"]
             try:
                 await _process_one_krs(krs, storage, stats)
             except Exception as e:
-                logger.error(f"KRS {krs}: unhandled error: {e}")
+                logger.error(
+                    "scraper_krs_error",
+                    extra={"event": "scraper_krs_error", "krs": krs, "error": str(e)},
+                    exc_info=True,
+                )
                 db.update_krs_checked(krs, total_docs=0, total_downloaded=0, error=str(e))
 
             stats["krs_checked"] += 1
             if (i + 1) % 50 == 0:
                 logger.info(
-                    f"Progress: {i+1}/{len(krs_list)} KRS checked, "
-                    f"{stats['documents_downloaded']} docs downloaded"
+                    "scraper_progress",
+                    extra={
+                        "event": "scraper_progress",
+                        "checked": i + 1,
+                        "total": len(krs_list),
+                        "docs_downloaded": stats["documents_downloaded"],
+                    },
                 )
 
             if i < len(krs_list) - 1:
@@ -89,10 +101,14 @@ async def run_scraper(
         db.finish_run(run_id, "completed", stats)
 
     except KeyboardInterrupt:
-        logger.warning("Interrupted by user")
+        logger.warning("scraper_interrupted", extra={"event": "scraper_interrupted", "run_id": run_id})
         db.finish_run(run_id, "interrupted", stats)
     except Exception as e:
-        logger.error(f"Run failed: {e}")
+        logger.error(
+            "scraper_run_failed",
+            extra={"event": "scraper_run_failed", "run_id": run_id, "error": str(e)},
+            exc_info=True,
+        )
         db.finish_run(run_id, "failed", {**stats, "error_message": str(e)})
         raise
     finally:
@@ -117,7 +133,7 @@ async def _process_one_krs(krs: str, storage, stats: dict) -> None:
     await asyncio.sleep(delay)
 
     if not lookup.get("czyPodmiotZnaleziony", False):
-        logger.debug(f"KRS {krs}: not found in registry, marking inactive")
+        logger.debug("scraper_krs_inactive", extra={"event": "scraper_krs_inactive", "krs": krs})
         db.upsert_krs(krs, company_name=None, legal_form=None, is_active=False)
         db.update_krs_checked(krs, total_docs=0, total_downloaded=0, error=None)
         return
@@ -207,12 +223,22 @@ async def _process_one_krs(krs: str, storage, stats: dict) -> None:
             stats["bytes_downloaded"] += total_extracted
 
             logger.debug(
-                f"KRS {krs}: extracted {doc_id} -> {len(manifest['files'])} files "
-                f"({total_extracted} bytes, types: {file_types})"
+                "scraper_doc_extracted",
+                extra={
+                    "event": "scraper_doc_extracted",
+                    "krs": krs,
+                    "doc_id": doc_id,
+                    "file_count": len(manifest["files"]),
+                    "extracted_bytes": total_extracted,
+                    "file_types": file_types,
+                },
             )
 
         except Exception as e:
-            logger.warning(f"KRS {krs}: failed to download {doc_id}: {e}")
+            logger.warning(
+                "scraper_doc_failed",
+                extra={"event": "scraper_doc_failed", "krs": krs, "doc_id": doc_id, "error": str(e)},
+            )
             db.update_document_error(doc_id, str(e))
             stats["documents_failed"] += 1
 

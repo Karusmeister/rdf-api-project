@@ -8,10 +8,13 @@ data stays only in the ``raw`` JSON payload.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.db import connection as shared_conn
+
+logger = logging.getLogger(__name__)
 
 _schema_initialized = False
 
@@ -25,6 +28,7 @@ def connect() -> None:
     """Ensure shared connection is open and KRS entity schema exists."""
     shared_conn.connect()
     _ensure_schema()
+    logger.info("krs_repo_ready", extra={"event": "krs_repo_ready"})
 
 
 def get_conn():

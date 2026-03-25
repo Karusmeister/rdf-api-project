@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
+
+logger = logging.getLogger(__name__)
 
 
 class StorageBackend(Protocol):
@@ -81,6 +84,18 @@ class LocalStorage:
         (target / "manifest.json").write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False),
             encoding="utf-8",
+        )
+
+        logger.info(
+            "document_extracted",
+            extra={
+                "event": "document_extracted",
+                "doc_dir": doc_dir,
+                "document_id": document_id,
+                "file_count": len(files_info),
+                "zip_size": len(zip_bytes),
+                "extracted_size": total_extracted_size,
+            },
         )
 
         return manifest

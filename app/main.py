@@ -1,3 +1,5 @@
+import logging
+import time
 from contextlib import asynccontextmanager
 
 import httpx
@@ -12,6 +14,7 @@ from app.adapters.registry import register as register_adapter
 from app.config import settings
 from app.db import connection as db_conn
 from app.db import prediction_db
+from app.logging_config import configure_logging
 from app.monitoring import metrics
 from app.repositories import krs_repo
 from app.scraper import db as scraper_db
@@ -20,9 +23,13 @@ from app.routers.analysis import router as analysis_router
 from app.routers.scraper import router as scraper_router
 from app.routers.etl.routes import router as etl_router
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging()
+    logger.info("app_startup", extra={"event": "startup"})
     db_conn.connect()
     scraper_db.connect()
     prediction_db.connect()
@@ -30,7 +37,9 @@ async def lifespan(app: FastAPI):
     await rdf_client.start()
     await krs_client.start()
     register_adapter("ms_gov", MsGovKrsAdapter())
+    logger.info("app_ready", extra={"event": "ready"})
     yield
+    logger.info("app_shutdown", extra={"event": "shutdown"})
     await krs_client.stop()
     await rdf_client.stop()
     db_conn.close()
@@ -46,6 +55,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# Request / response logging middleware
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    t0 = time.monotonic()
+    method = request.method
+    path = request.url.path
+
+    logger.debug(
+        "request_started",
+        extra={"event": "request_started", "method": method, "path": path},
+    )
+
+    response = await call_next(request)
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "request_finished",
+        extra={
+            "event": "request_finished",
+            "method": method,
+            "path": path,
+            "status_code": response.status_code,
+            "latency_ms": latency_ms,
+        },
+    )
+    return response
+
+
 app.include_router(rdf_router)
 app.include_router(analysis_router)
 app.include_router(scraper_router)
@@ -54,6 +95,16 @@ app.include_router(etl_router)
 
 @app.exception_handler(httpx.HTTPStatusError)
 async def upstream_error_handler(request: Request, exc: httpx.HTTPStatusError):
+    logger.error(
+        "upstream_http_error",
+        extra={
+            "event": "upstream_http_error",
+            "upstream_status": exc.response.status_code,
+            "upstream_url": str(exc.request.url),
+            "method": request.method,
+            "path": request.url.path,
+        },
+    )
     return JSONResponse(
         status_code=502,
         content={
@@ -66,6 +117,16 @@ async def upstream_error_handler(request: Request, exc: httpx.HTTPStatusError):
 
 @app.exception_handler(httpx.RequestError)
 async def upstream_request_error_handler(request: Request, exc: httpx.RequestError):
+    logger.error(
+        "upstream_connection_error",
+        extra={
+            "event": "upstream_connection_error",
+            "error_type": type(exc).__name__,
+            "upstream_url": str(exc.request.url) if exc.request else None,
+            "method": request.method,
+            "path": request.url.path,
+        },
+    )
     return JSONResponse(
         status_code=502,
         content={

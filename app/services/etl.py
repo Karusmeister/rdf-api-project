@@ -218,8 +218,14 @@ def ingest_document(document_id: str, storage: Optional[LocalStorage] = None) ->
     prediction_db.update_report_status(report_id, "completed")
 
     logger.info(
-        "Ingested document %s: krs=%s, fiscal_year=%d, line_items=%d",
-        document_id, krs, fiscal_year, len(line_items),
+        "document_ingested",
+        extra={
+            "event": "document_ingested",
+            "document_id": document_id,
+            "krs": krs,
+            "fiscal_year": fiscal_year,
+            "line_items": len(line_items),
+        },
     )
 
     return {
@@ -273,7 +279,11 @@ def ingest_all_pending(storage: Optional[LocalStorage] = None) -> dict:
         except Exception as e:
             results["failed"] += 1
             results["errors"].append({"document_id": doc_id, "error": str(e)})
-            logger.error("Failed to ingest %s: %s", doc_id, e)
+            logger.error(
+                "ingest_failed",
+                extra={"event": "ingest_failed", "document_id": doc_id, "error": str(e)},
+                exc_info=True,
+            )
 
     return results
 

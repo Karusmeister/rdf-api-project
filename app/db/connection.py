@@ -7,12 +7,15 @@ and prediction modules use this shared connection to the same DB file.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
 import duckdb
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 _conn: Optional[duckdb.DuckDBPyConnection] = None
 
@@ -26,6 +29,7 @@ def connect() -> duckdb.DuckDBPyConnection:
     if db_path != ":memory:":
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     _conn = duckdb.connect(db_path)
+    logger.info("db_connected", extra={"event": "db_connected", "path": db_path})
     return _conn
 
 
@@ -42,6 +46,7 @@ def close() -> None:
     if _conn is not None:
         _conn.close()
         _conn = None
+        logger.info("db_closed", extra={"event": "db_closed"})
 
 
 def reset() -> None:

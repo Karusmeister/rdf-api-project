@@ -4,6 +4,7 @@ All XML downloading/parsing happens server-side.
 """
 
 import asyncio
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -11,6 +12,8 @@ from fastapi import APIRouter, HTTPException
 from app import rdf_client
 from app.routers.analysis.schemas import CompareRequest, StatementRequest, TimeSeriesRequest
 from app.services import xml_parser
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
 
@@ -138,6 +141,7 @@ def _ratio_with_change(current: Optional[float], previous: Optional[float]) -> d
 @router.post("/statement")
 async def get_statement(body: StatementRequest):
     """Parse a single financial statement and return the full hierarchical tree."""
+    logger.info("statement_parse", extra={"event": "statement_parse", "krs": body.krs, "period_end": body.period_end})
     stmt = await _fetch_and_parse(body.krs, body.period_end)
     return stmt
 
@@ -148,6 +152,15 @@ async def compare(body: CompareRequest):
     Compare two financial statements year-over-year.
     Returns a merged tree with change calculations and financial ratios.
     """
+    logger.info(
+        "statement_compare",
+        extra={
+            "event": "statement_compare",
+            "krs": body.krs,
+            "current": body.period_end_current,
+            "previous": body.period_end_previous,
+        },
+    )
     # Fetch both statements (potentially in parallel)
     current_stmt, previous_stmt = await asyncio.gather(
         _fetch_and_parse(body.krs, body.period_end_current),
@@ -214,6 +227,10 @@ async def compare(body: CompareRequest):
 @router.post("/time-series")
 async def time_series(body: TimeSeriesRequest):
     """Track selected financial fields across multiple years."""
+    logger.info(
+        "time_series",
+        extra={"event": "time_series", "krs": body.krs, "fields": body.fields, "period_count": len(body.period_ends or [])},
+    )
     periods = await _get_available_periods(body.krs)
     if not periods:
         raise HTTPException(404, f"No financial statements found for KRS {body.krs}")
@@ -340,6 +357,7 @@ async def available_periods(krs: str):
     List all available Polish-GAAP financial statement periods for a company.
     Does NOT download XML — only calls /search + /metadata.
     """
+    logger.info("available_periods", extra={"event": "available_periods", "krs": krs})
     if not krs.isdigit() or len(krs) > 10:
         raise HTTPException(422, "krs must be 1–10 digits")
 

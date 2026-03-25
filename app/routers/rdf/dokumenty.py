@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
@@ -10,11 +12,14 @@ from app.routers.rdf.schemas import (
     SearchResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/dokumenty", tags=["rdf - dokumenty"])
 
 
 @router.post("/search", response_model=SearchResponse)
 async def search(body: SearchRequest):
+    logger.info("document_search", extra={"event": "document_search", "krs": body.krs, "page": body.page})
     data = await rdf_client.wyszukiwanie(
         krs=body.krs,
         page=body.page,
@@ -49,11 +54,13 @@ async def search(body: SearchRequest):
 
 @router.get("/metadata/{doc_id:path}")
 async def get_metadata(doc_id: str):
+    logger.info("metadata_fetch", extra={"event": "metadata_fetch", "doc_id": doc_id})
     return await rdf_client.metadata(doc_id)
 
 
 @router.post("/download")
 async def download(body: DownloadRequest):
+    logger.info("document_download", extra={"event": "document_download", "doc_count": len(body.document_ids)})
     data = await rdf_client.download(body.document_ids)
     return StreamingResponse(
         iter([data]),

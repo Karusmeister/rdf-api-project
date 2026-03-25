@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     max_connections: int = 20
     cors_origins: List[str] = ["*"]
     workers: int = 4
+    log_level: str = "INFO"
 
     # --- KRS Open API ---
     krs_api_base_url: str = "https://api-krs.ms.gov.pl/api/krs"

@@ -20,10 +20,11 @@ def cli():
 @click.option("--verbose", "-v", is_flag=True)
 def run(mode, krs, max_krs, verbose):
     """Run the scraper job."""
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    if verbose:
+        import os
+        os.environ["LOG_LEVEL"] = "DEBUG"
+    from app.logging_config import configure_logging
+    configure_logging()
     if krs:
         mode = "specific_krs"
 
