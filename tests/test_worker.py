@@ -78,7 +78,7 @@ async def test_process_krs_found(rdf_base):
     """KRS entity exists — returns 'found'."""
     with respx.mock:
         respx.post(f"{rdf_base}/podmioty/wyszukiwanie/dane-podstawowe").mock(
-            return_value=httpx.Response(200, json={"numerKRS": "0000000001", "nazwa": "Test"})
+            return_value=httpx.Response(200, json={"podmiot": {"numerKRS": "0000000001", "nazwa": "Test"}, "czyPodmiotZnaleziony": True})
         )
         respx.post(f"{rdf_base}/dokumenty/wyszukiwanie").mock(
             return_value=httpx.Response(200, json={"listaElementow": []})
@@ -93,7 +93,7 @@ async def test_process_krs_found_but_doc_lookup_fails(rdf_base):
     """Entity exists but document search returns 500 → 'error', not 'found'."""
     with respx.mock:
         respx.post(f"{rdf_base}/podmioty/wyszukiwanie/dane-podstawowe").mock(
-            return_value=httpx.Response(200, json={"numerKRS": "0000000001", "nazwa": "Test"})
+            return_value=httpx.Response(200, json={"podmiot": {"numerKRS": "0000000001", "nazwa": "Test"}, "czyPodmiotZnaleziony": True})
         )
         respx.post(f"{rdf_base}/dokumenty/wyszukiwanie").mock(
             return_value=httpx.Response(500)
@@ -158,7 +158,7 @@ async def test_process_krs_429_retries_then_succeeds(rdf_base):
         call_count += 1
         if call_count <= 2:
             return httpx.Response(429)
-        return httpx.Response(200, json={"numerKRS": "0000000001", "nazwa": "Test"})
+        return httpx.Response(200, json={"podmiot": {"numerKRS": "0000000001", "nazwa": "Test"}, "czyPodmiotZnaleziony": True})
 
     with respx.mock:
         respx.post(f"{rdf_base}/podmioty/wyszukiwanie/dane-podstawowe").mock(
@@ -197,7 +197,7 @@ async def test_process_krs_503_retries(rdf_base):
         call_count += 1
         if call_count == 1:
             return httpx.Response(503)
-        return httpx.Response(200, json={"numerKRS": "0000000001", "nazwa": "Ok"})
+        return httpx.Response(200, json={"podmiot": {"numerKRS": "0000000001", "nazwa": "Ok"}, "czyPodmiotZnaleziony": True})
 
     with respx.mock:
         respx.post(f"{rdf_base}/podmioty/wyszukiwanie/dane-podstawowe").mock(

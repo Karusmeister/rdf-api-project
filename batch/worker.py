@@ -105,8 +105,19 @@ async def _process_krs_with_backoff(
             resp.raise_for_status()
 
             data = resp.json()
-            if not data or (isinstance(data, dict) and not data.get("numerKRS")):
+            # The live API nests the entity under "podmiot" and sets
+            # "czyPodmiotZnaleziony": true when the KRS exists.
+            if not data:
                 return "not_found"
+            if isinstance(data, dict):
+                podmiot = data.get("podmiot") or {}
+                found = (
+                    data.get("czyPodmiotZnaleziony")
+                    or data.get("numerKRS")
+                    or podmiot.get("numerKRS")
+                )
+                if not found:
+                    return "not_found"
 
             # Entity exists — fetch documents
             encrypted = encrypt_nrkrs(krs_str.lstrip("0") or "0")
@@ -187,9 +198,16 @@ async def _worker_loop(
             if store.is_done(krs_num):
                 return
 
-            async with sem:
-                result = await _process_krs_with_backoff(client, krs_str, worker_id)
-                await asyncio.sleep(delay)
+            try:
+                async with sem:
+                    result = await _process_krs_with_backoff(client, krs_str, worker_id)
+                    await asyncio.sleep(delay)
+            except Exception as exc:
+                logger.error(
+                    "worker=%d krs=%s unexpected_error %s: %s",
+                    worker_id, krs_str, type(exc).__name__, exc,
+                )
+                result = "error"
 
             store.mark(krs_num, result, worker_id)
             stats.processed += 1

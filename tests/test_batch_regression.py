@@ -34,10 +34,14 @@ DIRECT_CONN = Connection(name="direct")
 def _entity_response(krs_str: str) -> dict:
     """Realistic dane-podstawowe 200 response for an existing entity."""
     return {
-        "numerKRS": krs_str,
-        "nazwaPodmiotu": f"TEST SP. Z O.O. ({krs_str})",
-        "formaPrawna": "SP. Z O.O.",
-        "wykreslenie": "",
+        "podmiot": {
+            "numerKRS": krs_str,
+            "nazwaPodmiotu": f"TEST SP. Z O.O. ({krs_str})",
+            "formaPrawna": "SP. Z O.O.",
+            "wykreslenie": "",
+        },
+        "czyPodmiotZnaleziony": True,
+        "komunikatBledu": None,
     }
 
 
