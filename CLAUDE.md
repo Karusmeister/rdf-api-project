@@ -116,6 +116,13 @@ app/
     db.py              - DuckDB schema + CRUD for scraper tables (existing)
     job.py             - Scraper job logic
     storage.py         - Document storage abstraction
+batch/
+  __init__.py          - Package marker
+  __main__.py          - `python -m batch` entrypoint
+  connections.py       - Connection dataclass + NordVPN SOCKS5 pool builder
+  progress.py          - DuckDB-backed progress store (batch_progress table)
+  worker.py            - Async worker loop with stride partitioning + backoff
+  runner.py            - Multiprocessing orchestrator + argparse CLI
 scripts/
   seed_features.py     - Populate feature_definitions and feature_sets
 tests/
@@ -136,6 +143,10 @@ tests/
   test_monitoring.py       - Metrics ring buffer + adapter integration tests
   test_krs_pipeline.py     - KRS sync pipeline integration tests (respx mocks)
   test_krs_scanner.py      - KRS sequential scanner tests (respx mocks)
+  test_connections.py      - Batch connection pool tests
+  test_progress.py         - Batch DuckDB progress store tests
+  test_worker.py           - Batch worker loop + backoff tests (respx mocks)
+  test_runner.py           - Batch runner orchestrator + CLI tests
 data/
   scraper.duckdb       - Single DuckDB file for ALL tables (scraper + prediction)
   documents/           - Extracted RDF files + manifest.json
@@ -153,6 +164,9 @@ data/
 - `krs_sync_log` - Sync run history (started_at, counts, status).
 - `krs_scan_cursor` - Single-row table tracking next KRS integer to probe. PK = boolean TRUE.
 - `krs_scan_runs` - One row per scanner invocation (krs_from/to, probed/valid/error counts, stopped_reason).
+
+### Batch scanner table (batch/progress.py)
+- `batch_progress` - Tracks which KRS integers have been probed by the batch scanner. PK = krs BIGINT. Status: found/not_found/error.
 
 ### Prediction tables (app/db/prediction_db.py)
 Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
@@ -226,6 +240,11 @@ pytest tests/test_crypto.py -v
 
 # Seed feature definitions
 python scripts/seed_features.py
+
+# Batch KRS scanner (all flags optional, defaults from .env)
+python -m batch.runner
+python -m batch.runner --start 500000 --workers 3 --vpn
+python -m batch.runner --start 1 --no-vpn --delay 2.0
 ```
 
 ## API endpoints
