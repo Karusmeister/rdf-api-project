@@ -255,7 +255,7 @@ async def test_doc_lookup_failure_records_error_not_found(db_path):
         )
 
         async with httpx.AsyncClient(base_url=RDF_BASE) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
 
     assert result == "error"
 
@@ -352,7 +352,7 @@ async def test_429_backoff_eventual_success_in_db(db_path):
         )
 
         async with httpx.AsyncClient(base_url=RDF_BASE) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
 
     store.mark(1, result, worker_id=0)
 

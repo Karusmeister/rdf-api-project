@@ -17,10 +17,18 @@ class Connection:
 
 
 def _socks5_url(server_hostname: str) -> str:
-    """Build NordVPN SOCKS5 URL from config credentials and a hostname stub."""
+    """Build NordVPN SOCKS5 URL from config credentials and a server hostname.
+
+    Accepts both full hostnames (amsterdam.nl.socks.nordhold.net) and
+    short stubs (pl192) — appends .nordvpn.com only for short stubs.
+    """
     u = settings.nordvpn_username
     p = settings.nordvpn_password
-    return f"socks5://{u}:{p}@{server_hostname}.nordvpn.com:1080"
+    if "." in server_hostname:
+        host = server_hostname  # full hostname
+    else:
+        host = f"{server_hostname}.nordvpn.com"  # short stub
+    return f"socks5://{u}:{p}@{host}:1080"
 
 
 def build_pool() -> list[Connection]:

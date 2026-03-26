@@ -73,7 +73,7 @@ async def test_live_lookup_existing_entity(krs, label, db_path):
         timeout=30,
         follow_redirects=True,
     ) as client:
-        result = await _process_krs_with_backoff(client, krs, worker_id=0)
+        result, _ = await _process_krs_with_backoff(client, krs, worker_id=0)
 
     assert result == "found", f"Expected 'found' for KRS {krs} ({label}), got '{result}'"
 
@@ -112,7 +112,7 @@ async def test_live_lookup_nonexistent_entity(db_path):
         timeout=30,
         follow_redirects=True,
     ) as client:
-        result = await _process_krs_with_backoff(client, krs, worker_id=0)
+        result, _ = await _process_krs_with_backoff(client, krs, worker_id=0)
 
     assert result == "not_found", f"Expected 'not_found' for KRS {krs}, got '{result}'"
 

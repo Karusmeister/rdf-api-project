@@ -17,6 +17,7 @@ import httpx
 from app.config import settings
 from app.crypto import encrypt_nrkrs
 from batch.connections import Connection
+from batch.entity_store import EntityStore
 from batch.progress import ProgressStore
 
 logger = logging.getLogger(__name__)
@@ -76,10 +77,11 @@ async def _process_krs_with_backoff(
     client: httpx.AsyncClient,
     krs_str: str,
     worker_id: int,
-) -> str:
+) -> tuple[str, dict | None]:
     """Call RDF API for a single KRS number, with exponential backoff on 429/503.
 
-    Returns one of: "found", "not_found", "error".
+    Returns (status, entity_data) where status is "found"/"not_found"/"error"
+    and entity_data is the parsed podmiot dict (or None).
     """
     for attempt in range(_MAX_RETRIES_RATE_LIMIT + 1):
         try:
@@ -100,7 +102,7 @@ async def _process_krs_with_backoff(
                     "worker=%d krs=%s max_retries_exceeded status=%d",
                     worker_id, krs_str, resp.status_code,
                 )
-                return "error"
+                return "error", None
 
             resp.raise_for_status()
 
@@ -108,7 +110,7 @@ async def _process_krs_with_backoff(
             # The live API nests the entity under "podmiot" and sets
             # "czyPodmiotZnaleziony": true when the KRS exists.
             if not data:
-                return "not_found"
+                return "not_found", None
             if isinstance(data, dict):
                 podmiot = data.get("podmiot") or {}
                 found = (
@@ -117,7 +119,7 @@ async def _process_krs_with_backoff(
                     or podmiot.get("numerKRS")
                 )
                 if not found:
-                    return "not_found"
+                    return "not_found", None
 
             # Entity exists — fetch documents
             encrypted = encrypt_nrkrs(krs_str.lstrip("0") or "0")
@@ -131,8 +133,7 @@ async def _process_krs_with_backoff(
             }
             doc_resp = await client.post("/dokumenty/wyszukiwanie", json=doc_payload)
             doc_resp.raise_for_status()
-            # TODO: insert into DB / trigger analysis pipeline here
-            return "found"
+            return "found", data
 
         except httpx.HTTPStatusError as exc:
             # Non-retryable HTTP errors (4xx other than 429, 5xx other than 503)
@@ -151,7 +152,7 @@ async def _process_krs_with_backoff(
                 "worker=%d krs=%s http_error status=%d",
                 worker_id, krs_str, status,
             )
-            return "error"
+            return "error", None
 
         except (httpx.TimeoutException, httpx.ConnectError, OSError) as exc:
             if attempt < _MAX_RETRIES_NETWORK:
@@ -166,9 +167,9 @@ async def _process_krs_with_backoff(
                 "worker=%d krs=%s network_error type=%s",
                 worker_id, krs_str, type(exc).__name__,
             )
-            return "error"
+            return "error", None
 
-    return "error"
+    return "error", None
 
 
 async def _worker_loop(
@@ -187,6 +188,7 @@ async def _worker_loop(
     new KRS numbers while existing tasks are still running.
     """
     store = ProgressStore(db_path)
+    entities = EntityStore(db_path)
     stats = WorkerStats()
     sem = asyncio.Semaphore(concurrency)
 
@@ -198,9 +200,10 @@ async def _worker_loop(
             if store.is_done(krs_num):
                 return
 
+            entity_data = None
             try:
                 async with sem:
-                    result = await _process_krs_with_backoff(client, krs_str, worker_id)
+                    result, entity_data = await _process_krs_with_backoff(client, krs_str, worker_id)
                     await asyncio.sleep(delay)
             except Exception as exc:
                 logger.error(
@@ -208,6 +211,19 @@ async def _worker_loop(
                     worker_id, krs_str, type(exc).__name__, exc,
                 )
                 result = "error"
+
+            # Store entity in krs_entities + krs_registry
+            if result == "found" and entity_data:
+                try:
+                    podmiot = entity_data.get("podmiot") or {}
+                    name = podmiot.get("nazwaPodmiotu", "")
+                    legal_form = podmiot.get("formaPrawna")
+                    entities.upsert_entity(krs_str, name, legal_form=legal_form, raw=entity_data)
+                except Exception as exc:
+                    logger.warning(
+                        "worker=%d krs=%s entity_store_error %s: %s",
+                        worker_id, krs_str, type(exc).__name__, exc,
+                    )
 
             store.mark(krs_num, result, worker_id)
             stats.processed += 1

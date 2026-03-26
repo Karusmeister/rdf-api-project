@@ -84,7 +84,7 @@ async def test_process_krs_found(rdf_base):
             return_value=httpx.Response(200, json={"listaElementow": []})
         )
         async with httpx.AsyncClient(base_url=rdf_base) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "found"
 
 
@@ -99,7 +99,7 @@ async def test_process_krs_found_but_doc_lookup_fails(rdf_base):
             return_value=httpx.Response(500)
         )
         async with httpx.AsyncClient(base_url=rdf_base) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "error"
 
 
@@ -111,7 +111,7 @@ async def test_process_krs_not_found_empty_dict(rdf_base):
             return_value=httpx.Response(200, json={})
         )
         async with httpx.AsyncClient(base_url=rdf_base) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "not_found"
 
 
@@ -123,7 +123,7 @@ async def test_process_krs_not_found_empty_body(rdf_base):
             return_value=httpx.Response(200, json=[])
         )
         async with httpx.AsyncClient(base_url=rdf_base) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "not_found"
 
 
@@ -142,7 +142,7 @@ async def test_process_krs_http_500_no_retry(rdf_base):
             side_effect=side_effect
         )
         async with httpx.AsyncClient(base_url=rdf_base) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "error"
     assert call_count == 1  # no retry on 500
 
@@ -168,7 +168,7 @@ async def test_process_krs_429_retries_then_succeeds(rdf_base):
             return_value=httpx.Response(200, json={"listaElementow": []})
         )
         async with httpx.AsyncClient(base_url=rdf_base) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "found"
     assert call_count == 3
 
@@ -182,7 +182,7 @@ async def test_process_krs_429_max_retries_exceeded(rdf_base):
             return_value=httpx.Response(429)
         )
         async with httpx.AsyncClient(base_url=rdf_base) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "error"
 
 
@@ -207,7 +207,7 @@ async def test_process_krs_503_retries(rdf_base):
             return_value=httpx.Response(200, json={})
         )
         async with httpx.AsyncClient(base_url=rdf_base) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "found"
     assert call_count == 2
 
@@ -228,7 +228,7 @@ async def test_process_krs_timeout_retries(rdf_base):
             side_effect=side_effect
         )
         async with httpx.AsyncClient(base_url=rdf_base) as client:
-            result = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
+            result, _ = await _process_krs_with_backoff(client, "0000000001", worker_id=0)
     assert result == "error"
     assert call_count == 3  # initial + 2 retries
 

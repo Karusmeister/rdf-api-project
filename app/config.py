@@ -33,10 +33,10 @@ class Settings(BaseSettings):
 
     # --- Batch runner ---
     batch_use_vpn: bool = False
-    batch_workers: int = 3
+    batch_workers: int = 4
     batch_start_krs: int = 1
     batch_concurrency_per_worker: int = 3
-    batch_delay_seconds: float = 1.0
+    batch_delay_seconds: float = 2.5
     batch_db_path: str = "data/scraper.duckdb"
 
     # NordVPN SOCKS5 credentials (only used when batch_use_vpn=true)
