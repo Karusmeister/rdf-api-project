@@ -22,6 +22,7 @@ import pytest
 
 from app.config import settings
 from app.crypto import encrypt_nrkrs
+from batch.connections import Connection
 from batch.progress import ProgressStore
 from batch.worker import (
     _make_client,
@@ -31,6 +32,7 @@ from batch.worker import (
 
 pytestmark = pytest.mark.e2e
 
+DIRECT_CONN = Connection(name="direct")
 RDF_BASE = settings.rdf_base_url
 
 # Well-known Polish companies that must exist in KRS
@@ -190,7 +192,7 @@ async def test_live_stride_partitioning(db_path):
                     worker_id=worker_id,
                     start_krs=start,
                     stride=2,
-
+                    connection=DIRECT_CONN,
                     concurrency=1,
                     delay=1.0,
                     db_path=db_path,

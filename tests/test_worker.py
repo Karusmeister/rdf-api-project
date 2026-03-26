@@ -9,6 +9,7 @@ import pytest
 import respx
 
 from app.config import settings
+from batch.connections import Connection
 from batch.progress import ProgressStore
 from batch.worker import (
     WorkerStats,
@@ -42,8 +43,16 @@ def test_worker_stats_log_does_not_raise(caplog):
 # _make_client
 # ---------------------------------------------------------------------------
 
-def test_make_client_creates_async_client():
-    client = _make_client()
+def test_make_client_direct():
+    conn = Connection(name="direct")
+    client = _make_client(conn)
+    assert isinstance(client, httpx.AsyncClient)
+
+
+def test_make_client_with_socks5_proxy():
+    """SOCKS5 proxy client can be constructed (socksio is installed)."""
+    conn = Connection(name="pl192", proxy_url="socks5://u:p@pl192.nordvpn.com:1080")
+    client = _make_client(conn)
     assert isinstance(client, httpx.AsyncClient)
 
 

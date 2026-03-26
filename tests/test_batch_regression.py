@@ -13,6 +13,7 @@ import pytest
 import respx
 
 from app.config import settings
+from batch.connections import Connection
 from batch.progress import ProgressStore
 from batch.worker import (
     _make_client,
@@ -27,6 +28,7 @@ from batch.worker import (
 # ---------------------------------------------------------------------------
 
 RDF_BASE = settings.rdf_base_url
+DIRECT_CONN = Connection(name="direct")
 
 
 def _entity_response(krs_str: str) -> dict:
@@ -112,7 +114,7 @@ async def test_worker_loop_processes_range_into_progress_db(db_path):
                     worker_id=0,
                     start_krs=1,
                     stride=1,
-
+                    connection=DIRECT_CONN,
                     concurrency=1,
                     delay=0,
                     db_path=db_path,
@@ -160,7 +162,7 @@ async def test_worker_loop_resumes_and_skips_done(db_path):
                     worker_id=0,
                     start_krs=1,
                     stride=1,
-
+                    connection=DIRECT_CONN,
                     concurrency=1,
                     delay=0,
                     db_path=db_path,
@@ -213,7 +215,7 @@ async def test_mixed_responses_recorded_correctly(db_path):
                     worker_id=0,
                     start_krs=1,
                     stride=1,
-
+                    connection=DIRECT_CONN,
                     concurrency=1,
                     delay=0,
                     db_path=db_path,
@@ -286,7 +288,7 @@ async def test_stride_partitioning_disjoint(db_path):
             await asyncio.wait_for(
                 _worker_loop(
                     worker_id=0, start_krs=1, stride=2,
-                    concurrency=1, delay=0,
+                    connection=DIRECT_CONN, concurrency=1, delay=0,
                     db_path=db_path,
                 ),
                 timeout=0.5,
@@ -297,7 +299,7 @@ async def test_stride_partitioning_disjoint(db_path):
             await asyncio.wait_for(
                 _worker_loop(
                     worker_id=1, start_krs=2, stride=2,
-                    concurrency=1, delay=0,
+                    connection=DIRECT_CONN, concurrency=1, delay=0,
                     db_path=db_path,
                 ),
                 timeout=0.5,
@@ -383,7 +385,7 @@ async def test_concurrency_processes_multiple_in_flight(db_path):
             await asyncio.wait_for(
                 _worker_loop(
                     worker_id=0, start_krs=1, stride=1,
-                    concurrency=3, delay=0,
+                    connection=DIRECT_CONN, concurrency=3, delay=0,
                     db_path=db_path,
                 ),
                 timeout=1.0,
@@ -443,12 +445,16 @@ def test_multi_process_shared_db_no_deadlock(db_path):
 
 
 # ---------------------------------------------------------------------------
-# 9. Client creation
+# 9. SOCKS5 proxy client creation (code-review fix #2)
 # ---------------------------------------------------------------------------
 
-def test_make_client_creates_async_client():
-    """httpx.AsyncClient is created correctly."""
-    client = _make_client()
+def test_socks5_proxy_client_creates_successfully():
+    """httpx.AsyncClient with socks5:// proxy can be constructed (socksio installed)."""
+    conn = Connection(
+        name="pl192",
+        proxy_url="socks5://testuser:testpass@pl192.nordvpn.com:1080",
+    )
+    client = _make_client(conn)
     assert isinstance(client, httpx.AsyncClient)
 
 
@@ -456,10 +462,12 @@ def test_make_client_creates_async_client():
 # 10. Runner exit code on worker failure (code-review fix #5)
 # ---------------------------------------------------------------------------
 
-def test_runner_surfaces_worker_failure():
+def test_runner_surfaces_worker_failure(monkeypatch):
     """Runner raises SystemExit(1) when a worker process exits non-zero."""
     from unittest.mock import MagicMock, patch
     from batch.runner import run_batch
+
+    monkeypatch.setattr(settings, "nordvpn_servers", [])
 
     mock_proc = MagicMock()
     mock_proc.pid = 1
@@ -468,4 +476,4 @@ def test_runner_surfaces_worker_failure():
 
     with patch("batch.runner.multiprocessing.Process", return_value=mock_proc):
         with pytest.raises(SystemExit):
-            run_batch(start_krs=1, workers=1, db_path="/tmp/unused.duckdb")
+            run_batch(start_krs=1, workers=1, use_vpn=False, db_path="/tmp/unused.duckdb")

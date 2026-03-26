@@ -16,6 +16,7 @@ import httpx
 
 from app.config import settings
 from app.crypto import encrypt_nrkrs
+from batch.connections import Connection
 from batch.progress import ProgressStore
 
 logger = logging.getLogger(__name__)
@@ -58,14 +59,17 @@ class WorkerStats:
         )
 
 
-def _make_client() -> httpx.AsyncClient:
-    """Create an httpx.AsyncClient. VPN is handled at the OS level."""
-    return httpx.AsyncClient(
-        base_url=_RDF_BASE,
-        headers=_RDF_HEADERS,
-        timeout=settings.request_timeout,
-        follow_redirects=True,
-    )
+def _make_client(connection: Connection) -> httpx.AsyncClient:
+    """Create an httpx.AsyncClient, optionally with a SOCKS5 proxy."""
+    kwargs: dict = {
+        "base_url": _RDF_BASE,
+        "headers": _RDF_HEADERS,
+        "timeout": settings.request_timeout,
+        "follow_redirects": True,
+    }
+    if connection.proxy_url is not None:
+        kwargs["proxy"] = connection.proxy_url
+    return httpx.AsyncClient(**kwargs)
 
 
 async def _process_krs_with_backoff(
@@ -171,6 +175,7 @@ async def _worker_loop(
     worker_id: int,
     start_krs: int,
     stride: int,
+    connection: Connection,
     concurrency: int,
     delay: float,
     db_path: str,
@@ -185,7 +190,7 @@ async def _worker_loop(
     stats = WorkerStats()
     sem = asyncio.Semaphore(concurrency)
 
-    async with _make_client() as client:
+    async with _make_client(connection) as client:
 
         async def _handle_one(krs_num: int) -> None:
             krs_str = str(krs_num).zfill(10)
@@ -245,6 +250,7 @@ def run_worker(
     worker_id: int,
     start_krs: int,
     stride: int,
+    connection: Connection,
     concurrency: int,
     delay: float,
     db_path: str,
@@ -255,14 +261,15 @@ def run_worker(
         format=f"%(asctime)s [worker-{worker_id}] %(levelname)s %(message)s",
     )
     logger.info(
-        "worker=%d starting start_krs=%d stride=%d concurrency=%d delay=%.1f",
-        worker_id, start_krs, stride, concurrency, delay,
+        "worker=%d starting start_krs=%d stride=%d connection=%s concurrency=%d delay=%.1f",
+        worker_id, start_krs, stride, connection.name, concurrency, delay,
     )
     asyncio.run(
         _worker_loop(
             worker_id=worker_id,
             start_krs=start_krs,
             stride=stride,
+            connection=connection,
             concurrency=concurrency,
             delay=delay,
             db_path=db_path,
