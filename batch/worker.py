@@ -41,6 +41,12 @@ _MAX_RETRIES_NETWORK = 2     # for connection/timeout errors
 _BACKOFF_CAP_SECONDS = 60.0
 _NETWORK_RETRY_DELAY = 5.0
 
+# Connection health constants
+_CONSECUTIVE_FAILURES_THRESHOLD = 3   # failures before adding extra delay
+_EXTRA_DELAY_INCREMENT = 1.0          # seconds added per threshold hit
+_EXTRA_DELAY_CAP = 5.0               # max extra delay before cooldown
+_COOLDOWN_SECONDS = 60.0             # pause connection for this long
+
 
 @dataclass
 class WorkerStats:
@@ -58,6 +64,36 @@ class WorkerStats:
             worker_id, self.processed, self.found, self.not_found,
             self.errors, elapsed, rate,
         )
+
+
+@dataclass
+class ConnectionHealth:
+    """Track consecutive failures and manage adaptive delays / cooldowns."""
+    consecutive_failures: int = 0
+    extra_delay: float = 0.0
+
+    def record_success(self):
+        self.consecutive_failures = 0
+        self.extra_delay = 0.0
+
+    def record_failure(self) -> float | None:
+        """Record a failure. Returns cooldown seconds if connection should pause, else None."""
+        self.consecutive_failures += 1
+
+        if self.consecutive_failures % _CONSECUTIVE_FAILURES_THRESHOLD == 0:
+            self.extra_delay = min(
+                self.extra_delay + _EXTRA_DELAY_INCREMENT,
+                _EXTRA_DELAY_CAP,
+            )
+
+        # If we've hit the cap and still failing, trigger cooldown
+        if (self.extra_delay >= _EXTRA_DELAY_CAP
+                and self.consecutive_failures >= _CONSECUTIVE_FAILURES_THRESHOLD * 2):
+            self.consecutive_failures = 0
+            self.extra_delay = 0.0
+            return _COOLDOWN_SECONDS
+
+        return None
 
 
 def _make_client(connection: Connection) -> httpx.AsyncClient:
@@ -186,10 +222,15 @@ async def _worker_loop(
     Launches up to `concurrency` tasks in parallel using a semaphore to
     bound in-flight requests.  A feeder coroutine continuously schedules
     new KRS numbers while existing tasks are still running.
+
+    Tracks connection health: after 3 consecutive failures the inter-request
+    delay increases by 1s (up to +5s).  If failures persist at max delay,
+    the connection pauses for 60s then resets.
     """
     store = ProgressStore(db_path)
     entities = EntityStore(db_path)
     stats = WorkerStats()
+    health = ConnectionHealth()
     sem = asyncio.Semaphore(concurrency)
 
     async with _make_client(connection) as client:
@@ -204,13 +245,33 @@ async def _worker_loop(
             try:
                 async with sem:
                     result, entity_data = await _process_krs_with_backoff(client, krs_str, worker_id)
-                    await asyncio.sleep(delay)
+                    effective_delay = delay + health.extra_delay
+                    await asyncio.sleep(effective_delay)
             except Exception as exc:
                 logger.error(
                     "worker=%d krs=%s unexpected_error %s: %s",
                     worker_id, krs_str, type(exc).__name__, exc,
                 )
                 result = "error"
+
+            # Track connection health
+            if result == "error":
+                cooldown = health.record_failure()
+                if cooldown:
+                    logger.warning(
+                        "worker=%d connection=%s cooldown=%.0fs after %d consecutive failures",
+                        worker_id, connection.name, cooldown,
+                        _CONSECUTIVE_FAILURES_THRESHOLD * 2,
+                    )
+                    await asyncio.sleep(cooldown)
+                elif health.extra_delay > 0:
+                    logger.info(
+                        "worker=%d connection=%s extra_delay=+%.1fs consecutive_failures=%d",
+                        worker_id, connection.name, health.extra_delay,
+                        health.consecutive_failures,
+                    )
+            else:
+                health.record_success()
 
             # Store entity in krs_entities + krs_registry
             if result == "found" and entity_data:
