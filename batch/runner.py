@@ -12,11 +12,14 @@ All flags are optional and fall back to settings from .env / app/config.py.
 import argparse
 import logging
 import multiprocessing
+import os
 import signal
 import sys
 
 from app.config import settings
 from batch.connections import Connection, build_pool
+from batch.entity_store import EntityStore
+from batch.progress import ProgressStore
 from batch.worker import run_worker
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,11 @@ def run_batch(
 
     if _vpn:
         _validate_vpn_config()
+
+    # Init DB schemas once in the parent process before spawning workers.
+    # This avoids all workers racing to CREATE TABLE simultaneously.
+    ProgressStore(_db)
+    EntityStore(_db)
 
     logger.info(
         "batch_start workers=%d start_krs=%d vpn=%s concurrency=%d delay=%.1f db=%s",
@@ -168,6 +176,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # macOS defaults to 'spawn' which doesn't survive nohup well.
+    # 'fork' keeps children alive when parent is backgrounded.
+    if os.name != "nt":
+        multiprocessing.set_start_method("fork", force=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [runner] %(levelname)s %(message)s",

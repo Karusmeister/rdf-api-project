@@ -13,16 +13,17 @@ import time
 
 import duckdb
 
-_MAX_LOCK_RETRIES = 10
+_MAX_LOCK_RETRIES = 20
 _BASE_LOCK_DELAY = 0.05  # 50ms base, jittered
 
 
 class ProgressStore:
     """Track which KRS numbers have been processed (found / not_found / error)."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, init_schema: bool = True):
         self._db_path = db_path
-        self._init_schema()
+        if init_schema:
+            self._init_schema()
 
     def _with_conn(self, fn):
         """Open a short-lived connection, call fn(conn), close, return result.

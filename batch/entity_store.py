@@ -11,16 +11,17 @@ from datetime import datetime, timezone
 
 import duckdb
 
-_MAX_LOCK_RETRIES = 10
+_MAX_LOCK_RETRIES = 20
 _BASE_LOCK_DELAY = 0.05
 
 
 class EntityStore:
     """Upsert KRS entities discovered by the batch scanner."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, init_schema: bool = True):
         self._db_path = db_path
-        self._ensure_tables()
+        if init_schema:
+            self._ensure_tables()
 
     def _with_conn(self, fn):
         for attempt in range(_MAX_LOCK_RETRIES):
