@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.adapters.exceptions import AdapterError, EntityNotFoundError
+from app.adapters.exceptions import AdapterError, EntityNotFoundError, RateLimitedError
 from app.adapters.registry import get as get_adapter
 from app.config import settings
 from app.repositories import krs_repo
@@ -28,6 +28,8 @@ _stop_event: asyncio.Event = asyncio.Event()
 _active_task: asyncio.Task[dict] | None = None
 
 CHECKPOINT_INTERVAL = 100  # flush stats to DB every N probes
+RATE_LIMIT_BACKOFF_S = 60  # pause when upstream rate-limits us
+MAX_CONSECUTIVE_ERRORS = 10  # stop scan after this many errors in a row
 
 
 def is_scan_running() -> bool:
@@ -134,61 +136,86 @@ async def _run_scan_inner(batch_size: int | None = None) -> dict:
     probed_count = 0
     valid_count = 0
     error_count = 0
+    consecutive_errors = 0
     last_probed = cursor_start
     stopped_by_signal = False
+    status = "completed"
 
-    try:
-        for krs_int in range(cursor_start, cursor_start + size):
-            # Check for graceful stop
-            if _stop_event.is_set():
-                stopped_by_signal = True
-                break
+    for krs_int in range(cursor_start, cursor_start + size):
+        # Check for graceful stop
+        if _stop_event.is_set():
+            stopped_by_signal = True
+            break
 
-            krs_str = str(krs_int).zfill(10)
-            try:
-                entity = await adapter.get_entity(krs_str)
-                if entity is not None:
-                    krs_repo.upsert_from_krs_entity(entity, source="ms_gov_scan")
-                    # Also upsert into krs_registry so krs_sync can re-enrich later
-                    scraper_db.upsert_krs(
-                        entity.krs, entity.name, entity.legal_form, is_active=True,
-                    )
-                    valid_count += 1
-            except EntityNotFoundError:
-                pass  # Expected — most KRS ints won't exist
-            except AdapterError as exc:
-                logger.warning("krs_scan_probe_error", extra={
-                    "event": "krs_scan_probe_error",
-                    "krs_int": krs_int,
-                    "error": str(exc),
-                })
-                error_count += 1
-
-            probed_count += 1
-            last_probed = krs_int
-
-            # Advance cursor after EVERY probe — crash loses at most 1
-            krs_repo.advance_cursor(krs_int + 1)
-
-            # Periodic checkpoint
-            if probed_count % CHECKPOINT_INTERVAL == 0:
-                krs_repo.update_scan_run(
-                    run_id,
-                    probed_count=probed_count,
-                    valid_count=valid_count,
-                    error_count=error_count,
+        krs_str = str(krs_int).zfill(10)
+        try:
+            entity = await adapter.get_entity(krs_str)
+            if entity is not None:
+                krs_repo.upsert_from_krs_entity(entity, source="ms_gov_scan")
+                # Also upsert into krs_registry so krs_sync can re-enrich later
+                scraper_db.upsert_krs(
+                    entity.krs, entity.name, entity.legal_form, is_active=True,
                 )
+                valid_count += 1
+            consecutive_errors = 0
+        except EntityNotFoundError:
+            consecutive_errors = 0  # 404 is expected, not an error
+        except RateLimitedError as exc:
+            logger.warning("krs_scan_rate_limited", extra={
+                "event": "krs_scan_rate_limited",
+                "krs_int": krs_int,
+                "backoff_s": RATE_LIMIT_BACKOFF_S,
+            })
+            error_count += 1
+            consecutive_errors += 1
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+        except AdapterError as exc:
+            logger.warning("krs_scan_probe_error", extra={
+                "event": "krs_scan_probe_error",
+                "krs_int": krs_int,
+                "error": str(exc),
+            })
+            error_count += 1
+            consecutive_errors += 1
+        except Exception as exc:
+            logger.exception("krs_scan_probe_unexpected", extra={
+                "event": "krs_scan_probe_unexpected",
+                "krs_int": krs_int,
+            })
+            error_count += 1
+            consecutive_errors += 1
 
-        status = "completed"
-    except Exception:
-        status = "failed"
-        logger.exception("krs_scan_failed", extra={
-            "event": "krs_scan_failed", "run_id": run_id,
-        })
+        probed_count += 1
+        last_probed = krs_int
 
-    stopped_reason = "signal" if stopped_by_signal else "batch_limit"
-    if status == "failed":
+        # Advance cursor after EVERY probe — crash loses at most 1
+        krs_repo.advance_cursor(krs_int + 1)
+
+        # Periodic checkpoint
+        if probed_count % CHECKPOINT_INTERVAL == 0:
+            krs_repo.update_scan_run(
+                run_id,
+                probed_count=probed_count,
+                valid_count=valid_count,
+                error_count=error_count,
+            )
+
+        # Bail if too many consecutive errors (upstream probably down)
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            logger.error("krs_scan_too_many_errors", extra={
+                "event": "krs_scan_too_many_errors",
+                "run_id": run_id,
+                "consecutive_errors": consecutive_errors,
+            })
+            status = "failed"
+            break
+
+    if stopped_by_signal:
+        stopped_reason = "signal"
+    elif status == "failed":
         stopped_reason = "error"
+    else:
+        stopped_reason = "batch_limit"
 
     krs_repo.close_scan_run(
         run_id,

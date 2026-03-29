@@ -28,6 +28,7 @@ def connect() -> None:
     """Ensure shared connection is open and KRS entity schema exists."""
     shared_conn.connect()
     _ensure_schema()
+    _close_orphaned_runs()
     logger.info("krs_repo_ready", extra={"event": "krs_repo_ready"})
 
 
@@ -115,6 +116,46 @@ def _init_schema() -> None:
             stopped_reason  VARCHAR
         )
     """)
+
+
+def _close_orphaned_runs() -> None:
+    """Close any scan/sync runs left in 'running' state from a prior crash."""
+    conn = get_conn()
+    now = datetime.now(timezone.utc).isoformat()
+
+    orphaned_scans = conn.execute(
+        "SELECT id FROM krs_scan_runs WHERE status = 'running'"
+    ).fetchall()
+    if orphaned_scans:
+        conn.execute(
+            """
+            UPDATE krs_scan_runs
+            SET status = 'interrupted', finished_at = ?, stopped_reason = 'process_killed'
+            WHERE status = 'running'
+            """,
+            [now],
+        )
+        ids = [r[0] for r in orphaned_scans]
+        logger.warning("krs_scan_orphaned_runs_closed", extra={
+            "event": "krs_scan_orphaned_runs_closed", "run_ids": ids,
+        })
+
+    orphaned_syncs = conn.execute(
+        "SELECT id FROM krs_sync_log WHERE status = 'running'"
+    ).fetchall()
+    if orphaned_syncs:
+        conn.execute(
+            """
+            UPDATE krs_sync_log
+            SET status = 'interrupted', finished_at = ?
+            WHERE status = 'running'
+            """,
+            [now],
+        )
+        ids = [r[0] for r in orphaned_syncs]
+        logger.warning("krs_sync_orphaned_runs_closed", extra={
+            "event": "krs_sync_orphaned_runs_closed", "run_ids": ids,
+        })
 
 
 def _ensure_krs_entities_columns(conn) -> None:

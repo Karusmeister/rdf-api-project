@@ -100,7 +100,7 @@ class MsGovKrsAdapter:
             resp = await krs_client.get(
                 f"/OdpisAktualny/{padded}",
                 params={"rejestr": "P", "format": "json"},
-                allowed_statuses={404},
+                allowed_statuses={404, 204},
             )
             latency_ms = int((time.monotonic() - t0) * 1000)
             record_api_call(
@@ -137,10 +137,22 @@ class MsGovKrsAdapter:
                 SOURCE, str(exc)
             ) from exc
 
-        if resp.status_code == 404:
+        if resp.status_code in (404, 204):
             return None
 
-        payload = resp.json()
+        try:
+            payload = resp.json()
+        except (ValueError, UnicodeDecodeError) as exc:
+            logger.warning("krs_api_invalid_json", extra={
+                "event": "krs_api_invalid_json",
+                "krs": padded,
+                "status_code": resp.status_code,
+                "body_preview": resp.text[:200] if resp.text else "",
+            })
+            raise UpstreamUnavailableError(
+                SOURCE, f"Non-JSON response (HTTP {resp.status_code})"
+            ) from exc
+
         return _extract_entity(padded, payload)
 
     async def search(
