@@ -169,13 +169,13 @@ def storage_with_xml(isolated_db):
     scraper_db.upsert_krs(krs, "Test Company Sp. z o.o.", "SP_Z_OO", True)
 
     now = datetime.now(timezone.utc)
-    scraper_db.get_conn().execute("""
-        INSERT INTO krs_documents
-            (document_id, krs, rodzaj, status, nazwa, okres_start, okres_end,
-             is_downloaded, storage_path, discovered_at)
-        VALUES (?, ?, '18', 'NIEUSUNIETY', 'test', '2023-01-01', '2023-12-31',
-                true, ?, ?)
-    """, [doc_id, krs, doc_dir, now])
+    scraper_db.insert_documents([{
+        "document_id": doc_id, "krs": krs,
+        "rodzaj": "18", "status": "NIEUSUNIETY",
+        "nazwa": "test", "okres_start": "2023-01-01", "okres_end": "2023-12-31",
+        "discovered_at": now,
+    }])
+    scraper_db.mark_downloaded(doc_id, doc_dir, "local", 0, 0, 1, "xml")
 
     return {"storage": storage, "krs": krs, "document_id": doc_id, "doc_dir": doc_dir}
 
@@ -289,11 +289,11 @@ class TestIngestDocument:
     def test_ingest_not_downloaded(self, isolated_db):
         scraper_db.upsert_krs("0000099999", None, None, True)
         now = datetime.now(timezone.utc)
-        scraper_db.get_conn().execute("""
-            INSERT INTO krs_documents
-                (document_id, krs, rodzaj, status, is_downloaded, discovered_at)
-            VALUES ('doc-not-dl', '0000099999', '18', 'NIEUSUNIETY', false, ?)
-        """, [now])
+        scraper_db.insert_documents([{
+            "document_id": "doc-not-dl", "krs": "0000099999",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
+            "discovered_at": now,
+        }])
 
         with pytest.raises(ValueError, match="not yet downloaded"):
             etl.ingest_document("doc-not-dl")
@@ -341,6 +341,142 @@ class TestIngestAllPending:
 
         result = etl.ingest_all_pending(storage=ctx["storage"])
         assert result["total"] == 0
+
+
+class TestEtlAttempts:
+    """PR4: ETL failure tracking via etl_attempts, no sentinel reports."""
+
+    def test_no_xml_records_etl_attempt(self, isolated_db):
+        """no_xml_found should create etl_attempts row, NOT a sentinel report."""
+        # Set up a document with empty storage dir (no XML)
+        storage_dir = isolated_db / "documents"
+        storage = LocalStorage(str(storage_dir))
+        krs = "0000099001"
+        doc_id = "doc-no-xml"
+        doc_dir = f"krs/{krs}/{doc_id}"
+        (storage_dir / doc_dir).mkdir(parents=True, exist_ok=True)
+
+        scraper_db.upsert_krs(krs, "NoXml Corp", None, True)
+        now = datetime.now(timezone.utc)
+        scraper_db.insert_documents([{
+            "document_id": doc_id, "krs": krs,
+            "rodzaj": "18", "status": "NIEUSUNIETY",
+            "discovered_at": now,
+        }])
+        scraper_db.mark_downloaded(doc_id, doc_dir, "local", 0, 0, 0, "")
+
+        result = etl.ingest_document(doc_id, storage=storage)
+        assert result["status"] == "failed"
+        assert result["error"] == "no_xml_found"
+
+        # etl_attempts should have a row
+        conn = prediction_db.get_conn()
+        attempts = conn.execute(
+            "SELECT status, reason_code FROM etl_attempts WHERE document_id = ?",
+            [doc_id],
+        ).fetchall()
+        assert len(attempts) == 1
+        assert attempts[0][0] == "failed"
+        assert attempts[0][1] == "no_xml_found"
+
+        # NO sentinel financial_reports should exist
+        sentinel_count = conn.execute("""
+            SELECT count(*) FROM financial_reports
+            WHERE source_document_id = ? AND fiscal_year = 0
+        """, [doc_id]).fetchone()[0]
+        assert sentinel_count == 0
+
+    def test_parse_error_records_etl_attempt(self, isolated_db):
+        """parse_error should create etl_attempts row, NOT a sentinel report."""
+        storage_dir = isolated_db / "documents"
+        storage = LocalStorage(str(storage_dir))
+        krs = "0000099002"
+        doc_id = "doc-bad-xml"
+        doc_dir = f"krs/{krs}/{doc_id}"
+        target = storage_dir / doc_dir
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "bad.xml").write_text("<<<TOTALLY BROKEN XML>>>", encoding="utf-8")
+
+        scraper_db.upsert_krs(krs, "BadXml Corp", None, True)
+        now = datetime.now(timezone.utc)
+        scraper_db.insert_documents([{
+            "document_id": doc_id, "krs": krs,
+            "rodzaj": "18", "status": "NIEUSUNIETY",
+            "discovered_at": now,
+        }])
+        scraper_db.mark_downloaded(doc_id, doc_dir, "local", 0, 0, 1, "xml")
+
+        result = etl.ingest_document(doc_id, storage=storage)
+        assert result["status"] == "failed"
+
+        conn = prediction_db.get_conn()
+        attempts = conn.execute(
+            "SELECT status, reason_code FROM etl_attempts WHERE document_id = ?",
+            [doc_id],
+        ).fetchall()
+        assert len(attempts) == 1
+        assert attempts[0][0] == "failed"
+        assert attempts[0][1] == "parse_error"
+
+        sentinel_count = conn.execute("""
+            SELECT count(*) FROM financial_reports
+            WHERE source_document_id = ? AND fiscal_year = 0
+        """, [doc_id]).fetchone()[0]
+        assert sentinel_count == 0
+
+    def test_success_records_etl_attempt_with_timestamps(self, storage_with_xml):
+        """Successful ingest should have started_at < finished_at."""
+        ctx = storage_with_xml
+        result = etl.ingest_document(ctx["document_id"], storage=ctx["storage"])
+        assert result["status"] == "completed"
+
+        conn = prediction_db.get_conn()
+        row = conn.execute(
+            "SELECT status, report_id, started_at, finished_at FROM etl_attempts WHERE document_id = ?",
+            [ctx["document_id"]],
+        ).fetchone()
+        assert row[0] == "completed"
+        assert row[1] == ctx["document_id"]
+        assert row[2] is not None  # started_at
+        assert row[3] is not None  # finished_at
+
+    def test_not_downloaded_records_skipped_attempt(self, isolated_db):
+        """Early exit for not-downloaded doc should record skipped attempt."""
+        scraper_db.upsert_krs("0000099003", None, None, True)
+        now = datetime.now(timezone.utc)
+        scraper_db.insert_documents([{
+            "document_id": "doc-skip-dl", "krs": "0000099003",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
+            "discovered_at": now,
+        }])
+
+        with pytest.raises(ValueError, match="not yet downloaded"):
+            etl.ingest_document("doc-skip-dl")
+
+        conn = prediction_db.get_conn()
+        row = conn.execute(
+            "SELECT status, reason_code FROM etl_attempts WHERE document_id = 'doc-skip-dl'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "skipped"
+        assert row[1] == "not_downloaded"
+
+    def test_unexpected_error_finalises_attempt(self, storage_with_xml):
+        """If an unexpected exception occurs mid-ingest, attempt must be finalised."""
+        ctx = storage_with_xml
+        with patch.object(prediction_db, "create_financial_report", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                etl.ingest_document(ctx["document_id"], storage=ctx["storage"])
+
+        conn = prediction_db.get_conn()
+        row = conn.execute(
+            "SELECT status, reason_code, error_message FROM etl_attempts WHERE document_id = ?",
+            [ctx["document_id"]],
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "failed"
+        assert row[1] == "unexpected_error"
+        assert "boom" in row[2]
 
 
 class TestFlattenTree:

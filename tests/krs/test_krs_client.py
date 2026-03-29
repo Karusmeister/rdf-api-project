@@ -19,7 +19,6 @@ async def _setup_client(monkeypatch):
     monkeypatch.setattr(krs_client, "_BASE_URL", "https://api-krs.ms.gov.pl/api/krs")
     monkeypatch.setattr(krs_client, "_last_request_time", 0.0)
     monkeypatch.setattr(krs_client, "_rate_limit_lock", None)
-    monkeypatch.setattr(krs_client, "_rate_limit_lock_loop", None)
 
     krs_client._client = httpx.AsyncClient(
         base_url="https://api-krs.ms.gov.pl/api/krs",

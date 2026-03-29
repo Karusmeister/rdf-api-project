@@ -227,15 +227,20 @@ def _close_orphaned_runs() -> None:
         })
 
 
+_ALLOWED_ALTER_COLUMNS = {
+    "address_street": "VARCHAR",
+    "address_postal_code": "VARCHAR",
+}
+
+
 def _ensure_krs_entities_columns(conn) -> None:
     existing_columns = {
         row[0] for row in conn.execute("DESCRIBE krs_entities").fetchall()
     }
-    for name, definition in (
-        ("address_street", "VARCHAR"),
-        ("address_postal_code", "VARCHAR"),
-    ):
+    for name, definition in _ALLOWED_ALTER_COLUMNS.items():
         if name not in existing_columns:
+            if name not in _ALLOWED_ALTER_COLUMNS or _ALLOWED_ALTER_COLUMNS[name] != definition:
+                raise ValueError(f"Refusing to add unapproved column: {name} {definition}")
             conn.execute(f"ALTER TABLE krs_entities ADD COLUMN {name} {definition}")
 
 
@@ -495,8 +500,8 @@ def get_entity(krs: str) -> Optional[dict]:
     if result is None:
         return None
     columns = [desc[0] for desc in conn.execute(
-        "SELECT * FROM krs_entities_current LIMIT 0"
-    ).description]
+        "DESCRIBE krs_entities_current"
+    ).fetchall()]
     row = dict(zip(columns, result))
     raw = row.get("raw")
     if isinstance(raw, str):
@@ -684,8 +689,8 @@ def get_last_scan_run() -> Optional[dict]:
     if row is None:
         return None
     columns = [desc[0] for desc in conn.execute(
-        "SELECT * FROM krs_scan_runs LIMIT 0"
-    ).description]
+        "DESCRIBE krs_scan_runs"
+    ).fetchall()]
     return dict(zip(columns, row))
 
 
@@ -709,6 +714,6 @@ def get_last_sync(source: str = "ms_gov") -> Optional[dict]:
     if row is None:
         return None
     columns = [desc[0] for desc in conn.execute(
-        "SELECT * FROM krs_sync_log LIMIT 0"
-    ).description]
+        "DESCRIBE krs_sync_log"
+    ).fetchall()]
     return dict(zip(columns, row))

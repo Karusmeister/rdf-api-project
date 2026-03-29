@@ -556,14 +556,22 @@ def find_node_value(
 
 def find_value(stmt: dict, tag: str, kwota: str = "kwota_a") -> Optional[float]:
     """Search across bilans + rzis + cash_flow."""
-    for section in (stmt["bilans"]["aktywa"], stmt["bilans"]["pasywa"]):
+    bilans = stmt.get("bilans") or {}
+    for section in (bilans.get("aktywa"), bilans.get("pasywa")):
+        if section is None:
+            continue
         v = find_node_value(section, tag, kwota)
         if v is not None:
             return v
-    v = find_node_value(stmt["rzis"], tag, kwota)
-    if v is not None:
-        return v
-    return find_node_value(stmt["cash_flow"], tag, kwota)
+    rzis = stmt.get("rzis")
+    if rzis is not None:
+        v = find_node_value(rzis, tag, kwota)
+        if v is not None:
+            return v
+    cash_flow = stmt.get("cash_flow")
+    if cash_flow is not None:
+        return find_node_value(cash_flow, tag, kwota)
+    return None
 
 
 def extract_flat_values(stmt: dict, use_kwota_b: bool = False) -> dict[str, Optional[float]]:
@@ -744,12 +752,12 @@ def compute_ratios(stmt: dict, use_kwota_b: bool = False) -> dict:
         return find_value(stmt, tag, kwota)
 
     def ratio(num: Optional[float], den: Optional[float]) -> Optional[float]:
-        if num is None or den is None or den == 0:
+        if num is None or den is None or abs(den) < 1e-6:
             return None
         return round(num / den, 4)
 
     def pct_change(a: Optional[float], b: Optional[float]) -> Optional[float]:
-        if a is None or b is None or b == 0:
+        if a is None or b is None or abs(b) < 1e-6:
             return None
         return round((a - b) / abs(b) * 100, 2)
 

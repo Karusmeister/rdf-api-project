@@ -141,7 +141,6 @@ async def _setup(monkeypatch, tmp_path):
     monkeypatch.setattr(krs_client, "_MAX_RETRIES", 1)
     monkeypatch.setattr(krs_client, "_last_request_time", 0.0)
     monkeypatch.setattr(krs_client, "_rate_limit_lock", None)
-    monkeypatch.setattr(krs_client, "_rate_limit_lock_loop", None)
 
     krs_client._client = httpx.AsyncClient(
         base_url="https://api-krs.ms.gov.pl/api/krs",
@@ -240,10 +239,11 @@ async def test_stale_entity_re_enrichment(monkeypatch):
     await krs_sync.run_sync()
     assert krs_repo.count_entities() == 1
 
-    # Artificially age the entity's synced_at
+    # Artificially age the entity's synced_at (both legacy cache and version table)
     conn = db_conn.get_conn()
     old_ts = (datetime.now(timezone.utc) - timedelta(hours=200)).isoformat()
     conn.execute("UPDATE krs_entities SET synced_at = ? WHERE krs = ?", [old_ts, "0000694720"])
+    conn.execute("UPDATE krs_entity_versions SET valid_from = ? WHERE krs = ? AND is_current = true", [old_ts, "0000694720"])
 
     # Second run: should re-enrich the stale entity
     second = await krs_sync.run_sync()

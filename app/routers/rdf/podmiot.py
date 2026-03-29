@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app import rdf_client
 from app.routers.rdf.schemas import (
@@ -19,20 +19,20 @@ router = APIRouter(prefix="/api/podmiot", tags=["rdf - podmiot"])
 async def lookup(body: KrsRequest):
     logger.info("entity_lookup", extra={"event": "entity_lookup", "krs": body.krs})
     data = await rdf_client.dane_podstawowe(body.krs)
+    if not isinstance(data, dict):
+        raise HTTPException(502, "Invalid response structure from upstream")
     podmiot_data = data.get("podmiot")
-    podmiot = (
-        PodmiotInfo(
-            numer_krs=podmiot_data["numerKRS"],
-            nazwa_podmiotu=podmiot_data["nazwaPodmiotu"],
-            forma_prawna=podmiot_data["formaPrawna"],
-            wykreslenie=podmiot_data["wykreslenie"],
+    podmiot = None
+    if podmiot_data and isinstance(podmiot_data, dict):
+        podmiot = PodmiotInfo(
+            numer_krs=podmiot_data.get("numerKRS", ""),
+            nazwa_podmiotu=podmiot_data.get("nazwaPodmiotu", ""),
+            forma_prawna=podmiot_data.get("formaPrawna", ""),
+            wykreslenie=podmiot_data.get("wykreslenie", False),
         )
-        if podmiot_data
-        else None
-    )
     return LookupResponse(
         podmiot=podmiot,
-        czy_podmiot_znaleziony=data["czyPodmiotZnaleziony"],
+        czy_podmiot_znaleziony=data.get("czyPodmiotZnaleziony", False),
         komunikat_bledu=data.get("komunikatBledu"),
     )
 

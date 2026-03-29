@@ -87,7 +87,7 @@ def _discover_new_krs_numbers(limit: int) -> list[str]:
         """
         SELECT r.krs
         FROM krs_registry r
-        LEFT JOIN krs_entities e ON r.krs = e.krs
+        LEFT JOIN krs_entities_current e ON r.krs = e.krs
         WHERE e.krs IS NULL
           AND r.is_active = true
         ORDER BY r.check_priority DESC, r.first_seen_at ASC

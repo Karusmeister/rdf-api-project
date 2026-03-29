@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 _client: Optional[httpx.AsyncClient] = None
 _last_request_time: float = 0.0
 _rate_limit_lock: Optional[asyncio.Lock] = None
-_rate_limit_lock_loop: Optional[asyncio.AbstractEventLoop] = None
 
 _BASE_URL = settings.krs_api_base_url
 _TIMEOUT = settings.krs_request_timeout
@@ -40,7 +39,7 @@ _HEADERS = {
 
 async def start() -> None:
     """Create the shared httpx.AsyncClient. Call once at app startup."""
-    global _client, _last_request_time, _rate_limit_lock, _rate_limit_lock_loop
+    global _client, _last_request_time, _rate_limit_lock
     _client = httpx.AsyncClient(
         base_url=_BASE_URL,
         headers=_HEADERS,
@@ -49,19 +48,17 @@ async def start() -> None:
         follow_redirects=True,
     )
     _last_request_time = 0.0
-    _rate_limit_lock = None
-    _rate_limit_lock_loop = None
+    _rate_limit_lock = asyncio.Lock()
 
 
 async def stop() -> None:
     """Close the shared client. Call once at app shutdown."""
-    global _client, _last_request_time, _rate_limit_lock, _rate_limit_lock_loop
+    global _client, _last_request_time, _rate_limit_lock
     if _client is not None:
         await _client.aclose()
         _client = None
     _last_request_time = 0.0
     _rate_limit_lock = None
-    _rate_limit_lock_loop = None
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -71,11 +68,9 @@ def _get_client() -> httpx.AsyncClient:
 
 
 def _get_rate_limit_lock() -> asyncio.Lock:
-    global _rate_limit_lock, _rate_limit_lock_loop
-    loop = asyncio.get_running_loop()
-    if _rate_limit_lock is None or _rate_limit_lock_loop is not loop:
+    global _rate_limit_lock
+    if _rate_limit_lock is None:
         _rate_limit_lock = asyncio.Lock()
-        _rate_limit_lock_loop = loop
     return _rate_limit_lock
 
 

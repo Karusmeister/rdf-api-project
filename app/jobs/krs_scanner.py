@@ -27,9 +27,9 @@ _scan_lock: asyncio.Lock = asyncio.Lock()
 _stop_event: asyncio.Event = asyncio.Event()
 _active_task: asyncio.Task[dict] | None = None
 
-CHECKPOINT_INTERVAL = 100  # flush stats to DB every N probes
-RATE_LIMIT_BACKOFF_S = 60  # pause when upstream rate-limits us
-MAX_CONSECUTIVE_ERRORS = 10  # stop scan after this many errors in a row
+CHECKPOINT_INTERVAL = settings.krs_scan_checkpoint_interval
+RATE_LIMIT_BACKOFF_S = settings.krs_scan_rate_limit_backoff_s
+MAX_CONSECUTIVE_ERRORS = settings.krs_scan_max_consecutive_errors
 
 
 def is_scan_running() -> bool:

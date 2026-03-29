@@ -51,6 +51,11 @@ def import_krs(filepath, column):
     count = 0
     with open(filepath, "r") as f:
         reader = csv.DictReader(f)
+        if reader.fieldnames and column not in reader.fieldnames:
+            raise click.BadParameter(
+                f"Column '{column}' not found. Available: {reader.fieldnames}",
+                param_hint="--column",
+            )
         for row in reader:
             krs_val = row[column].strip().zfill(10)
             if krs_val.isdigit() and len(krs_val) == 10:

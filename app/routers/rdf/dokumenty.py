@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app import rdf_client
@@ -27,6 +27,8 @@ async def search(body: SearchRequest):
         sort_field=body.sort_field,
         sort_dir=body.sort_dir.value,
     )
+    if "content" not in data or "metadaneWynikow" not in data:
+        raise HTTPException(502, "Invalid response structure from upstream")
     content = [
         DocumentItem(
             id=item["id"],

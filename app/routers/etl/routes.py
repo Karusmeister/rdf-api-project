@@ -1,3 +1,5 @@
+import asyncio
+import functools
 import logging
 from typing import Optional
 
@@ -19,11 +21,14 @@ class IngestRequest(BaseModel):
 async def ingest(body: IngestRequest):
     """Trigger ETL ingestion for a specific document or all pending."""
     logger.info("etl_ingest", extra={"event": "etl_ingest", "document_id": body.document_id})
+    loop = asyncio.get_running_loop()
     try:
         if body.document_id:
-            result = etl.ingest_document(body.document_id)
+            result = await loop.run_in_executor(
+                None, functools.partial(etl.ingest_document, body.document_id)
+            )
         else:
-            result = etl.ingest_all_pending()
+            result = await loop.run_in_executor(None, etl.ingest_all_pending)
         logger.info("etl_ingest_complete", extra={"event": "etl_ingest_complete", "result": result})
         return result
     except ValueError as e:

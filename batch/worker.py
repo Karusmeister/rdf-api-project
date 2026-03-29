@@ -208,6 +208,10 @@ async def _process_krs_with_backoff(
     return "error", None
 
 
+_MAX_KRS = 99_999_999  # upper bound for KRS numbers
+_MAX_CONSECUTIVE_TASK_ERRORS = 50  # abort if too many consecutive task errors
+
+
 async def _worker_loop(
     worker_id: int,
     start_krs: int,
@@ -234,10 +238,12 @@ async def _worker_loop(
     stats = WorkerStats()
     health = ConnectionHealth()
     sem = asyncio.Semaphore(concurrency)
+    consecutive_task_errors = 0
 
     async with _make_client(connection) as client:
 
         async def _handle_one(krs_num: int) -> None:
+            nonlocal consecutive_task_errors
             krs_str = str(krs_num).zfill(10)
 
             if store.is_done(krs_num):
@@ -293,10 +299,13 @@ async def _worker_loop(
 
             if result == "found":
                 stats.found += 1
+                consecutive_task_errors = 0
             elif result == "not_found":
                 stats.not_found += 1
+                consecutive_task_errors = 0
             else:
                 stats.errors += 1
+                consecutive_task_errors += 1
 
             if stats.found > 0 and stats.found % 100 == 0:
                 stats.log(worker_id)
@@ -304,9 +313,16 @@ async def _worker_loop(
         pending: set[asyncio.Task] = set()
         krs = start_krs
 
-        while True:
+        while krs <= _MAX_KRS:
+            if consecutive_task_errors >= _MAX_CONSECUTIVE_TASK_ERRORS:
+                logger.error(
+                    "worker=%d aborting after %d consecutive errors",
+                    worker_id, consecutive_task_errors,
+                )
+                break
+
             # Fill up to `concurrency` in-flight tasks
-            while len(pending) < concurrency:
+            while len(pending) < concurrency and krs <= _MAX_KRS:
                 task = asyncio.create_task(_handle_one(krs))
                 pending.add(task)
                 task.add_done_callback(pending.discard)
@@ -317,12 +333,24 @@ async def _worker_loop(
                 done, _ = await asyncio.wait(
                     pending, return_when=asyncio.FIRST_COMPLETED,
                 )
-                # Re-raise any unexpected exceptions from completed tasks
                 for t in done:
-                    if t.exception() is not None:
+                    exc = t.exception()
+                    if exc is not None:
                         logger.error(
-                            "worker=%d task_error %s", worker_id, t.exception(),
+                            "worker=%d task_error %s: %s",
+                            worker_id, type(exc).__name__, exc,
                         )
+
+        # Drain remaining tasks
+        if pending:
+            done, _ = await asyncio.wait(pending)
+            for t in done:
+                exc = t.exception()
+                if exc is not None:
+                    logger.error("worker=%d drain_task_error %s", worker_id, exc)
+
+        stats.log(worker_id)
+        logger.info("worker=%d finished krs_reached=%d", worker_id, krs)
 
 
 def run_worker(

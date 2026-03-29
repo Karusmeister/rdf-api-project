@@ -78,6 +78,13 @@ def run_batch(
     _delay = delay if delay is not None else settings.batch_delay_seconds
     _db = db_path if db_path is not None else settings.batch_db_path
 
+    if _workers <= 0:
+        raise ValueError("workers must be > 0")
+    if _concurrency <= 0:
+        raise ValueError("concurrency must be > 0")
+    if _delay < 0:
+        raise ValueError("delay must be >= 0")
+
     if _vpn:
         _validate_vpn_config()
 
@@ -110,11 +117,20 @@ def run_batch(
         processes.append(p)
 
     # Graceful shutdown on SIGINT/SIGTERM
+    _shutdown_in_progress = False
+
     def _shutdown(signum, frame):
+        nonlocal _shutdown_in_progress
+        if _shutdown_in_progress:
+            return
+        _shutdown_in_progress = True
         logger.info("batch_shutdown signal=%s — terminating workers", signum)
         for p in processes:
-            if p.is_alive():
-                p.terminate()
+            try:
+                if p.is_alive():
+                    p.terminate()
+            except ProcessLookupError:
+                pass
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -124,7 +140,11 @@ def run_batch(
         logger.info("spawned %s pid=%d", p.name, p.pid)
 
     for p in processes:
-        p.join()
+        p.join(timeout=300)
+        if p.is_alive():
+            logger.warning("worker %s did not exit after 300s — killing", p.name)
+            p.kill()
+            p.join(timeout=5)
         logger.info("joined %s exitcode=%s", p.name, p.exitcode)
 
     failed = [p for p in processes if p.exitcode != 0]

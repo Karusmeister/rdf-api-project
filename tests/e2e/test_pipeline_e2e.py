@@ -146,23 +146,32 @@ def downloaded_doc(db_and_storage, event_loop):
             manifest = storage.save_extracted(doc_dir, zip_bytes, document_id)
             print(f"  Extracted {len(manifest['files'])} files to {doc_dir}")
 
-            # 4. Register in scraper DB
+            # 4. Register in scraper DB (using API to populate version table)
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc)
 
             scraper_db.upsert_krs(KRS.zfill(10), None, None, True)
-            scraper_db.get_conn().execute("""
-                INSERT INTO krs_documents
-                    (document_id, krs, rodzaj, status, nazwa, okres_start, okres_end,
-                     is_downloaded, storage_path, discovered_at)
-                VALUES (?, ?, '18', 'NIEUSUNIETY', ?, ?, ?, true, ?, ?)
-                ON CONFLICT (document_id) DO NOTHING
-            """, [
-                document_id, KRS.zfill(10), meta.get("nazwaPliku"),
-                doc.get("okresSprawozdawczyPoczatek"),
-                doc.get("okresSprawozdawczyKoniec"),
-                doc_dir, now,
-            ])
+            scraper_db.insert_documents([{
+                "document_id": document_id,
+                "krs": KRS.zfill(10),
+                "rodzaj": "18",
+                "status": "NIEUSUNIETY",
+                "nazwa": meta.get("nazwaPliku"),
+                "okres_start": doc.get("okresSprawozdawczyPoczatek"),
+                "okres_end": doc.get("okresSprawozdawczyKoniec"),
+                "discovered_at": now,
+            }])
+            scraper_db.mark_downloaded(
+                document_id=document_id,
+                storage_path=doc_dir,
+                storage_backend="local",
+                file_size=sum(f["size"] for f in manifest["files"]),
+                zip_size=len(zip_bytes),
+                file_count=len(manifest["files"]),
+                file_types=",".join(sorted(set(
+                    f["type"] for f in manifest["files"]
+                ))),
+            )
 
             return {
                 "document_id": document_id,

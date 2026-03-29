@@ -123,6 +123,7 @@ def test_run_batch_spawns_correct_workers(mock_process_cls, monkeypatch):
     mock_proc = MagicMock()
     mock_proc.pid = 12345
     mock_proc.exitcode = 0
+    mock_proc.is_alive.return_value = False  # process exits normally
     mock_process_cls.return_value = mock_proc
 
     run_batch(start_krs=100, workers=3, use_vpn=False, db_path="/tmp/test.duckdb")

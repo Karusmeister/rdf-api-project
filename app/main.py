@@ -58,7 +58,11 @@ async def lifespan(app: FastAPI):
             "krs_scan_cron": settings.krs_scan_cron,
         })
     except Exception:
-        logger.exception("scheduler_start_failed", extra={"event": "scheduler_start_failed"})
+        logger.error(
+            "scheduler_start_failed — KRS sync/scan jobs will NOT run",
+            extra={"event": "scheduler_start_failed"},
+            exc_info=True,
+        )
 
     logger.info("app_ready", extra={"event": "ready"})
     yield
@@ -175,8 +179,8 @@ async def health_krs():
         adapter = get_adapter("ms_gov")
     except KeyError:
         return JSONResponse(
-            status_code=503,
-            content={"source": "ms_gov", "ok": False, "detail": "Adapter not registered"},
+            status_code=500,
+            content={"source": "ms_gov", "ok": False, "detail": "Adapter not registered (misconfiguration)"},
         )
 
     health = await adapter.health_check()

@@ -34,19 +34,13 @@ def test_schema_creation():
         ).fetchall()
     }
     expected = {
-        "data_sources", "companies", "company_identifiers",
+        "companies",
         "financial_reports", "raw_financial_data", "financial_line_items",
         "feature_definitions", "feature_sets", "feature_set_members", "computed_features",
         "model_registry", "prediction_runs", "predictions",
-        "bankruptcy_events", "assessment_jobs",
+        "bankruptcy_events", "assessment_jobs", "etl_attempts",
     }
     assert expected.issubset(tables)
-
-
-def test_krs_data_source_seeded():
-    sources = db.get_data_sources()
-    ids = [s["id"] for s in sources]
-    assert "KRS" in ids
 
 
 # ---------------------------------------------------------------------------
@@ -83,29 +77,6 @@ def test_upsert_company_none_does_not_overwrite():
 
 def test_get_company_not_found():
     assert db.get_company("9999999999") is None
-
-
-def test_add_company_identifier():
-    db.upsert_company("0000000004")
-    db.add_company_identifier("0000000004", "KRS", "KRS", "0000000004")
-    conn = db.get_conn()
-    row = conn.execute(
-        "SELECT identifier_value FROM company_identifiers WHERE krs = '0000000004'"
-    ).fetchone()
-    assert row is not None
-    assert row[0] == "0000000004"
-
-
-def test_company_identifier_unique_constraint():
-    db.upsert_company("0000000005")
-    db.add_company_identifier("0000000005", "KRS", "NIP", "5555555555")
-    # duplicate should silently do nothing (ON CONFLICT DO NOTHING)
-    db.add_company_identifier("0000000005", "KRS", "NIP", "5555555555")
-    conn = db.get_conn()
-    count = conn.execute(
-        "SELECT count(*) FROM company_identifiers WHERE identifier_value = '5555555555'"
-    ).fetchone()[0]
-    assert count == 1
 
 
 # ---------------------------------------------------------------------------

@@ -252,11 +252,10 @@ def compute_all_pending() -> dict:
             GROUP BY report_id
         )
         SELECT fr.id
-        FROM latest_financial_reports fr
+        FROM latest_successful_financial_reports fr
         JOIN latest_line_items lli ON lli.report_id = fr.id
         LEFT JOIN latest_feature_inputs lfi ON lfi.report_id = fr.id
-        WHERE fr.ingestion_status = 'completed'
-          AND coalesce(lfi.latest_feature_extraction_version, 0) < lli.latest_extraction_version
+        WHERE coalesce(lfi.latest_feature_extraction_version, 0) < lli.latest_extraction_version
     """).fetchall()
 
     results = {"total": len(rows), "computed": 0, "failed": 0, "errors": []}

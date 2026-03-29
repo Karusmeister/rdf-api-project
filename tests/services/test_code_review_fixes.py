@@ -93,14 +93,13 @@ def _setup_doc(isolated_db, doc_id, krs="0000012345"):
 
     scraper_db.upsert_krs(krs, "Test Company", None, True)
     now = datetime.now(timezone.utc)
-    scraper_db.get_conn().execute("""
-        INSERT INTO krs_documents
-            (document_id, krs, rodzaj, status, nazwa, okres_start, okres_end,
-             is_downloaded, storage_path, discovered_at)
-        VALUES (?, ?, '18', 'NIEUSUNIETY', 'test', '2023-01-01', '2023-12-31',
-                true, ?, ?)
-        ON CONFLICT (document_id) DO NOTHING
-    """, [doc_id, krs, doc_dir, now])
+    scraper_db.insert_documents([{
+        "document_id": doc_id, "krs": krs,
+        "rodzaj": "18", "status": "NIEUSUNIETY",
+        "nazwa": "test", "okres_start": "2023-01-01", "okres_end": "2023-12-31",
+        "discovered_at": now,
+    }])
+    scraper_db.mark_downloaded(doc_id, doc_dir, "local", 0, 0, 1, "xml")
 
     return storage
 
@@ -286,13 +285,13 @@ class TestFailedRetry:
         scraper_db.upsert_krs(krs, "Test", None, True)
         now = datetime.now(timezone.utc)
         doc_dir = f"krs/{krs}/{doc_id}"
-        scraper_db.get_conn().execute("""
-            INSERT INTO krs_documents
-                (document_id, krs, rodzaj, status, nazwa, okres_start, okres_end,
-                 is_downloaded, storage_path, discovered_at)
-            VALUES (?, ?, '18', 'NIEUSUNIETY', 'test', '2023-01-01', '2023-12-31',
-                    true, ?, ?)
-        """, [doc_id, krs, doc_dir, now])
+        scraper_db.insert_documents([{
+            "document_id": doc_id, "krs": krs,
+            "rodzaj": "18", "status": "NIEUSUNIETY",
+            "nazwa": "test", "okres_start": "2023-01-01", "okres_end": "2023-12-31",
+            "discovered_at": now,
+        }])
+        scraper_db.mark_downloaded(doc_id, doc_dir, "local", 0, 0, 0, "")
 
         # First attempt: no XML on disk -> should fail
         target = storage_dir / doc_dir
@@ -300,8 +299,17 @@ class TestFailedRetry:
         result1 = etl.ingest_document(doc_id, storage=storage)
         assert result1["status"] == "failed"
 
+        # No sentinel financial_reports row — failure is recorded in etl_attempts
         report = prediction_db.get_financial_report(doc_id)
-        assert report["ingestion_status"] == "failed"
+        assert report is None
+
+        conn = prediction_db.get_conn()
+        attempts = conn.execute(
+            "SELECT status, reason_code FROM etl_attempts WHERE document_id = ?",
+            [doc_id],
+        ).fetchall()
+        assert len(attempts) == 1
+        assert attempts[0][0] == "failed"
 
         # Now put the XML on disk (simulating fix)
         (target / "sprawozdanie.xml").write_text(SAMPLE_XML, encoding="utf-8")

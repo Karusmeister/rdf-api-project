@@ -29,22 +29,13 @@ The existing DuckDB database (`data/scraper.duckdb`) already has `krs_registry`,
 
 ## Schema
 
-### Layer 1: Core Entity & Data Source Registry
+### Layer 1: Core Entity Registry
+
+> **Note (2026-03):** `data_sources` and `company_identifiers` were removed as part of
+> the multi-source simplification. No GUS/GPW integration is planned in the near term.
+> ETL failure tracking moved to a dedicated `etl_attempts` table.
 
 ```sql
--- Registry of all external data sources
-CREATE TABLE IF NOT EXISTS data_sources (
-    id              VARCHAR PRIMARY KEY,          -- short code: 'KRS', 'GUS', 'CEIDG', 'GPW'
-    name            VARCHAR NOT NULL,
-    description     VARCHAR,
-    base_url        VARCHAR,
-    is_active       BOOLEAN DEFAULT true,
-    created_at      TIMESTAMP DEFAULT current_timestamp
-);
-
--- Seed:
--- INSERT INTO data_sources VALUES ('KRS', 'Krajowy Rejestr Sadowy', 'Court registry - financial statements', 'https://rdf-przegladarka.ms.gov.pl', true, current_timestamp);
-
 -- Extended company data beyond what krs_registry stores
 -- krs_registry remains the scraper's table; this adds ML-relevant fields
 CREATE TABLE IF NOT EXISTS companies (
@@ -57,21 +48,20 @@ CREATE TABLE IF NOT EXISTS companies (
     updated_at      TIMESTAMP DEFAULT current_timestamp
 );
 
--- Cross-reference: same company across multiple data sources
--- Enables future deduplication when adding GUS, CEIDG, GPW
-CREATE TABLE IF NOT EXISTS company_identifiers (
-    id              INTEGER PRIMARY KEY,           -- auto-populated via sequence
-    krs             VARCHAR(10) NOT NULL,           -- FK to companies.krs
-    data_source_id  VARCHAR NOT NULL,               -- FK to data_sources.id
-    identifier_type VARCHAR(20) NOT NULL,           -- 'KRS', 'NIP', 'REGON', 'ISIN'
-    identifier_value VARCHAR(50) NOT NULL,
-    valid_from      DATE,
-    valid_to        DATE,                           -- NULL = still valid
-    created_at      TIMESTAMP DEFAULT current_timestamp,
-    UNIQUE(data_source_id, identifier_type, identifier_value)
+-- Tracks every ETL ingestion attempt (completed/failed/skipped)
+CREATE TABLE IF NOT EXISTS etl_attempts (
+    attempt_id            BIGINT PRIMARY KEY DEFAULT nextval('seq_etl_attempts'),
+    document_id           VARCHAR NOT NULL,
+    krs                   VARCHAR(10),
+    started_at            TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    finished_at           TIMESTAMP,
+    status                VARCHAR NOT NULL,        -- 'running', 'completed', 'failed', 'skipped'
+    reason_code           VARCHAR,                 -- 'no_xml_found', 'parse_error', 'not_downloaded', etc.
+    error_message         VARCHAR,
+    xml_path              VARCHAR,
+    report_id             VARCHAR,
+    extraction_version    INTEGER
 );
-
-CREATE SEQUENCE IF NOT EXISTS seq_company_identifiers START 1;
 ```
 
 ### Layer 2: Financial Data (Raw + Structured Extraction)

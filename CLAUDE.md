@@ -43,8 +43,9 @@ Decision comments should be short: what was decided, why, and what alternatives 
 
 - `README.md` - current project overview, setup, architecture, and API summary
 - `docs/RDF_API_DOCUMENTATION.md` - reverse-engineered upstream RDF API contract
-- `docs/PREDICTION_SCHEMA_DESIGN.md` - detailed prediction schema and lineage design
+- `docs/PREDICTION_SCHEMA_DESIGN.md` - prediction schema and lineage design (Layer 1 updated: `data_sources`/`company_identifiers` removed)
 - `docs/KRS_OPEN_API.md` - official MS KRS Open API reference (endpoints, response structure, GDPR)
+- `docs/KRS_SYNC_RUNBOOK.md` - operational runbook for KRS sync pipeline
 
 ## Tech stack
 
@@ -121,32 +122,28 @@ batch/
   __main__.py          - `python -m batch` entrypoint
   connections.py       - Connection dataclass + NordVPN SOCKS5 pool builder
   progress.py          - DuckDB-backed progress store (batch_progress table)
+  entity_store.py      - Append-only entity store for batch scanner
+  rdf_document_store.py - Append-only document store for batch RDF worker
+  rdf_progress.py      - RDF document discovery progress store
   worker.py            - Async worker loop with stride partitioning + backoff
+  rdf_worker.py        - RDF document discovery + download worker
   runner.py            - Multiprocessing orchestrator + argparse CLI
+  rdf_runner.py        - RDF document batch orchestrator
 scripts/
   seed_features.py     - Populate feature_definitions and feature_sets
+  run_db_migration.py  - Run schema migrations (e.g., append-only backfill)
+  db_migrations/       - Migration scripts (001_append_only_backfill.py, etc.)
 tests/
-  test_code_review_fixes.py
-  test_crypto.py
-  test_endpoints.py
-  test_etl.py
-  test_feature_engine.py
-  test_pipeline_e2e.py     - requires --e2e flag (hits live RDF)
-  test_prediction_db.py
-  test_scraper_db.py
-  test_scraper_integration.py
-  test_storage.py
-  test_krs_client.py       - KRS client retry/backoff tests (respx mocks)
-  test_adapters.py         - Adapter interface + FakeKrsAdapter tests
-  test_ms_gov_adapter.py   - MsGovKrsAdapter tests (respx mocks)
-  test_krs_repo.py         - KRS entity repository CRUD tests
-  test_monitoring.py       - Metrics ring buffer + adapter integration tests
-  test_krs_pipeline.py     - KRS sync pipeline integration tests (respx mocks)
-  test_krs_scanner.py      - KRS sequential scanner tests (respx mocks)
-  test_connections.py      - Batch connection pool tests
-  test_progress.py         - Batch DuckDB progress store tests
-  test_worker.py           - Batch worker loop + backoff tests (respx mocks)
-  test_runner.py           - Batch runner orchestrator + CLI tests
+  api/                 - FastAPI endpoint tests (endpoints, jobs routes)
+  db/                  - DB schema + CRUD tests (prediction_db, krs_repo, scraper_db,
+                         append-only versioning, document versions, migrations)
+  batch/               - Batch processing tests (worker, runner, progress, connections,
+                         rdf_worker, rdf_progress, rdf_runner)
+  services/            - ETL, feature engine, crypto, code review fixes
+  scraper/             - Scraper integration, storage
+  krs/                 - KRS adapter, client, sync pipeline, scanner, monitoring
+  e2e/                 - End-to-end tests against live APIs (--e2e flag required)
+  regression/          - Live API regression tests (--e2e flag required)
 data/
   scraper.duckdb       - Single DuckDB file for ALL tables (scraper + prediction)
   documents/           - Extracted RDF files + manifest.json
@@ -154,16 +151,23 @@ data/
 
 ## Database: DuckDB tables
 
-### Scraper tables (existing - app/scraper/db.py)
+### Scraper tables (app/scraper/db.py)
 - `krs_registry` - KRS master list, scraper priority/scheduling
-- `krs_documents` - Documents per KRS, download status, storage paths
+- `krs_documents` - Documents per KRS (legacy cache; reads via `krs_documents_current` view)
+- `krs_document_versions` - Append-only document history. PK = version_id. UNIQUE(document_id, version_no).
 - `scraper_runs` - Scraper run history
 
 ### KRS entity tables (app/repositories/krs_repo.py)
-- `krs_entities` - Cached KRS entity data from adapters. PK = krs VARCHAR(10). GDPR: PESEL stays in `raw` JSON only.
+- `krs_entities` - Legacy cache of KRS entity data. PK = krs VARCHAR(10). Reads via `krs_entities_current` view.
+- `krs_entity_versions` - Append-only entity history. PK = version_id. Indexed on (krs, is_current).
 - `krs_sync_log` - Sync run history (started_at, counts, status).
 - `krs_scan_cursor` - Single-row table tracking next KRS integer to probe. PK = boolean TRUE.
 - `krs_scan_runs` - One row per scanner invocation (krs_from/to, probed/valid/error counts, stopped_reason).
+
+### Views
+- `krs_entities_current` - Current entity snapshot from `krs_entity_versions` (read path for all entity queries).
+- `krs_documents_current` - Current document snapshot from `krs_document_versions` (read path for all document queries).
+- `latest_successful_financial_reports` - Latest completed report per logical key (used by feature engine).
 
 ### Batch scanner table (batch/progress.py)
 - `batch_progress` - Tracks which KRS integers have been probed by the batch scanner. PK = krs BIGINT. Status: found/not_found/error.
@@ -172,9 +176,8 @@ data/
 Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
 
 **Layer 1 - Entities:**
-- `data_sources` - Registry of data origins (KRS, GUS, CEIDG, GPW). PK = short code.
 - `companies` - Extended company data. PK = krs VARCHAR(10). Joins to krs_registry.krs.
-- `company_identifiers` - Cross-reference across data sources.
+- `etl_attempts` - Tracks every ETL ingestion attempt (completed/failed/skipped). PK = attempt_id.
 
 **Layer 2 - Financial data:**
 - `financial_reports` - One row per ingested statement. Links to krs_documents.
@@ -232,11 +235,18 @@ uvicorn app.main:app --reload --port 8000
 # Run prod
 uvicorn app.main:app --workers 4 --port 8000
 
-# Test
+# Test all unit tests
 pytest tests/ -v
 
-# Test single module
-pytest tests/test_crypto.py -v
+# Test by category
+pytest tests/db/ -v
+pytest tests/api/ -v
+pytest tests/batch/ -v
+pytest tests/services/ -v
+pytest tests/krs/ -v
+
+# E2E tests (hits live APIs)
+pytest tests/e2e/ -v --e2e
 
 # Seed feature definitions
 python scripts/seed_features.py

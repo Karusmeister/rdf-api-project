@@ -27,7 +27,8 @@ def _encrypt_aes_base64(plaintext: bytes, key: bytes) -> str:
 
 
 def _random_request_key() -> str:
-    return str(secrets.randbits(32)).zfill(16)
+    """Generate a 16-digit decimal request key with full entropy."""
+    return str(secrets.randbelow(9 * 10**15) + 10**15)
 
 
 def encrypt_nrkrs(krs: str) -> str:

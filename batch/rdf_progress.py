@@ -102,11 +102,11 @@ class RdfProgressStore:
             rows = conn.execute("""
                 SELECT DISTINCT rp.krs
                 FROM batch_rdf_progress rp
-                JOIN krs_documents kd ON kd.krs = rp.krs
+                JOIN krs_document_versions kd ON kd.krs = rp.krs AND kd.is_current = true
                 WHERE rp.status IN ('done', 'partial')
-                  AND kd.is_downloaded = false
+                  AND (kd.is_downloaded = false OR kd.is_downloaded IS NULL)
                   AND kd.download_error IS NULL
-                  AND CAST(LTRIM(rp.krs, '0') AS BIGINT) % ? = ?
+                  AND CAST(rp.krs AS BIGINT) % ? = ?
                 ORDER BY rp.krs
             """, [total_workers, worker_id]).fetchall()
             return [row[0] for row in rows]

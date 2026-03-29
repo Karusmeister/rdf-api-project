@@ -41,7 +41,7 @@ class ProgressStore:
             except duckdb.IOException:
                 if attempt == _MAX_LOCK_RETRIES - 1:
                     raise
-                delay = _BASE_LOCK_DELAY * (2 ** attempt) + random.uniform(0, 0.05)
+                delay = min(_BASE_LOCK_DELAY * (2 ** attempt), 5.0) + random.uniform(0, 0.05)
                 time.sleep(delay)
 
     def _init_schema(self):

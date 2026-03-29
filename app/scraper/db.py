@@ -289,7 +289,7 @@ def _get_current_document_snapshot(conn, document_id: str) -> Optional[dict]:
     ).fetchone()
     if row is None:
         return None
-    cols = [d[0] for d in conn.execute("SELECT * FROM krs_document_versions LIMIT 0").description]
+    cols = [d[0] for d in conn.execute("DESCRIBE krs_document_versions").fetchall()]
     return dict(zip(cols, row))
 
 
@@ -351,9 +351,9 @@ def _append_document_version_if_changed(
             )
             next_version_no = current["version_no"] + 1
 
-        discovered_at = patch.get("discovered_at") or (current["discovered_at"] if current else now)
-        metadata_fetched_at = patch.get("metadata_fetched_at") or (current["metadata_fetched_at"] if current else None)
-        downloaded_at = patch.get("downloaded_at") or (current["downloaded_at"] if current else None)
+        discovered_at = patch["discovered_at"] if "discovered_at" in patch else (current["discovered_at"] if current else now)
+        metadata_fetched_at = patch["metadata_fetched_at"] if "metadata_fetched_at" in patch else (current["metadata_fetched_at"] if current else None)
+        downloaded_at = patch["downloaded_at"] if "downloaded_at" in patch else (current["downloaded_at"] if current else None)
 
         conn.execute(
         """
@@ -392,7 +392,10 @@ def _append_document_version_if_changed(
         conn.execute("COMMIT")
         return True
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
 
 
@@ -499,14 +502,25 @@ def insert_documents(docs: list[dict]) -> None:
         ])
 
 
+def _resolve_krs(conn, document_id: str) -> str:
+    """Get KRS from current version or legacy table. Raises if not found."""
+    current = _get_current_document_snapshot(conn, document_id)
+    if current is not None:
+        return current["krs"]
+    legacy = conn.execute(
+        "SELECT krs FROM krs_documents WHERE document_id = ?", [document_id]
+    ).fetchone()
+    if legacy is not None:
+        return legacy[0]
+    raise ValueError(f"Document {document_id} has no version history and no legacy record")
+
+
 def update_document_metadata(document_id: str, meta: dict) -> None:
     """Update extended metadata fields — appends a new version."""
     conn = get_conn()
     now = datetime.now(timezone.utc)
 
-    # Need krs from current version
-    current = _get_current_document_snapshot(conn, document_id)
-    krs = current["krs"] if current else ""
+    krs = _resolve_krs(conn, document_id)
 
     _append_document_version_if_changed(
         conn, document_id, krs,
@@ -546,8 +560,7 @@ def update_document_error(document_id: str, error: str) -> None:
     """Set download_error on a document — appends a new version."""
     conn = get_conn()
 
-    current = _get_current_document_snapshot(conn, document_id)
-    krs = current["krs"] if current else ""
+    krs = _resolve_krs(conn, document_id)
 
     _append_document_version_if_changed(
         conn, document_id, krs,
@@ -575,8 +588,7 @@ def mark_downloaded(
     conn = get_conn()
     now = datetime.now(timezone.utc)
 
-    current = _get_current_document_snapshot(conn, document_id)
-    krs = current["krs"] if current else ""
+    krs = _resolve_krs(conn, document_id)
 
     _append_document_version_if_changed(
         conn, document_id, krs,

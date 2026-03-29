@@ -102,11 +102,6 @@ def fake_adapter():
 # ---------------------------------------------------------------------------
 
 
-def test_fake_adapter_satisfies_protocol():
-    adapter = FakeKrsAdapter()
-    assert isinstance(adapter, KrsSourceAdapter)
-
-
 # ---------------------------------------------------------------------------
 # get_entity tests
 # ---------------------------------------------------------------------------

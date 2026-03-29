@@ -316,16 +316,25 @@ There is currently no public API endpoint for feature computation or prediction 
 
 ## Testing
 
-Run the regular test suite:
+Tests are organized by app layer:
 
 ```bash
+# Run all unit/integration tests
 pytest tests/ -v
+
+# Run by category
+pytest tests/db/ -v          # DB schema, CRUD, versioning
+pytest tests/api/ -v         # FastAPI endpoints
+pytest tests/batch/ -v       # Batch scanner/worker
+pytest tests/services/ -v    # ETL, feature engine, crypto
+pytest tests/krs/ -v         # KRS adapter, client, pipeline
+pytest tests/scraper/ -v     # Scraper integration, storage
 ```
 
-Run networked end-to-end tests against the live RDF service:
+Run end-to-end tests against live APIs (RDF + KRS):
 
 ```bash
-pytest tests/ -v --e2e
+pytest tests/e2e/ -v --e2e
 ```
 
 Without `--e2e`, those tests are skipped by default.

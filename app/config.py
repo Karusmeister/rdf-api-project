@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # --- KRS Sequential Scanner ---
     krs_scan_batch_size: int = 500     # probes per run
     krs_scan_cron: str = "0 1 * * *"  # 1am daily (separate from krs_sync_cron)
+    krs_scan_checkpoint_interval: int = 100  # flush stats to DB every N probes
+    krs_scan_rate_limit_backoff_s: int = 60  # pause when upstream rate-limits us
+    krs_scan_max_consecutive_errors: int = 10  # stop scan after this many in a row
 
     # --- Batch runner ---
     batch_use_vpn: bool = False

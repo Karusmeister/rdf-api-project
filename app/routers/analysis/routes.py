@@ -35,10 +35,14 @@ async def _get_available_periods(krs: str) -> list[dict]:
     if cached is not None:
         return cached
 
-    # Paginate through all search pages
+    # Paginate through all search pages (bounded to prevent DoS)
+    _MAX_SEARCH_PAGES = 100
     all_docs: list[dict] = []
     page = 0
     while True:
+        if page >= _MAX_SEARCH_PAGES:
+            logger.warning("max_search_pages_reached", extra={"krs": krs, "pages": page})
+            break
         search_data = await rdf_client.wyszukiwanie(krs, page=page, page_size=100)
         all_docs.extend(search_data["content"])
         total_pages = search_data["metadaneWynikow"]["liczbaStron"]
@@ -125,6 +129,19 @@ async def _fetch_and_parse(krs: str, period_end: Optional[str]) -> dict:
 
     xml_parser.cache_set(cache_key, parsed)
     return parsed
+
+
+def _tag_section(tag: str) -> str:
+    if tag.startswith("CF."):
+        return "cash_flow"
+    if tag.startswith("RZiS."):
+        return "rzis"
+    return "bilans"
+
+
+def _tag_label(tag: str) -> str:
+    raw = tag.split(".")[-1] if "." in tag else tag
+    return xml_parser.TAG_LABELS.get(tag) or xml_parser.TAG_LABELS.get(raw) or tag
 
 
 def _ratio_with_change(current: Optional[float], previous: Optional[float]) -> dict:
@@ -248,11 +265,20 @@ async def time_series(body: TimeSeriesRequest):
         return_exceptions=True,
     )
 
-    # Build period list (skip failed downloads)
+    # Build period list (skip failed downloads, log failures)
     valid_periods = []
     valid_stmts = []
     for period, stmt in zip(periods, stmts):
         if isinstance(stmt, Exception):
+            logger.warning(
+                "statement_download_failed",
+                extra={
+                    "event": "statement_download_failed",
+                    "krs": body.krs,
+                    "period_end": period["period_end"],
+                    "error": str(stmt),
+                },
+            )
             continue
         valid_periods.append(period)
         valid_stmts.append(stmt)
@@ -296,18 +322,6 @@ async def time_series(body: TimeSeriesRequest):
     # Extract flat values for each statement (kwota_a = that year's value)
     stmt_values = [xml_parser.extract_flat_values(s) for s in valid_stmts]
 
-    # Determine tag section for labelling
-    def _section(tag: str) -> str:
-        if tag.startswith("CF."):
-            return "cash_flow"
-        if tag.startswith("RZiS."):
-            return "rzis"
-        return "bilans"
-
-    def _label(tag: str) -> str:
-        raw = tag.split(".")[-1] if "." in tag else tag
-        return xml_parser.TAG_LABELS.get(tag) or xml_parser.TAG_LABELS.get(raw) or tag
-
     # Build series
     series = []
     for field_tag in body.fields:
@@ -336,8 +350,8 @@ async def time_series(body: TimeSeriesRequest):
 
         series.append({
             "tag": field_tag,
-            "label": _label(field_tag),
-            "section": _section(field_tag),
+            "label": _tag_label(field_tag),
+            "section": _tag_section(field_tag),
             "values": values,
             "changes_absolute": changes_abs,
             "changes_percent": changes_pct,

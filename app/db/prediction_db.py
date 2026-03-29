@@ -39,25 +39,7 @@ def _init_schema() -> None:
     """Create all prediction engine tables if they don't exist. Idempotent."""
     conn = get_conn()
 
-    # ----- Layer 1: Core Entity & Data Source Registry -----
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS data_sources (
-            id              VARCHAR PRIMARY KEY,
-            name            VARCHAR NOT NULL,
-            description     VARCHAR,
-            base_url        VARCHAR,
-            is_active       BOOLEAN DEFAULT true,
-            created_at      TIMESTAMP DEFAULT current_timestamp
-        )
-    """)
-
-    conn.execute("""
-        INSERT INTO data_sources (id, name, description, base_url)
-        VALUES ('KRS', 'Krajowy Rejestr Sadowy', 'Court registry - financial statements',
-                'https://rdf-przegladarka.ms.gov.pl')
-        ON CONFLICT (id) DO NOTHING
-    """)
+    # ----- Layer 1: Core Entity Registry -----
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS companies (
@@ -68,24 +50,6 @@ def _init_schema() -> None:
             incorporation_date DATE,
             voivodeship     VARCHAR(100),
             updated_at      TIMESTAMP DEFAULT current_timestamp
-        )
-    """)
-
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS seq_company_identifiers START 1
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS company_identifiers (
-            id              INTEGER PRIMARY KEY,
-            krs             VARCHAR(10) NOT NULL,
-            data_source_id  VARCHAR NOT NULL,
-            identifier_type VARCHAR(20) NOT NULL,
-            identifier_value VARCHAR(50) NOT NULL,
-            valid_from      DATE,
-            valid_to        DATE,
-            created_at      TIMESTAMP DEFAULT current_timestamp,
-            UNIQUE(data_source_id, identifier_type, identifier_value)
         )
     """)
 
@@ -262,6 +226,28 @@ def _init_schema() -> None:
         )
     """)
 
+    # ----- ETL Attempts -----
+
+    conn.execute("""
+        CREATE SEQUENCE IF NOT EXISTS seq_etl_attempts START 1
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS etl_attempts (
+            attempt_id            BIGINT PRIMARY KEY DEFAULT nextval('seq_etl_attempts'),
+            document_id           VARCHAR NOT NULL,
+            krs                   VARCHAR(10),
+            started_at            TIMESTAMP NOT NULL DEFAULT current_timestamp,
+            finished_at           TIMESTAMP,
+            status                VARCHAR NOT NULL,
+            reason_code           VARCHAR,
+            error_message         VARCHAR,
+            xml_path              VARCHAR,
+            report_id             VARCHAR,
+            extraction_version    INTEGER
+        )
+    """)
+
     # ----- Job tracking -----
 
     conn.execute("""
@@ -297,6 +283,8 @@ def _init_schema() -> None:
         ("idx_bankruptcy_krs",      "CREATE INDEX idx_bankruptcy_krs ON bankruptcy_events(krs)"),
         ("idx_bankruptcy_date",     "CREATE INDEX idx_bankruptcy_date ON bankruptcy_events(event_date)"),
         ("idx_assess_jobs_krs",     "CREATE INDEX idx_assess_jobs_krs ON assessment_jobs(krs)"),
+        ("idx_etl_attempts_doc",    "CREATE INDEX idx_etl_attempts_doc ON etl_attempts(document_id)"),
+        ("idx_etl_attempts_status", "CREATE INDEX idx_etl_attempts_status ON etl_attempts(status)"),
     ]
 
     for name, sql in index_defs:
@@ -403,6 +391,26 @@ def _init_schema() -> None:
         WHERE version_rank = 1
     """)
 
+    conn.execute("""
+        CREATE OR REPLACE VIEW latest_successful_financial_reports AS
+        SELECT
+            id, logical_key, report_version, supersedes_report_id, krs,
+            data_source_id, report_type, fiscal_year, period_start, period_end,
+            taxonomy_version, source_document_id, source_file_path,
+            ingestion_status, ingestion_error, created_at
+        FROM (
+            SELECT
+                fr.*,
+                row_number() OVER (
+                    PARTITION BY fr.logical_key
+                    ORDER BY fr.report_version DESC, fr.created_at DESC, fr.id DESC
+                ) AS rn
+            FROM financial_reports fr
+            WHERE fr.ingestion_status = 'completed'
+        ) ranked
+        WHERE rn = 1
+    """)
+
 
 # ---------------------------------------------------------------------------
 # CRUD helpers
@@ -441,15 +449,6 @@ def get_latest_extraction_version(report_id: str) -> int:
 def get_next_extraction_version(report_id: str) -> int:
     return get_latest_extraction_version(report_id) + 1
 
-# --- data_sources ---
-
-def get_data_sources() -> list[dict]:
-    conn = get_conn()
-    rows = conn.execute("SELECT id, name, description, base_url, is_active FROM data_sources").fetchall()
-    cols = ["id", "name", "description", "base_url", "is_active"]
-    return [dict(zip(cols, row)) for row in rows]
-
-
 # --- companies ---
 
 def upsert_company(krs: str, nip: Optional[str] = None, regon: Optional[str] = None,
@@ -478,22 +477,6 @@ def get_company(krs: str) -> Optional[dict]:
     if row is None:
         return None
     return dict(zip(["krs", "nip", "regon", "pkd_code", "incorporation_date", "voivodeship"], row))
-
-
-# --- company_identifiers ---
-
-def add_company_identifier(krs: str, data_source_id: str, identifier_type: str,
-                            identifier_value: str, valid_from: Optional[str] = None,
-                            valid_to: Optional[str] = None) -> None:
-    conn = get_conn()
-    now = datetime.now(timezone.utc)
-    next_id = conn.execute("SELECT nextval('seq_company_identifiers')").fetchone()[0]
-    conn.execute("""
-        INSERT INTO company_identifiers
-            (id, krs, data_source_id, identifier_type, identifier_value, valid_from, valid_to, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (data_source_id, identifier_type, identifier_value) DO NOTHING
-    """, [next_id, krs, data_source_id, identifier_type, identifier_value, valid_from, valid_to, now])
 
 
 # --- financial_reports ---
@@ -715,14 +698,22 @@ def upsert_feature_definition(feature_id: str, name: str, description: Optional[
 
 def get_feature_definitions(active_only: bool = True) -> list[dict]:
     conn = get_conn()
-    where = "WHERE is_active = true" if active_only else ""
-    rows = conn.execute(f"""
-        SELECT id, name, description, category, formula_description,
-               formula_numerator, formula_denominator, required_tags,
-               computation_logic, version, is_active
-        FROM feature_definitions {where}
-        ORDER BY id
-    """).fetchall()
+    if active_only:
+        rows = conn.execute("""
+            SELECT id, name, description, category, formula_description,
+                   formula_numerator, formula_denominator, required_tags,
+                   computation_logic, version, is_active
+            FROM feature_definitions WHERE is_active = true
+            ORDER BY id
+        """).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT id, name, description, category, formula_description,
+                   formula_numerator, formula_denominator, required_tags,
+                   computation_logic, version, is_active
+            FROM feature_definitions
+            ORDER BY id
+        """).fetchall()
     cols = ["id", "name", "description", "category", "formula_description",
             "formula_numerator", "formula_denominator", "required_tags",
             "computation_logic", "version", "is_active"]
@@ -796,14 +787,22 @@ def upsert_computed_feature(report_id: str, feature_definition_id: str, krs: str
 
 def get_computed_features_for_report(report_id: str, valid_only: bool = True) -> list[dict]:
     conn = get_conn()
-    where = "WHERE report_id = ?" if not valid_only else "WHERE report_id = ? AND is_valid = true"
-    rows = conn.execute(f"""
-        SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid,
-               error_message, source_extraction_version, computation_version
-        FROM latest_computed_features
-        {where}
-        ORDER BY feature_definition_id
-    """, [report_id]).fetchall()
+    if valid_only:
+        rows = conn.execute("""
+            SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid,
+                   error_message, source_extraction_version, computation_version
+            FROM latest_computed_features
+            WHERE report_id = ? AND is_valid = true
+            ORDER BY feature_definition_id
+        """, [report_id]).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid,
+                   error_message, source_extraction_version, computation_version
+            FROM latest_computed_features
+            WHERE report_id = ?
+            ORDER BY feature_definition_id
+        """, [report_id]).fetchall()
     cols = [
         "report_id",
         "feature_definition_id",

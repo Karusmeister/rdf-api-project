@@ -96,6 +96,11 @@ async def stop_scan():
 @scan_router.post("/reset-cursor")
 async def reset_cursor(body: ResetCursorBody):
     """Reset the scan cursor to an arbitrary position. Rejected if running."""
+    if not 0 <= body.next_krs_int <= 99_999_999:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"status": "rejected", "reason": "next_krs_int must be between 0 and 99999999"},
+        )
     if krs_scanner.is_scan_running():
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
