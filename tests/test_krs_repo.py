@@ -274,3 +274,118 @@ def test_multiple_scan_runs_returns_latest():
     last = krs_repo.get_last_scan_run()
     assert last["id"] == run2
     assert last["krs_from"] == 101
+
+
+# ---------------------------------------------------------------------------
+# Append-only entity versioning (PR2)
+# ---------------------------------------------------------------------------
+
+
+def _version_rows(krs: str):
+    conn = db_conn.get_conn()
+    return conn.execute(
+        "SELECT * FROM krs_entity_versions WHERE krs = ? ORDER BY version_id",
+        [krs],
+    ).fetchall()
+
+
+def _version_dicts(krs: str) -> list[dict]:
+    conn = db_conn.get_conn()
+    rows = conn.execute(
+        "SELECT * FROM krs_entity_versions WHERE krs = ? ORDER BY version_id",
+        [krs],
+    ).fetchall()
+    cols = [d[0] for d in conn.execute("SELECT * FROM krs_entity_versions LIMIT 0").description]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def test_upsert_creates_version():
+    """First upsert should create exactly one version row."""
+    krs_repo.upsert_entity(krs="0000000010", name="Version Corp")
+    versions = _version_dicts("0000000010")
+    assert len(versions) == 1
+    assert versions[0]["is_current"] is True
+    assert versions[0]["valid_to"] is None
+
+
+def test_different_snapshots_create_two_versions():
+    """Two different snapshots should produce two version rows."""
+    krs_repo.upsert_entity(krs="0000000011", name="Name A", nip="1111111111")
+    krs_repo.upsert_entity(krs="0000000011", name="Name B", nip="2222222222")
+    versions = _version_dicts("0000000011")
+    assert len(versions) == 2
+    # Only the latest is current
+    current_versions = [v for v in versions if v["is_current"]]
+    assert len(current_versions) == 1
+    assert current_versions[0]["name"] == "Name B"
+    # Old version is closed
+    old = [v for v in versions if not v["is_current"]]
+    assert len(old) == 1
+    assert old[0]["valid_to"] is not None
+
+
+def test_identical_snapshot_no_new_version():
+    """Same snapshot twice should NOT create a second version."""
+    krs_repo.upsert_entity(
+        krs="0000000012", name="Stable Corp", legal_form="SA",
+        raw={"key": "value"},
+    )
+    krs_repo.upsert_entity(
+        krs="0000000012", name="Stable Corp", legal_form="SA",
+        raw={"key": "value"},
+    )
+    versions = _version_dicts("0000000012")
+    assert len(versions) == 1
+    assert versions[0]["is_current"] is True
+
+
+def test_only_one_current_per_krs_after_multiple_changes():
+    """After several changes, exactly one version should be current."""
+    for i in range(5):
+        krs_repo.upsert_entity(krs="0000000013", name=f"Name {i}")
+    versions = _version_dicts("0000000013")
+    assert len(versions) == 5
+    current = [v for v in versions if v["is_current"]]
+    assert len(current) == 1
+    assert current[0]["name"] == "Name 4"
+
+
+def test_version_appears_in_current_view():
+    """get_entity reads from krs_entities_current view, backed by versions."""
+    krs_repo.upsert_entity(krs="0000000014", name="View Corp", nip="9999999999")
+    entity = krs_repo.get_entity("0000000014")
+    assert entity is not None
+    assert entity["name"] == "View Corp"
+    assert entity["nip"] == "9999999999"
+
+
+def test_count_entities_uses_current_view():
+    """count_entities should count distinct current entities, not version rows."""
+    krs_repo.upsert_entity(krs="0000000015", name="A")
+    krs_repo.upsert_entity(krs="0000000015", name="B")  # version 2, same krs
+    krs_repo.upsert_entity(krs="0000000016", name="C")
+    assert krs_repo.count_entities() == 2
+
+
+def test_list_stale_uses_current_view():
+    """list_stale should work against krs_entities_current."""
+    krs_repo.upsert_entity(krs="0000000017", name="Stale Corp")
+    far_future = datetime(2099, 1, 1, tzinfo=timezone.utc)
+    stale = krs_repo.list_stale(far_future)
+    krs_list = [s["krs"] for s in stale]
+    assert "0000000017" in krs_list
+
+
+def test_startup_guardrail_fails_fast_when_legacy_without_versions():
+    """connect() should fail fast on legacy rows without append-only backfill."""
+    conn = db_conn.get_conn()
+    # Insert legacy data directly, ensure version table is empty
+    conn.execute("DELETE FROM krs_entity_versions")
+    conn.execute("""
+        INSERT INTO krs_entities (krs, name, source) VALUES ('0000099999', 'Guard Corp', 'ms_gov')
+        ON CONFLICT (krs) DO NOTHING
+    """)
+    # Re-connect — guardrail must block startup with clear migration hint.
+    krs_repo._schema_initialized = False
+    with pytest.raises(RuntimeError, match="Cutover blocked: krs_entity_versions is empty"):
+        krs_repo.connect()

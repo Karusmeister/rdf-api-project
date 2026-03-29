@@ -205,3 +205,20 @@ def test_stats():
     assert stats["krs_unchecked"] >= 1
     assert stats["total_documents"] >= 3
     assert stats["total_downloaded"] >= 2
+
+
+def test_startup_guardrail_fails_fast_when_legacy_without_versions():
+    """connect() should fail fast on legacy docs without append-only backfill."""
+    conn = scraper_db.get_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("DELETE FROM krs_document_versions")
+    conn.execute("""
+        INSERT INTO krs_documents (
+            document_id, krs, rodzaj, status, discovered_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (document_id) DO NOTHING
+    """, ["legacy-doc-guard", "0000099998", "18", "NIEUSUNIETY", now])
+
+    scraper_db._schema_initialized = False
+    with pytest.raises(RuntimeError, match="Cutover blocked: krs_document_versions is empty"):
+        scraper_db.connect()

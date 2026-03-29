@@ -227,8 +227,10 @@ async def _worker_loop(
     delay increases by 1s (up to +5s).  If failures persist at max delay,
     the connection pauses for 60s then resets.
     """
-    store = ProgressStore(db_path, init_schema=False)
-    entities = EntityStore(db_path, init_schema=False)
+    # Ensure required tables exist even when _worker_loop is used standalone
+    # (e.g. tests or direct invocation outside batch.runner pre-bootstrap).
+    store = ProgressStore(db_path, init_schema=True)
+    entities = EntityStore(db_path, init_schema=True)
     stats = WorkerStats()
     health = ConnectionHealth()
     sem = asyncio.Semaphore(concurrency)
