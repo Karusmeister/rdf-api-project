@@ -19,14 +19,13 @@ from app.scraper import db as scraper_db
 
 
 @pytest.fixture(autouse=True)
-def isolated_db(tmp_path):
-    """Isolated DuckDB for each test."""
-    db_path = str(tmp_path / "test.duckdb")
+def isolated_db(pg_dsn, clean_pg):
+    """Isolated PostgreSQL schema for each test."""
     db_conn.reset()
     krs_repo._schema_initialized = False
     scraper_db._schema_initialized = False
     prediction_db._schema_initialized = False
-    with patch.object(settings, "scraper_db_path", db_path):
+    with patch.object(settings, "database_url", pg_dsn):
         db_conn.connect()
         krs_repo._ensure_schema()
         scraper_db._ensure_schema()
@@ -48,7 +47,7 @@ class TestDDLPresence:
         conn = db_conn.get_conn()
         tables = {
             row[0] for row in conn.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
             ).fetchall()
         }
         assert "krs_entity_versions" in tables
@@ -57,7 +56,7 @@ class TestDDLPresence:
         conn = db_conn.get_conn()
         tables = {
             row[0] for row in conn.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
             ).fetchall()
         }
         assert "krs_document_versions" in tables
@@ -66,7 +65,7 @@ class TestDDLPresence:
         conn = db_conn.get_conn()
         tables = {
             row[0] for row in conn.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
             ).fetchall()
         }
         assert "etl_attempts" in tables
@@ -192,7 +191,7 @@ class TestBackfill:
         conn = db_conn.get_conn()
         for i in range(1, 6):
             conn.execute(
-                "INSERT INTO krs_entities (krs, name, source) VALUES (?, ?, 'ms_gov')",
+                "INSERT INTO krs_entities (krs, name, source) VALUES (%s, %s, 'ms_gov')",
                 [f"000000000{i}", f"Company {i}"],
             )
         self._run_backfill()

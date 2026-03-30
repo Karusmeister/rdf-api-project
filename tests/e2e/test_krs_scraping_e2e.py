@@ -9,7 +9,7 @@ All tests hit live government endpoints:
   - api-krs.ms.gov.pl  (KRS Open API)
   - rdf-przegladarka.ms.gov.pl  (RDF document repository)
 
-Each test writes to an isolated DuckDB in tmp_path — never the main DB.
+Each test writes to an isolated PostgreSQL database — never the main DB.
 
 Run with:  pytest tests/e2e/test_krs_scraping_e2e.py -v -s --e2e
 """
@@ -59,16 +59,15 @@ def event_loop():
 
 
 @pytest.fixture
-def isolated_db(tmp_path):
-    """Isolated DuckDB + storage directory with all schemas initialized."""
-    db_path = str(tmp_path / "e2e.duckdb")
+def isolated_db(tmp_path, pg_dsn, clean_pg):
+    """Isolated PostgreSQL DB + storage directory with all schemas initialized."""
     storage_dir = tmp_path / "documents"
 
     db_conn.reset()
     scraper_db._schema_initialized = False
     prediction_db._schema_initialized = False
 
-    with patch.object(settings, "scraper_db_path", db_path):
+    with patch.object(settings, "database_url", pg_dsn):
         db_conn.connect()
         scraper_db.connect()
         prediction_db.connect()
@@ -77,7 +76,7 @@ def isolated_db(tmp_path):
 
         yield {
             "tmp": tmp_path,
-            "db_path": db_path,
+            "db_path": pg_dsn,
             "storage_dir": storage_dir,
             "storage": LocalStorage(str(storage_dir)),
         }
@@ -344,7 +343,7 @@ class TestScraper:
         conn = scraper_db.get_conn()
         reg = conn.execute(
             "SELECT company_name, total_documents, total_downloaded "
-            "FROM krs_registry WHERE krs = ?",
+            "FROM krs_registry WHERE krs = %s",
             [KRS_KNOWN],
         ).fetchone()
         assert reg is not None
@@ -354,7 +353,7 @@ class TestScraper:
 
         # krs_documents should have rows (via version table)
         doc_count = conn.execute(
-            "SELECT count(*) FROM krs_documents_current WHERE krs = ?",
+            "SELECT count(*) FROM krs_documents_current WHERE krs = %s",
             [KRS_KNOWN],
         ).fetchone()[0]
         assert doc_count > 0
@@ -364,7 +363,7 @@ class TestScraper:
         downloaded = conn.execute(
             "SELECT document_id, storage_path, file_count, file_types "
             "FROM krs_documents_current "
-            "WHERE krs = ? AND is_downloaded = true",
+            "WHERE krs = %s AND is_downloaded = true",
             [KRS_KNOWN],
         ).fetchall()
         assert len(downloaded) > 0
@@ -438,7 +437,7 @@ class TestScraper:
         # KRS should be marked inactive
         conn = scraper_db.get_conn()
         reg = conn.execute(
-            "SELECT is_active FROM krs_registry WHERE krs = ?",
+            "SELECT is_active FROM krs_registry WHERE krs = %s",
             [KRS_NONEXISTENT],
         ).fetchone()
         assert reg is not None
@@ -503,14 +502,14 @@ class TestFullPipeline:
 
         # The KRS should now have documents in the DB
         doc_count = conn.execute(
-            "SELECT count(*) FROM krs_documents_current WHERE krs = ?",
+            "SELECT count(*) FROM krs_documents_current WHERE krs = %s",
             [krs],
         ).fetchone()[0]
         print(f"  Documents in DB: {doc_count}")
 
         # Verify the registry was updated with document counts
         reg = conn.execute(
-            "SELECT total_documents, total_downloaded FROM krs_registry WHERE krs = ?",
+            "SELECT total_documents, total_downloaded FROM krs_registry WHERE krs = %s",
             [krs],
         ).fetchone()
         assert reg is not None

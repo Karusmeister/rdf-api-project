@@ -65,7 +65,7 @@ def run_batch(
     use_vpn: bool | None = None,
     concurrency: int | None = None,
     delay: float | None = None,
-    db_path: str | None = None,
+    dsn: str | None = None,
 ) -> None:
     """Spawn N worker processes and block until all exit.
 
@@ -76,7 +76,7 @@ def run_batch(
     _vpn = use_vpn if use_vpn is not None else settings.batch_use_vpn
     _concurrency = concurrency if concurrency is not None else settings.batch_concurrency_per_worker
     _delay = delay if delay is not None else settings.batch_delay_seconds
-    _db = db_path if db_path is not None else settings.batch_db_path
+    _db = dsn if dsn is not None else settings.database_url
 
     if _workers <= 0:
         raise ValueError("workers must be > 0")
@@ -94,8 +94,8 @@ def run_batch(
     EntityStore(_db)
 
     logger.info(
-        "batch_start workers=%d start_krs=%d vpn=%s concurrency=%d delay=%.1f db=%s",
-        _workers, _start, _vpn, _concurrency, _delay, _db,
+        "batch_start workers=%d start_krs=%d vpn=%s concurrency=%d delay=%.1f dsn=%s",
+        _workers, _start, _vpn, _concurrency, _delay, _db.split("@")[-1] if "@" in _db else _db,
     )
 
     processes: list[multiprocessing.Process] = []
@@ -111,7 +111,7 @@ def run_batch(
                 connection=conn,
                 concurrency=_concurrency,
                 delay=_delay,
-                db_path=_db,
+                dsn=_db,
             ),
         )
         processes.append(p)
@@ -186,7 +186,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db", type=str, default=None,
-        help=f"Progress DB path (default: {settings.batch_db_path})",
+        help=f"PostgreSQL DSN (default: DATABASE_URL from .env)",
     )
     return parser
 
@@ -216,7 +216,7 @@ def main() -> None:
         use_vpn=use_vpn,
         concurrency=args.concurrency,
         delay=args.delay,
-        db_path=args.db,
+        dsn=args.db,
     )
 
 

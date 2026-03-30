@@ -388,11 +388,11 @@ async def _worker_loop(
     concurrency: int,
     delay: float,
     page_size: int,
-    db_path: str,
+    dsn: str,
 ) -> None:
     """Main async loop for a single RDF document discovery + download worker."""
-    progress = RdfProgressStore(db_path)
-    doc_store = RdfDocumentStore(db_path)
+    progress = RdfProgressStore(dsn)
+    doc_store = RdfDocumentStore(dsn)
     storage = create_storage()
     stats = RdfWorkerStats()
     health = ConnectionHealth()
@@ -536,7 +536,7 @@ def run_rdf_worker(
     concurrency: int,
     delay: float,
     page_size: int,
-    db_path: str,
+    dsn: str,
 ) -> None:
     """Entrypoint for multiprocessing.Process."""
     logging.basicConfig(
@@ -557,6 +557,6 @@ def run_rdf_worker(
             concurrency=concurrency,
             delay=delay,
             page_size=page_size,
-            db_path=db_path,
+            dsn=dsn,
         )
     )

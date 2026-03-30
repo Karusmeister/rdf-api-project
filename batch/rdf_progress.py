@@ -1,42 +1,30 @@
-"""DuckDB-backed progress store for the batch RDF document discovery.
+"""PostgreSQL-backed progress store for the batch RDF document discovery.
 
 Tracks which KRS numbers have had their RDF documents fetched.
 Uses a separate table (batch_rdf_progress) so it does not interfere
 with the KRS entity scanner's batch_progress table.
-
-Same short-lived connection + retry pattern as batch/progress.py.
 """
 
-import random
-import time
+import psycopg2
 
-import duckdb
-
-_MAX_LOCK_RETRIES = 10
-_BASE_LOCK_DELAY = 0.05
+from app.db.connection import make_connection
 
 
 class RdfProgressStore:
     """Track which KRS numbers have had their RDF documents discovered."""
 
-    def __init__(self, db_path: str):
-        self._db_path = db_path
+    def __init__(self, dsn: str):
+        self._dsn = dsn
         self._init_schema()
 
     def _with_conn(self, fn):
-        for attempt in range(_MAX_LOCK_RETRIES):
-            try:
-                conn = duckdb.connect(self._db_path)
-                try:
-                    result = fn(conn)
-                finally:
-                    conn.close()
-                return result
-            except duckdb.IOException:
-                if attempt == _MAX_LOCK_RETRIES - 1:
-                    raise
-                delay = _BASE_LOCK_DELAY * (2 ** attempt) + random.uniform(0, 0.05)
-                time.sleep(delay)
+        """Open a short-lived connection, call fn(conn), close, return result."""
+        conn = make_connection(self._dsn)
+        try:
+            result = fn(conn)
+        finally:
+            conn.close()
+        return result
 
     def _init_schema(self):
         def _do(conn):
@@ -54,7 +42,7 @@ class RdfProgressStore:
     def is_done(self, krs: str) -> bool:
         def _do(conn):
             row = conn.execute(
-                "SELECT 1 FROM batch_rdf_progress WHERE krs = ?", [krs]
+                "SELECT 1 FROM batch_rdf_progress WHERE krs = %s", [krs]
             ).fetchone()
             return row is not None
         return self._with_conn(_do)
@@ -63,7 +51,7 @@ class RdfProgressStore:
         def _do(conn):
             conn.execute("""
                 INSERT INTO batch_rdf_progress (krs, status, documents_found, worker_id)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (krs) DO UPDATE SET
                     status = excluded.status,
                     documents_found = excluded.documents_found,
@@ -86,7 +74,7 @@ class RdfProgressStore:
                     ON LPAD(CAST(bp.krs AS VARCHAR), 10, '0') = rp.krs
                 WHERE bp.status = 'found'
                   AND rp.krs IS NULL
-                  AND bp.krs % ? = ?
+                  AND bp.krs %% %s = %s
                 ORDER BY bp.krs
             """, [total_workers, worker_id]).fetchall()
             return [row[0] for row in rows]
@@ -106,7 +94,7 @@ class RdfProgressStore:
                 WHERE rp.status IN ('done', 'partial')
                   AND (kd.is_downloaded = false OR kd.is_downloaded IS NULL)
                   AND kd.download_error IS NULL
-                  AND CAST(rp.krs AS BIGINT) % ? = ?
+                  AND CAST(rp.krs AS BIGINT) %% %s = %s
                 ORDER BY rp.krs
             """, [total_workers, worker_id]).fetchall()
             return [row[0] for row in rows]

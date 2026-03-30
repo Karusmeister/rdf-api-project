@@ -245,6 +245,6 @@ async def _process_one_krs(krs: str, storage, stats: dict) -> None:
     # Step 5: Update registry
     total_docs = len(all_docs)
     conn_downloaded = db.get_conn().execute(
-        "SELECT count(*) FROM krs_documents_current WHERE krs = ? AND is_downloaded = true", [krs.zfill(10)]
+        "SELECT count(*) FROM krs_documents_current WHERE krs = %s AND is_downloaded = true", [krs.zfill(10)]
     ).fetchone()[0]
     db.update_krs_checked(krs, total_docs=total_docs, total_downloaded=conn_downloaded, error=None)

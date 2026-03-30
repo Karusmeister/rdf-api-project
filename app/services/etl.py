@@ -29,7 +29,7 @@ def _start_etl_attempt(document_id: str, krs: str | None = None) -> int:
         """
         INSERT INTO etl_attempts
             (document_id, krs, started_at, status)
-        VALUES (?, ?, ?, 'running')
+        VALUES (%s, %s, %s, 'running')
         RETURNING attempt_id
         """,
         [document_id, krs, now],
@@ -54,9 +54,9 @@ def _finish_etl_attempt(
     conn.execute(
         """
         UPDATE etl_attempts
-        SET finished_at = ?, status = ?, reason_code = ?, error_message = ?,
-            xml_path = ?, report_id = ?, extraction_version = ?
-        WHERE attempt_id = ?
+        SET finished_at = %s, status = %s, reason_code = %s, error_message = %s,
+            xml_path = %s, report_id = %s, extraction_version = %s
+        WHERE attempt_id = %s
         """,
         [now, status, reason_code, error_message, xml_path, report_id,
          extraction_version, attempt_id],
@@ -148,7 +148,7 @@ def ingest_document(document_id: str, storage: Optional[LocalStorage] = None) ->
     # 1. Look up document in scraper DB
     conn = scraper_db.get_conn()
     row = conn.execute(
-        "SELECT krs, storage_path, is_downloaded FROM krs_documents_current WHERE document_id = ?",
+        "SELECT krs, storage_path, is_downloaded FROM krs_documents_current WHERE document_id = %s",
         [document_id],
     ).fetchone()
 

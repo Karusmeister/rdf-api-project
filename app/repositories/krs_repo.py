@@ -107,7 +107,7 @@ def _init_schema() -> None:
 
     # Indexes for krs_entity_versions
     existing_idx = {
-        row[0] for row in conn.execute("SELECT index_name FROM duckdb_indexes()").fetchall()
+        row[0] for row in conn.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'public'").fetchall()
     }
     for idx_name, idx_sql in [
         ("idx_krs_entity_versions_krs", "CREATE INDEX idx_krs_entity_versions_krs ON krs_entity_versions(krs)"),
@@ -164,7 +164,8 @@ def _init_schema() -> None:
     """)
     # Seed the single-row cursor if it doesn't exist
     conn.execute("""
-        INSERT OR IGNORE INTO krs_scan_cursor (id, next_krs_int) VALUES (TRUE, 1)
+        INSERT INTO krs_scan_cursor (id, next_krs_int) VALUES (TRUE, 1)
+        ON CONFLICT DO NOTHING
     """)
 
     conn.execute("""
@@ -199,7 +200,7 @@ def _close_orphaned_runs() -> None:
         conn.execute(
             """
             UPDATE krs_scan_runs
-            SET status = 'interrupted', finished_at = ?, stopped_reason = 'process_killed'
+            SET status = 'interrupted', finished_at = %s, stopped_reason = 'process_killed'
             WHERE status = 'running'
             """,
             [now],
@@ -216,7 +217,7 @@ def _close_orphaned_runs() -> None:
         conn.execute(
             """
             UPDATE krs_sync_log
-            SET status = 'interrupted', finished_at = ?
+            SET status = 'interrupted', finished_at = %s
             WHERE status = 'running'
             """,
             [now],
@@ -235,7 +236,7 @@ _ALLOWED_ALTER_COLUMNS = {
 
 def _ensure_krs_entities_columns(conn) -> None:
     existing_columns = {
-        row[0] for row in conn.execute("DESCRIBE krs_entities").fetchall()
+        row[0] for row in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'krs_entities' AND table_schema = 'public' ORDER BY ordinal_position").fetchall()
     }
     for name, definition in _ALLOWED_ALTER_COLUMNS.items():
         if name not in existing_columns:
@@ -339,7 +340,7 @@ def _append_entity_version_if_changed(
             """
             SELECT version_id, snapshot_hash
             FROM krs_entity_versions
-            WHERE krs = ? AND is_current = true
+            WHERE krs = %s AND is_current = true
             ORDER BY valid_from DESC, version_id DESC
             LIMIT 1
             """,
@@ -348,7 +349,7 @@ def _append_entity_version_if_changed(
 
         if current is not None and current[1] == snapshot_hash:
             conn.execute(
-                "UPDATE krs_entity_versions SET observed_at = ? WHERE version_id = ?",
+                "UPDATE krs_entity_versions SET observed_at = %s WHERE version_id = %s",
                 [now, current[0]],
             )
             conn.execute("COMMIT")
@@ -358,8 +359,8 @@ def _append_entity_version_if_changed(
             conn.execute(
                 """
                 UPDATE krs_entity_versions
-                SET valid_to = ?, is_current = false
-                WHERE version_id = ? AND is_current = true
+                SET valid_to = %s, is_current = false
+                WHERE version_id = %s AND is_current = true
                 """,
                 [now, current[0]],
             )
@@ -370,7 +371,7 @@ def _append_entity_version_if_changed(
                 (krs, name, legal_form, status, registered_at, last_changed_at,
                  nip, regon, address_city, address_street, address_postal_code,
                  raw, source, valid_from, is_current, snapshot_hash, observed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, %s, %s)
             """,
             [
                 krs,
@@ -448,7 +449,7 @@ def upsert_entity(
             (krs, name, legal_form, status, registered_at, last_changed_at,
              nip, regon, address_city, address_street, address_postal_code,
              raw, source, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (krs) DO UPDATE SET
             name            = excluded.name,
             legal_form      = excluded.legal_form,
@@ -495,12 +496,12 @@ def get_entity(krs: str) -> Optional[dict]:
     """Fetch current entity from krs_entities_current view. Returns None if not found."""
     conn = get_conn()
     result = conn.execute(
-        "SELECT * FROM krs_entities_current WHERE krs = ?", [krs]
+        "SELECT * FROM krs_entities_current WHERE krs = %s", [krs]
     ).fetchone()
     if result is None:
         return None
     columns = [desc[0] for desc in conn.execute(
-        "DESCRIBE krs_entities_current"
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'krs_entities_current' AND table_schema = 'public' ORDER BY ordinal_position"
     ).fetchall()]
     row = dict(zip(columns, result))
     raw = row.get("raw")
@@ -513,7 +514,7 @@ def list_stale(older_than: datetime) -> list[dict]:
     """Return entities not synced since ``older_than``."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT krs, name, synced_at FROM krs_entities_current WHERE synced_at < ? ORDER BY synced_at",
+        "SELECT krs, name, synced_at FROM krs_entities_current WHERE synced_at < %s ORDER BY synced_at",
         [older_than.isoformat()],
     ).fetchall()
     return [{"krs": r[0], "name": r[1], "synced_at": r[2]} for r in rows]
@@ -541,7 +542,7 @@ def log_sync_start(
     result = conn.execute(
         """
         INSERT INTO krs_sync_log (started_at, source, status)
-        VALUES (?, ?, 'running')
+        VALUES (%s, %s, 'running')
         RETURNING id
         """,
         [ts, source],
@@ -564,9 +565,9 @@ def log_sync_finish(
     conn.execute(
         """
         UPDATE krs_sync_log
-        SET finished_at = ?, krs_count = ?, new_count = ?,
-            updated_count = ?, error_count = ?, status = ?
-        WHERE id = ?
+        SET finished_at = %s, krs_count = %s, new_count = %s,
+            updated_count = %s, error_count = %s, status = %s
+        WHERE id = %s
         """,
         [now, krs_count, new_count, updated_count, error_count, status, sync_id],
     )
@@ -593,7 +594,7 @@ def advance_cursor(next_krs_int: int) -> None:
     conn.execute(
         """
         UPDATE krs_scan_cursor
-        SET next_krs_int = ?, updated_at = ?
+        SET next_krs_int = %s, updated_at = %s
         WHERE id = TRUE
         """,
         [next_krs_int, now],
@@ -612,7 +613,7 @@ def open_scan_run(krs_from: int) -> int:
     result = conn.execute(
         """
         INSERT INTO krs_scan_runs (started_at, krs_from)
-        VALUES (?, ?)
+        VALUES (%s, %s)
         RETURNING id
         """,
         [now, krs_from],
@@ -632,19 +633,19 @@ def update_scan_run(
     sets: list[str] = []
     params: list[Any] = []
     if probed_count is not None:
-        sets.append("probed_count = ?")
+        sets.append("probed_count = %s")
         params.append(probed_count)
     if valid_count is not None:
-        sets.append("valid_count = ?")
+        sets.append("valid_count = %s")
         params.append(valid_count)
     if error_count is not None:
-        sets.append("error_count = ?")
+        sets.append("error_count = %s")
         params.append(error_count)
     if not sets:
         return
     params.append(run_id)
     conn.execute(
-        f"UPDATE krs_scan_runs SET {', '.join(sets)} WHERE id = ?",
+        f"UPDATE krs_scan_runs SET {', '.join(sets)} WHERE id = %s",
         params,
     )
 
@@ -665,11 +666,11 @@ def close_scan_run(
     conn.execute(
         """
         UPDATE krs_scan_runs
-        SET finished_at = ?, status = ?, krs_to = ?, stopped_reason = ?,
-            probed_count = COALESCE(?, probed_count),
-            valid_count  = COALESCE(?, valid_count),
-            error_count  = COALESCE(?, error_count)
-        WHERE id = ?
+        SET finished_at = %s, status = %s, krs_to = %s, stopped_reason = %s,
+            probed_count = COALESCE(%s, probed_count),
+            valid_count  = COALESCE(%s, valid_count),
+            error_count  = COALESCE(%s, error_count)
+        WHERE id = %s
         """,
         [now, status, krs_to, stopped_reason,
          probed_count, valid_count, error_count, run_id],
@@ -689,7 +690,7 @@ def get_last_scan_run() -> Optional[dict]:
     if row is None:
         return None
     columns = [desc[0] for desc in conn.execute(
-        "DESCRIBE krs_scan_runs"
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'krs_scan_runs' AND table_schema = 'public' ORDER BY ordinal_position"
     ).fetchall()]
     return dict(zip(columns, row))
 
@@ -705,7 +706,7 @@ def get_last_sync(source: str = "ms_gov") -> Optional[dict]:
     row = conn.execute(
         """
         SELECT * FROM krs_sync_log
-        WHERE source = ?
+        WHERE source = %s
         ORDER BY started_at DESC
         LIMIT 1
         """,
@@ -714,6 +715,6 @@ def get_last_sync(source: str = "ms_gov") -> Optional[dict]:
     if row is None:
         return None
     columns = [desc[0] for desc in conn.execute(
-        "DESCRIBE krs_sync_log"
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'krs_sync_log' AND table_schema = 'public' ORDER BY ordinal_position"
     ).fetchall()]
     return dict(zip(columns, row))

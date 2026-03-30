@@ -219,7 +219,7 @@ async def _worker_loop(
     connection: Connection,
     concurrency: int,
     delay: float,
-    db_path: str,
+    dsn: str,
 ) -> None:
     """Main async loop for a single worker process.
 
@@ -233,8 +233,8 @@ async def _worker_loop(
     """
     # Ensure required tables exist even when _worker_loop is used standalone
     # (e.g. tests or direct invocation outside batch.runner pre-bootstrap).
-    store = ProgressStore(db_path, init_schema=True)
-    entities = EntityStore(db_path, init_schema=True)
+    store = ProgressStore(dsn, init_schema=True)
+    entities = EntityStore(dsn, init_schema=True)
     stats = WorkerStats()
     health = ConnectionHealth()
     sem = asyncio.Semaphore(concurrency)
@@ -360,7 +360,7 @@ def run_worker(
     connection: Connection,
     concurrency: int,
     delay: float,
-    db_path: str,
+    dsn: str,
 ) -> None:
     """Entrypoint for multiprocessing.Process — sets up logging and runs the async loop."""
     logging.basicConfig(
@@ -379,6 +379,6 @@ def run_worker(
             connection=connection,
             concurrency=concurrency,
             delay=delay,
-            db_path=db_path,
+            dsn=dsn,
         )
     )

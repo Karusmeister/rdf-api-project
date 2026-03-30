@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     krs_scan_rate_limit_backoff_s: int = 60  # pause when upstream rate-limits us
     krs_scan_max_consecutive_errors: int = 10  # stop scan after this many in a row
 
+    # --- PostgreSQL ---
+    database_url: str = "postgresql://rdf:rdf_dev@localhost:5432/rdf"
+    db_pool_min: int = 2
+    db_pool_max: int = 10
+
     # --- Batch runner ---
     batch_use_vpn: bool = False
     batch_workers: int = 4

@@ -1,7 +1,7 @@
 """Store discovered RDF documents using append-only versioning.
 
-Uses the same short-lived connection + retry pattern as other batch stores,
-so multiple worker processes can write to the same DuckDB file.
+Uses short-lived PostgreSQL connections via make_connection,
+so multiple worker processes can write concurrently.
 
 Each document change (discovery, metadata, download, error) creates a new
 version row in ``krs_document_versions``. The legacy ``krs_documents`` table
@@ -11,16 +11,13 @@ is still populated for backward compatibility.
 import hashlib
 import json
 import logging
-import random
-import time
 from datetime import datetime, timezone
 
-import duckdb
+import psycopg2
+
+from app.db.connection import make_connection
 
 logger = logging.getLogger(__name__)
-
-_MAX_LOCK_RETRIES = 10
-_BASE_LOCK_DELAY = 0.05
 
 _DOC_SNAPSHOT_FIELDS = (
     "rodzaj", "status", "nazwa", "okres_start", "okres_end",
@@ -39,25 +36,19 @@ def _doc_snapshot_hash(snapshot: dict) -> str:
 class RdfDocumentStore:
     """Batch-insert discovered RDF documents with append-only versioning."""
 
-    def __init__(self, db_path: str, *, init_schema: bool = True):
-        self._db_path = db_path
+    def __init__(self, dsn: str, *, init_schema: bool = True):
+        self._dsn = dsn
         if init_schema:
             self._ensure_table()
 
     def _with_conn(self, fn):
-        for attempt in range(_MAX_LOCK_RETRIES):
-            try:
-                conn = duckdb.connect(self._db_path)
-                try:
-                    result = fn(conn)
-                finally:
-                    conn.close()
-                return result
-            except duckdb.IOException:
-                if attempt == _MAX_LOCK_RETRIES - 1:
-                    raise
-                delay = min(_BASE_LOCK_DELAY * (2 ** attempt), 5.0) + random.uniform(0, 0.05)
-                time.sleep(delay)
+        """Open a short-lived connection, call fn(conn), close, return result."""
+        conn = make_connection(self._dsn)
+        try:
+            result = fn(conn)
+        finally:
+            conn.close()
+        return result
 
     def _ensure_table(self):
         def _do(conn):
@@ -134,13 +125,17 @@ class RdfDocumentStore:
 
     def _get_current(self, conn, document_id: str) -> dict | None:
         row = conn.execute(
-            "SELECT * FROM krs_document_versions WHERE document_id = ? AND is_current = true "
+            "SELECT * FROM krs_document_versions WHERE document_id = %s AND is_current = true "
             "ORDER BY version_no DESC, version_id DESC LIMIT 1",
             [document_id],
         ).fetchone()
         if row is None:
             return None
-        cols = [d[0] for d in conn.execute("DESCRIBE krs_document_versions").fetchall()]
+        cols = [d[0] for d in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'krs_document_versions' AND table_schema = 'public' "
+            "ORDER BY ordinal_position"
+        ).fetchall()]
         return dict(zip(cols, row))
 
     def _merge(self, current: dict | None, patch: dict) -> dict:
@@ -167,7 +162,7 @@ class RdfDocumentStore:
 
             if current is not None and current.get("snapshot_hash") == new_hash:
                 conn.execute(
-                    "UPDATE krs_document_versions SET observed_at = ? WHERE version_id = ?",
+                    "UPDATE krs_document_versions SET observed_at = %s WHERE version_id = %s",
                     [now, current["version_id"]],
                 )
                 conn.execute("COMMIT")
@@ -176,7 +171,7 @@ class RdfDocumentStore:
             next_vno = 1
             if current is not None:
                 conn.execute(
-                    "UPDATE krs_document_versions SET valid_to = ?, is_current = false WHERE version_id = ? AND is_current = true",
+                    "UPDATE krs_document_versions SET valid_to = %s, is_current = false WHERE version_id = %s AND is_current = true",
                     [now, current["version_id"]],
                 )
                 next_vno = current["version_no"] + 1
@@ -195,13 +190,13 @@ class RdfDocumentStore:
                     discovered_at, metadata_fetched_at, download_error,
                     valid_from, is_current, snapshot_hash, change_reason, observed_at
                 ) VALUES (
-                    ?, ?, ?,
-                    ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?,
-                    ?, true, ?, ?, ?
+                    %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, true, %s, %s, %s
                 )
             """, [
                 document_id, next_vno, krs,
@@ -259,7 +254,7 @@ class RdfDocumentStore:
                     INSERT INTO krs_documents
                         (document_id, krs, rodzaj, status, nazwa,
                          okres_start, okres_end, discovered_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (document_id) DO NOTHING
                 """, [
                     doc_id, krs,
@@ -278,7 +273,7 @@ class RdfDocumentStore:
             # Read from version table (current) since view may not exist in batch context
             rows = conn.execute(
                 """SELECT document_id FROM krs_document_versions
-                   WHERE krs = ? AND is_current = true
+                   WHERE krs = %s AND is_current = true
                      AND (is_downloaded = false OR is_downloaded IS NULL)
                      AND download_error IS NULL""",
                 [krs],
@@ -292,7 +287,7 @@ class RdfDocumentStore:
         if current is not None:
             return current["krs"]
         legacy = conn.execute(
-            "SELECT krs FROM krs_documents WHERE document_id = ?", [document_id]
+            "SELECT krs FROM krs_documents WHERE document_id = %s", [document_id]
         ).fetchone()
         if legacy is not None:
             return legacy[0]
@@ -321,13 +316,13 @@ class RdfDocumentStore:
             # Legacy cache
             conn.execute("""
                 UPDATE krs_documents SET
-                    filename            = ?,
-                    is_ifrs             = ?,
-                    is_correction       = ?,
-                    date_filed          = ?,
-                    date_prepared       = ?,
-                    metadata_fetched_at = ?
-                WHERE document_id = ?
+                    filename            = %s,
+                    is_ifrs             = %s,
+                    is_correction       = %s,
+                    date_filed          = %s,
+                    date_prepared       = %s,
+                    metadata_fetched_at = %s
+                WHERE document_id = %s
             """, [
                 meta.get("nazwaPliku"), meta.get("czyMSR"),
                 meta.get("czyKorekta"), meta.get("dataDodania"),
@@ -371,15 +366,15 @@ class RdfDocumentStore:
             conn.execute("""
                 UPDATE krs_documents SET
                     is_downloaded    = true,
-                    downloaded_at    = ?,
-                    storage_path     = ?,
-                    storage_backend  = ?,
-                    file_size_bytes  = ?,
-                    zip_size_bytes   = ?,
-                    file_count       = ?,
-                    file_types       = ?,
+                    downloaded_at    = %s,
+                    storage_path     = %s,
+                    storage_backend  = %s,
+                    file_size_bytes  = %s,
+                    zip_size_bytes   = %s,
+                    file_count       = %s,
+                    file_types       = %s,
                     download_error   = NULL
-                WHERE document_id = ?
+                WHERE document_id = %s
             """, [now, storage_path, storage_backend, file_size, zip_size,
                   file_count, file_types, document_id])
         self._with_conn(_do)
@@ -397,7 +392,7 @@ class RdfDocumentStore:
 
             # Legacy cache
             conn.execute(
-                "UPDATE krs_documents SET download_error = ? WHERE document_id = ?",
+                "UPDATE krs_documents SET download_error = %s WHERE document_id = %s",
                 [error, document_id],
             )
         self._with_conn(_do)

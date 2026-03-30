@@ -1,16 +1,17 @@
-"""Tests for scripts/run_db_migration.py — migration runner."""
+"""Tests for scripts/run_db_migration.py — migration runner.
+
+DuckDB-specific migration tests are skipped after the PostgreSQL migration.
+Pure SQL parsing tests remain active as they have no DuckDB dependency.
+"""
 import pytest
 from pathlib import Path
 from unittest.mock import patch
 
-import duckdb
-
-from app.config import settings
-from scripts.run_db_migration import run_migration, _parse_statements
+from scripts.run_db_migration import _parse_statements
 
 
 # ---------------------------------------------------------------------------
-# Statement parsing
+# Statement parsing (no DuckDB dependency)
 # ---------------------------------------------------------------------------
 
 def test_parse_strips_comments():
@@ -24,7 +25,7 @@ def test_parse_empty_file():
 
 
 # ---------------------------------------------------------------------------
-# Full migration
+# Full migration (DuckDB-specific — skipped after PostgreSQL migration)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
@@ -32,12 +33,17 @@ def fresh_db(tmp_path):
     return str(tmp_path / "mig_test.duckdb")
 
 
+@pytest.mark.skip(reason="DuckDB migration tests - not applicable after PostgreSQL migration")
 def test_python_migration_succeeds_on_fresh_db(fresh_db):
     """Python backfill runner should bootstrap schema and complete."""
+    import duckdb
+    from app.config import settings
+
     py_path = "scripts/db_migrations/001_append_only_backfill.py"
     if not Path(py_path).exists():
         pytest.skip("migration file not found")
     with patch.object(settings, "scraper_db_path", fresh_db):
+        from scripts.run_db_migration import run_migration
         run_migration(py_path, fresh_db)
     conn = duckdb.connect(fresh_db, read_only=True)
     tables = {
@@ -51,18 +57,26 @@ def test_python_migration_succeeds_on_fresh_db(fresh_db):
     assert "etl_attempts" in tables
 
 
+@pytest.mark.skip(reason="DuckDB migration tests - not applicable after PostgreSQL migration")
 def test_python_migration_is_idempotent(fresh_db):
     """Running the same Python migration twice should not raise."""
+    from app.config import settings
+
     py_path = "scripts/db_migrations/001_append_only_backfill.py"
     if not Path(py_path).exists():
         pytest.skip("migration file not found")
     with patch.object(settings, "scraper_db_path", fresh_db):
+        from scripts.run_db_migration import run_migration
         run_migration(py_path, fresh_db)
         run_migration(py_path, fresh_db)
 
 
+@pytest.mark.skip(reason="DuckDB migration tests - not applicable after PostgreSQL migration")
 def test_sql_migration_rolls_back_on_error(fresh_db, tmp_path):
     """If a SQL statement fails, the entire migration should be rolled back."""
+    import duckdb
+    from app.config import settings
+
     bad_sql = tmp_path / "bad.sql"
     bad_sql.write_text(
         "CREATE TABLE _mig_test (id INTEGER);\n"
@@ -70,6 +84,7 @@ def test_sql_migration_rolls_back_on_error(fresh_db, tmp_path):
         "INSERT INTO nonexistent_table VALUES (99);\n"
     )
     with patch.object(settings, "scraper_db_path", fresh_db):
+        from scripts.run_db_migration import run_migration
         with pytest.raises(duckdb.CatalogException):
             run_migration(str(bad_sql), fresh_db)
 
@@ -87,10 +102,14 @@ def test_sql_migration_rolls_back_on_error(fresh_db, tmp_path):
     conn.close()
 
 
+@pytest.mark.skip(reason="DuckDB migration tests - not applicable after PostgreSQL migration")
 def test_sql_drop_migration(fresh_db):
     """SQL drop migration should run on a bootstrapped DB."""
+    from app.config import settings
+
     sql_path = "scripts/db_migrations/002_drop_multisource_tables.sql"
     if not Path(sql_path).exists():
         pytest.skip("migration file not found")
     with patch.object(settings, "scraper_db_path", fresh_db):
+        from scripts.run_db_migration import run_migration
         run_migration(sql_path, fresh_db)

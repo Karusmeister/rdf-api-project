@@ -22,9 +22,9 @@ def _make_test_zip(files: dict) -> bytes:
 
 
 @pytest.fixture
-def temp_env(tmp_path, monkeypatch):
-    """Override DB and storage paths to temp dirs."""
-    monkeypatch.setattr(settings, "scraper_db_path", str(tmp_path / "test.duckdb"))
+def temp_env(tmp_path, pg_dsn, clean_pg, monkeypatch):
+    """Override DB URL and storage paths to temp dirs."""
+    monkeypatch.setattr(settings, "database_url", pg_dsn)
     monkeypatch.setattr(settings, "storage_local_path", str(tmp_path / "documents"))
     monkeypatch.setattr(settings, "scraper_delay_between_krs", 0.0)
     monkeypatch.setattr(settings, "scraper_delay_between_requests", 0.0)

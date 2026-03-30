@@ -1,7 +1,7 @@
 """End-to-end batch scanner tests against the live RDF API.
 
 These tests hit rdf-przegladarka.ms.gov.pl with real KRS numbers and
-write results to an isolated DuckDB in tmp_path — never the main DB.
+write results to an isolated PostgreSQL database — never the main DB.
 
 Run with:  pytest tests/test_batch_e2e.py -v -s --e2e
 Skip with: pytest tests/ -v  (skipped by default)
@@ -15,13 +15,13 @@ Known test KRS numbers:
 """
 
 import asyncio
-import duckdb
 
 import httpx
 import pytest
 
 from app.config import settings
 from app.crypto import encrypt_nrkrs
+from app.db.connection import make_connection
 from batch.connections import Connection
 from batch.progress import ProgressStore
 from batch.worker import (
@@ -49,8 +49,8 @@ KNOWN_MISSING = "9999999999"
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def db_path(tmp_path):
-    return str(tmp_path / "e2e_batch.duckdb")
+def db_path(pg_dsn, clean_pg):
+    return pg_dsn
 
 
 # ---------------------------------------------------------------------------
@@ -81,11 +81,11 @@ async def test_live_lookup_existing_entity(krs, label, db_path):
     store = ProgressStore(db_path)
     store.mark(int(krs), result, worker_id=0)
 
-    conn = duckdb.connect(db_path)
-    row = conn.execute(
-        "SELECT krs, status FROM batch_progress WHERE krs = ?", [int(krs)]
+    wrapper = make_connection(db_path)
+    row = wrapper.execute(
+        "SELECT krs, status FROM batch_progress WHERE krs = %s", [int(krs)]
     ).fetchone()
-    conn.close()
+    wrapper.close()
 
     print(f"\n  KRS {krs} ({label}): status={row[1]}")
     assert row[1] == "found"
@@ -119,11 +119,11 @@ async def test_live_lookup_nonexistent_entity(db_path):
     store = ProgressStore(db_path)
     store.mark(int(krs), result, worker_id=0)
 
-    conn = duckdb.connect(db_path)
-    row = conn.execute(
-        "SELECT status FROM batch_progress WHERE krs = ?", [int(krs)]
+    wrapper = make_connection(db_path)
+    row = wrapper.execute(
+        "SELECT status FROM batch_progress WHERE krs = %s", [int(krs)]
     ).fetchone()
-    conn.close()
+    wrapper.close()
 
     print(f"\n  KRS {krs}: status={row[0]}")
     assert row[0] == "not_found"
@@ -149,7 +149,7 @@ async def test_live_worker_loop_small_range(db_path):
                 connection=DIRECT_CONN,
                 concurrency=1,
                 delay=1.0,  # polite — 1s between requests to live API
-                db_path=db_path,
+                dsn=db_path,
             ),
             timeout=15.0,
         )
@@ -164,11 +164,11 @@ async def test_live_worker_loop_small_range(db_path):
     assert total >= 2, f"Expected at least 2 processed, got {total}"
 
     # Every entry must have a valid status
-    conn = duckdb.connect(db_path)
-    rows = conn.execute(
+    wrapper = make_connection(db_path)
+    rows = wrapper.execute(
         "SELECT krs, status, worker_id, processed_at FROM batch_progress ORDER BY krs"
     ).fetchall()
-    conn.close()
+    wrapper.close()
 
     print(f"\n  {'KRS':>10}  {'status':>10}  {'worker':>6}  processed_at")
     print("  " + "-" * 60)
@@ -195,20 +195,20 @@ async def test_live_stride_partitioning(db_path):
                     connection=DIRECT_CONN,
                     concurrency=1,
                     delay=1.0,
-                    db_path=db_path,
+                    dsn=db_path,
                 ),
                 timeout=8.0,
             )
 
-    conn = duckdb.connect(db_path)
-    w0 = {r[0] for r in conn.execute(
+    wrapper = make_connection(db_path)
+    w0 = {r[0] for r in wrapper.execute(
         "SELECT krs FROM batch_progress WHERE worker_id = 0"
     ).fetchall()}
-    w1 = {r[0] for r in conn.execute(
+    w1 = {r[0] for r in wrapper.execute(
         "SELECT krs FROM batch_progress WHERE worker_id = 1"
     ).fetchall()}
-    total = conn.execute("SELECT COUNT(*) FROM batch_progress").fetchone()[0]
-    conn.close()
+    total = wrapper.execute("SELECT COUNT(*) FROM batch_progress").fetchone()[0]
+    wrapper.close()
 
     print(f"\n  Worker 0 processed: {sorted(w0)}")
     print(f"  Worker 1 processed: {sorted(w1)}")
@@ -239,21 +239,21 @@ async def test_live_resume_skips_done(db_path):
                 connection=DIRECT_CONN,
                 concurrency=1,
                 delay=1.0,
-                db_path=db_path,
+                dsn=db_path,
             ),
             timeout=10.0,
         )
 
-    conn = duckdb.connect(db_path)
+    wrapper = make_connection(db_path)
     # KRS 1-3 should still have worker_id=99 (pre-marked, not overwritten)
-    premarked = conn.execute(
+    premarked = wrapper.execute(
         "SELECT krs, worker_id FROM batch_progress WHERE krs <= 3 ORDER BY krs"
     ).fetchall()
     # KRS 4+ should have worker_id=0 (processed by the test worker)
-    new_rows = conn.execute(
+    new_rows = wrapper.execute(
         "SELECT krs, status, worker_id FROM batch_progress WHERE krs > 3 ORDER BY krs"
     ).fetchall()
-    conn.close()
+    wrapper.close()
 
     print("\n  Pre-marked (should be worker_id=99):")
     for r in premarked:

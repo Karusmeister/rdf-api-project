@@ -11,8 +11,6 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-import duckdb
-
 import logging
 
 from app.config import settings
@@ -41,8 +39,8 @@ def close() -> None:
     pass
 
 
-def get_conn() -> duckdb.DuckDBPyConnection:
-    """Return the shared DuckDB connection."""
+def get_conn():
+    """Return the shared database connection."""
     return shared_conn.get_conn()
 
 
@@ -208,7 +206,7 @@ def _init_schema() -> None:
     existing = {
         row[0]
         for row in conn.execute(
-            "SELECT index_name FROM duckdb_indexes()"
+            "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
         ).fetchall()
     }
 
@@ -281,7 +279,7 @@ def _get_current_document_snapshot(conn, document_id: str) -> Optional[dict]:
     row = conn.execute(
         """
         SELECT * FROM krs_document_versions
-        WHERE document_id = ? AND is_current = true
+        WHERE document_id = %s AND is_current = true
         ORDER BY version_no DESC, version_id DESC
         LIMIT 1
         """,
@@ -289,7 +287,7 @@ def _get_current_document_snapshot(conn, document_id: str) -> Optional[dict]:
     ).fetchone()
     if row is None:
         return None
-    cols = [d[0] for d in conn.execute("DESCRIBE krs_document_versions").fetchall()]
+    cols = [d[0] for d in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'krs_document_versions' AND table_schema = 'public' ORDER BY ordinal_position").fetchall()]
     return dict(zip(cols, row))
 
 
@@ -337,7 +335,7 @@ def _append_document_version_if_changed(
 
         if current is not None and current.get("snapshot_hash") == new_hash:
             conn.execute(
-                "UPDATE krs_document_versions SET observed_at = ? WHERE version_id = ?",
+                "UPDATE krs_document_versions SET observed_at = %s WHERE version_id = %s",
                 [now, current["version_id"]],
             )
             conn.execute("COMMIT")
@@ -346,7 +344,7 @@ def _append_document_version_if_changed(
         next_version_no = 1
         if current is not None:
             conn.execute(
-                "UPDATE krs_document_versions SET valid_to = ?, is_current = false WHERE version_id = ? AND is_current = true",
+                "UPDATE krs_document_versions SET valid_to = %s, is_current = false WHERE version_id = %s AND is_current = true",
                 [now, current["version_id"]],
             )
             next_version_no = current["version_no"] + 1
@@ -366,13 +364,13 @@ def _append_document_version_if_changed(
             discovered_at, metadata_fetched_at, download_error,
             valid_from, is_current, snapshot_hash, change_reason, run_id, observed_at
         ) VALUES (
-            ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?,
-            ?, true, ?, ?, ?, ?
+            %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, true, %s, %s, %s, %s
         )
         """,
         [
@@ -409,7 +407,7 @@ def upsert_krs(krs: str, company_name: Optional[str], legal_form: Optional[str],
     now = datetime.now(timezone.utc)
     conn.execute("""
         INSERT INTO krs_registry (krs, company_name, legal_form, is_active, first_seen_at)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT (krs) DO UPDATE SET
             company_name = COALESCE(excluded.company_name, krs_registry.company_name),
             legal_form   = COALESCE(excluded.legal_form,   krs_registry.legal_form),
@@ -435,12 +433,12 @@ def get_krs_to_check(strategy: str, limit: int, error_backoff_hours: int) -> lis
         FROM krs_registry
         WHERE is_active = true
           AND NOT (
-              check_error_count >= ?
-              AND last_checked_at > (NOW() - INTERVAL (? || ' hours'))
+              check_error_count >= %s
+              AND last_checked_at > (NOW() - %s * INTERVAL '1 hour')
           )
         {order_clause}
-        LIMIT ?
-    """, [settings.scraper_max_errors_before_skip, str(error_backoff_hours), limit]).fetchall()
+        LIMIT %s
+    """, [settings.scraper_max_errors_before_skip, error_backoff_hours, limit]).fetchall()
 
     cols = ["krs", "company_name", "legal_form", "is_active",
             "check_priority", "check_error_count", "last_checked_at", "last_error_message"]
@@ -451,7 +449,7 @@ def get_known_document_ids(krs: str) -> set[str]:
     """Return set of document_ids we already know about for this KRS."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT document_id FROM krs_documents_current WHERE krs = ?", [krs]
+        "SELECT document_id FROM krs_documents_current WHERE krs = %s", [krs]
     ).fetchall()
     return {row[0] for row in rows}
 
@@ -461,7 +459,7 @@ def get_undownloaded_documents(krs: str) -> list[str]:
     conn = get_conn()
     rows = conn.execute(
         """SELECT document_id FROM krs_documents_current
-           WHERE krs = ? AND (is_downloaded = false OR is_downloaded IS NULL)""",
+           WHERE krs = %s AND (is_downloaded = false OR is_downloaded IS NULL)""",
         [krs],
     ).fetchall()
     return [row[0] for row in rows]
@@ -493,7 +491,7 @@ def insert_documents(docs: list[dict]) -> None:
         conn.execute("""
             INSERT INTO krs_documents
                 (document_id, krs, rodzaj, status, nazwa, okres_start, okres_end, discovered_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (document_id) DO NOTHING
         """, [
             doc_id, krs, doc["rodzaj"], doc["status"],
@@ -508,7 +506,7 @@ def _resolve_krs(conn, document_id: str) -> str:
     if current is not None:
         return current["krs"]
     legacy = conn.execute(
-        "SELECT krs FROM krs_documents WHERE document_id = ?", [document_id]
+        "SELECT krs FROM krs_documents WHERE document_id = %s", [document_id]
     ).fetchone()
     if legacy is not None:
         return legacy[0]
@@ -538,13 +536,13 @@ def update_document_metadata(document_id: str, meta: dict) -> None:
     # Legacy cache
     conn.execute("""
         UPDATE krs_documents SET
-            filename            = ?,
-            is_ifrs             = ?,
-            is_correction       = ?,
-            date_filed          = ?,
-            date_prepared       = ?,
-            metadata_fetched_at = ?
-        WHERE document_id = ?
+            filename            = %s,
+            is_ifrs             = %s,
+            is_correction       = %s,
+            date_filed          = %s,
+            date_prepared       = %s,
+            metadata_fetched_at = %s
+        WHERE document_id = %s
     """, [
         meta.get("filename"),
         meta.get("is_ifrs"),
@@ -570,7 +568,7 @@ def update_document_error(document_id: str, error: str) -> None:
 
     # Legacy cache
     conn.execute(
-        "UPDATE krs_documents SET download_error = ? WHERE document_id = ?",
+        "UPDATE krs_documents SET download_error = %s WHERE document_id = %s",
         [error, document_id],
     )
 
@@ -610,15 +608,15 @@ def mark_downloaded(
     conn.execute("""
         UPDATE krs_documents SET
             is_downloaded    = true,
-            downloaded_at    = ?,
-            storage_path     = ?,
-            storage_backend  = ?,
-            file_size_bytes  = ?,
-            zip_size_bytes   = ?,
-            file_count       = ?,
-            file_types       = ?,
+            downloaded_at    = %s,
+            storage_path     = %s,
+            storage_backend  = %s,
+            file_size_bytes  = %s,
+            zip_size_bytes   = %s,
+            file_count       = %s,
+            file_types       = %s,
             download_error   = NULL
-        WHERE document_id = ?
+        WHERE document_id = %s
     """, [now, storage_path, storage_backend, file_size, zip_size, file_count, file_types, document_id])
 
 
@@ -629,21 +627,21 @@ def update_krs_checked(krs: str, total_docs: int, total_downloaded: int, error: 
     if error:
         conn.execute("""
             UPDATE krs_registry SET
-                last_checked_at     = ?,
+                last_checked_at     = %s,
                 check_error_count   = check_error_count + 1,
-                last_error_message  = ?
-            WHERE krs = ?
+                last_error_message  = %s
+            WHERE krs = %s
         """, [now, error, krs])
     else:
         conn.execute("""
             UPDATE krs_registry SET
-                last_checked_at     = ?,
-                last_download_at    = ?,
+                last_checked_at     = %s,
+                last_download_at    = %s,
                 check_error_count   = 0,
                 last_error_message  = NULL,
-                total_documents     = ?,
-                total_downloaded    = ?
-            WHERE krs = ?
+                total_documents     = %s,
+                total_downloaded    = %s
+            WHERE krs = %s
         """, [now, now, total_docs, total_downloaded, krs])
 
 
@@ -653,7 +651,7 @@ def create_run(run_id: str, mode: str, config_snapshot: str) -> None:
     now = datetime.now(timezone.utc)
     conn.execute("""
         INSERT INTO scraper_runs (run_id, started_at, status, mode, config_snapshot)
-        VALUES (?, ?, 'running', ?, ?)
+        VALUES (%s, %s, 'running', %s, %s)
     """, [run_id, now, mode, config_snapshot])
 
 
@@ -663,16 +661,16 @@ def finish_run(run_id: str, status: str, stats: dict) -> None:
     now = datetime.now(timezone.utc)
     conn.execute("""
         UPDATE scraper_runs SET
-            finished_at          = ?,
-            status               = ?,
-            krs_checked          = ?,
-            krs_new_found        = ?,
-            documents_discovered = ?,
-            documents_downloaded = ?,
-            documents_failed     = ?,
-            bytes_downloaded     = ?,
-            error_message        = ?
-        WHERE run_id = ?
+            finished_at          = %s,
+            status               = %s,
+            krs_checked          = %s,
+            krs_new_found        = %s,
+            documents_discovered = %s,
+            documents_downloaded = %s,
+            documents_failed     = %s,
+            bytes_downloaded     = %s,
+            error_message        = %s
+        WHERE run_id = %s
     """, [
         now, status,
         stats.get("krs_checked", 0),

@@ -15,7 +15,8 @@ import sys
 from datetime import datetime, timezone as tz
 from pathlib import Path
 
-import duckdb
+import psycopg2
+from app.db.connection import make_connection
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +69,7 @@ def _ensure_repo_root_on_path() -> None:
         sys.path.insert(0, repo_root_str)
 
 
-def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
+def _init_schema(conn) -> None:
     """Bootstrap app schema so backfill queries can find the tables."""
     _ensure_repo_root_on_path()
     from app.db import connection as shared_conn
@@ -92,8 +93,8 @@ def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         prediction_db._schema_initialized = False
 
 
-def run_backfill(db_path: str) -> None:
-    conn = duckdb.connect(db_path)
+def run_backfill(dsn: str) -> None:
+    conn = make_connection(dsn)
     try:
         _init_schema(conn)
         _backfill_entities(conn)
@@ -124,7 +125,7 @@ def _backfill_entities(conn) -> None:
                 krs, name, legal_form, status, registered_at, last_changed_at,
                 nip, regon, address_city, address_street, address_postal_code,
                 raw, source, valid_from, valid_to, is_current, snapshot_hash, change_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, true, ?, 'bootstrap_from_krs_entities')
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, true, %s, 'bootstrap_from_krs_entities')
         """, [
             row["krs"], row["name"], row.get("legal_form"), row.get("status"),
             row.get("registered_at"), row.get("last_changed_at"),
@@ -162,13 +163,13 @@ def _backfill_documents(conn) -> None:
                 discovered_at, metadata_fetched_at, download_error,
                 valid_from, valid_to, is_current, snapshot_hash, change_reason
             ) VALUES (
-                ?, 1, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?,
-                ?, NULL, true, ?, 'bootstrap_from_krs_documents'
+                %s, 1, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, NULL, true, %s, 'bootstrap_from_krs_documents'
             )
         """, [
             row["document_id"], row["krs"],
@@ -188,8 +189,8 @@ def _backfill_documents(conn) -> None:
 
 
 if __name__ == "__main__":
-    db = os.environ.get("SCRAPER_DB_PATH", "data/scraper.duckdb")
+    dsn = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/rdf")
     if "--db" in sys.argv:
         idx = sys.argv.index("--db")
-        db = sys.argv[idx + 1]
-    run_backfill(db)
+        dsn = sys.argv[idx + 1]
+    run_backfill(dsn)

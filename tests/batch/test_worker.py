@@ -237,9 +237,9 @@ async def test_process_krs_timeout_retries(rdf_base):
 # Progress store integration with worker
 # ---------------------------------------------------------------------------
 
-def test_progress_store_skips_done(tmp_path):
+def test_progress_store_skips_done(pg_dsn, clean_pg):
     """Worker should skip KRS numbers already marked in progress store."""
-    store = ProgressStore(str(tmp_path / "test.duckdb"))
+    store = ProgressStore(pg_dsn)
     store.mark(1, "found", worker_id=0)
     assert store.is_done(1) is True
     assert store.is_done(2) is False

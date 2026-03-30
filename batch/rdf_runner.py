@@ -51,7 +51,7 @@ def run_rdf_batch(
     concurrency: int | None = None,
     delay: float | None = None,
     page_size: int | None = None,
-    db_path: str | None = None,
+    dsn: str | None = None,
 ) -> None:
     """Spawn N worker processes for RDF document discovery + download."""
     _workers = workers if workers is not None else settings.batch_workers
@@ -59,7 +59,7 @@ def run_rdf_batch(
     _concurrency = concurrency if concurrency is not None else settings.rdf_batch_concurrency
     _delay = delay if delay is not None else settings.rdf_batch_delay_seconds
     _page_size = page_size if page_size is not None else settings.rdf_batch_page_size
-    _db = db_path if db_path is not None else settings.batch_db_path
+    _db = dsn if dsn is not None else settings.database_url
 
     if _vpn:
         _validate_vpn_config()
@@ -83,7 +83,7 @@ def run_rdf_batch(
                 concurrency=_concurrency,
                 delay=_delay,
                 page_size=_page_size,
-                db_path=_db,
+                dsn=_db,
             ),
         )
         processes.append(p)
@@ -150,7 +150,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db", type=str, default=None,
-        help=f"DuckDB path (default: {settings.batch_db_path})",
+        help=f"PostgreSQL DSN (default: DATABASE_URL from .env)",
     )
     return parser
 
@@ -175,7 +175,7 @@ def main() -> None:
         concurrency=args.concurrency,
         delay=args.delay,
         page_size=args.page_size,
-        db_path=args.db,
+        dsn=args.db,
     )
 
 

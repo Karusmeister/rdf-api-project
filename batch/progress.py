@@ -1,48 +1,29 @@
-"""DuckDB-backed progress store for the batch KRS scanner.
+"""PostgreSQL-backed progress store for the batch KRS scanner.
 
-The batch_progress table lives in the same DuckDB file as financial data,
-keeping everything queryable in one place.
-
-DuckDB uses an exclusive file lock per connection, so we use short-lived
-connections (connect -> execute -> close) with retry-on-lock-contention
-to support multiple worker processes writing to the same file.
+The batch_progress table tracks which KRS numbers have been processed.
 """
 
-import random
-import time
+import psycopg2
 
-import duckdb
-
-_MAX_LOCK_RETRIES = 20
-_BASE_LOCK_DELAY = 0.05  # 50ms base, jittered
+from app.db.connection import make_connection
 
 
 class ProgressStore:
     """Track which KRS numbers have been processed (found / not_found / error)."""
 
-    def __init__(self, db_path: str, *, init_schema: bool = True):
-        self._db_path = db_path
+    def __init__(self, dsn: str, *, init_schema: bool = True):
+        self._dsn = dsn
         if init_schema:
             self._init_schema()
 
     def _with_conn(self, fn):
-        """Open a short-lived connection, call fn(conn), close, return result.
-
-        Retries on DuckDB lock contention with jittered backoff.
-        """
-        for attempt in range(_MAX_LOCK_RETRIES):
-            try:
-                conn = duckdb.connect(self._db_path)
-                try:
-                    result = fn(conn)
-                finally:
-                    conn.close()
-                return result
-            except duckdb.IOException:
-                if attempt == _MAX_LOCK_RETRIES - 1:
-                    raise
-                delay = min(_BASE_LOCK_DELAY * (2 ** attempt), 5.0) + random.uniform(0, 0.05)
-                time.sleep(delay)
+        """Open a short-lived connection, call fn(conn), close, return result."""
+        conn = make_connection(self._dsn)
+        try:
+            result = fn(conn)
+        finally:
+            conn.close()
+        return result
 
     def _init_schema(self):
         def _do(conn):
@@ -59,7 +40,7 @@ class ProgressStore:
     def is_done(self, krs: int) -> bool:
         def _do(conn):
             row = conn.execute(
-                "SELECT 1 FROM batch_progress WHERE krs = ?", [krs]
+                "SELECT 1 FROM batch_progress WHERE krs = %s", [krs]
             ).fetchone()
             return row is not None
         return self._with_conn(_do)
@@ -68,7 +49,7 @@ class ProgressStore:
         def _do(conn):
             conn.execute("""
                 INSERT INTO batch_progress (krs, status, worker_id)
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
                 ON CONFLICT (krs) DO UPDATE SET
                     status = excluded.status,
                     worker_id = excluded.worker_id,

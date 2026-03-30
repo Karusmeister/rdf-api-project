@@ -1,4 +1,4 @@
-"""Tests for app.jobs.krs_scanner — resumable sequential KRS scanner (PKR-41)."""
+"""Tests for app.jobs.krs_scanner — resumable sequential KRS scanner."""
 
 from __future__ import annotations
 
@@ -59,10 +59,9 @@ def _krs_url(krs_int: int) -> str:
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _setup(monkeypatch, tmp_path):
-    """Wire up an isolated DuckDB, fast KRS client, and adapter."""
-    db_path = str(tmp_path / "test.duckdb")
-    monkeypatch.setattr("app.config.settings.scraper_db_path", db_path)
+async def _setup(monkeypatch, pg_dsn, clean_pg):
+    """Wire up an isolated PostgreSQL DB, fast KRS client, and adapter."""
+    monkeypatch.setattr("app.config.settings.database_url", pg_dsn)
     db_conn.reset()
     db_conn.connect()
 
