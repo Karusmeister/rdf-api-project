@@ -35,7 +35,6 @@ def test_parser_all_flags():
         "--delay", "3.0",
         "--page-size", "50",
         "--db", "/tmp/test.duckdb",
-        "--storage-path", "/tmp/docs",
         "--no-vpn",
     ])
     assert args.workers == 2
@@ -43,7 +42,6 @@ def test_parser_all_flags():
     assert args.delay == 3.0
     assert args.page_size == 50
     assert args.db == "/tmp/test.duckdb"
-    assert args.storage_path == "/tmp/docs"
     assert args.no_vpn is True
 
 

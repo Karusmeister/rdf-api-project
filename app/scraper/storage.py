@@ -41,6 +41,92 @@ def _classify_file(filename: str) -> str:
     return ext
 
 
+class GcsStorage:
+    def __init__(self, bucket_name: str, prefix: str, project: str | None = None):
+        from google.cloud import storage as gcs
+
+        self._bucket_name = bucket_name
+        self._prefix = prefix
+        self._client = gcs.Client(project=project or "rdf-api-project")
+        self._bucket = self._client.bucket(bucket_name)
+
+    def _blob_path(self, path: str) -> str:
+        return f"{self._prefix}{path}"
+
+    def save_extracted(self, doc_dir: str, zip_bytes: bytes, document_id: str) -> dict:
+        """Extract ZIP contents, upload to GCS, write manifest.json. Returns manifest dict."""
+        files_info = []
+        total_extracted_size = 0
+
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for entry in zf.infolist():
+                if entry.is_dir():
+                    continue
+                filename = Path(entry.filename).name
+                if not filename:
+                    continue
+
+                data = zf.read(entry.filename)
+                blob_key = self._blob_path(f"{doc_dir}/{filename}")
+                blob = self._bucket.blob(blob_key)
+                blob.upload_from_string(data)
+
+                file_size = len(data)
+                total_extracted_size += file_size
+                files_info.append({
+                    "name": filename,
+                    "size": file_size,
+                    "type": _classify_file(filename),
+                })
+
+        manifest = {
+            "document_id": document_id,
+            "source_zip_size": len(zip_bytes),
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "files": files_info,
+        }
+
+        manifest_blob = self._bucket.blob(self._blob_path(f"{doc_dir}/manifest.json"))
+        manifest_blob.upload_from_string(
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            content_type="application/json",
+        )
+
+        logger.info(
+            "document_extracted",
+            extra={
+                "event": "document_extracted",
+                "doc_dir": doc_dir,
+                "document_id": document_id,
+                "file_count": len(files_info),
+                "zip_size": len(zip_bytes),
+                "extracted_size": total_extracted_size,
+            },
+        )
+
+        return manifest
+
+    def exists(self, path: str) -> bool:
+        return self._bucket.blob(self._blob_path(path)).exists()
+
+    def read(self, path: str) -> bytes:
+        return self._bucket.blob(self._blob_path(path)).download_as_bytes()
+
+    def list_files(self, dir_path: str) -> list:
+        prefix = self._blob_path(f"{dir_path}/")
+        blobs = self._client.list_blobs(self._bucket, prefix=prefix)
+        filenames = []
+        for blob in blobs:
+            name = blob.name[len(prefix):]
+            # Skip entries in subdirectories
+            if name and "/" not in name:
+                filenames.append(name)
+        return filenames
+
+    def get_full_path(self, path: str) -> str:
+        return f"gs://{self._bucket_name}/{self._blob_path(path)}"
+
+
 class LocalStorage:
     def __init__(self, base_path: str):
         self._base = Path(base_path)
@@ -116,8 +202,8 @@ class LocalStorage:
         return str(self._base / path)
 
 
-def create_storage() -> LocalStorage:
+def create_storage() -> LocalStorage | GcsStorage:
     from app.config import settings
     if settings.storage_backend == "gcs":
-        raise NotImplementedError("GCS backend not yet implemented. Set STORAGE_BACKEND=local")
+        return GcsStorage(settings.storage_gcs_bucket, settings.storage_gcs_prefix)
     return LocalStorage(settings.storage_local_path)

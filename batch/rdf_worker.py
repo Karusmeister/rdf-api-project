@@ -19,7 +19,7 @@ import httpx
 
 from app.config import settings
 from app.crypto import encrypt_nrkrs
-from app.scraper.storage import LocalStorage, make_doc_dir
+from app.scraper.storage import StorageBackend, create_storage, make_doc_dir
 from batch.connections import Connection
 from batch.rdf_document_store import RdfDocumentStore
 from batch.rdf_progress import RdfProgressStore
@@ -314,7 +314,7 @@ async def _download_one_document(
     krs: str,
     doc_id: str,
     doc_store: RdfDocumentStore,
-    storage: LocalStorage,
+    storage: StorageBackend,
     delay: float,
     worker_id: int,
     stats: RdfWorkerStats,
@@ -356,7 +356,7 @@ async def _download_one_document(
         doc_store.mark_downloaded(
             document_id=doc_id,
             storage_path=doc_dir,
-            storage_backend="local",
+            storage_backend=settings.storage_backend,
             file_size=total_extracted,
             zip_size=len(zip_bytes),
             file_count=len(manifest["files"]),
@@ -389,12 +389,11 @@ async def _worker_loop(
     delay: float,
     page_size: int,
     db_path: str,
-    storage_path: str,
 ) -> None:
     """Main async loop for a single RDF document discovery + download worker."""
     progress = RdfProgressStore(db_path)
     doc_store = RdfDocumentStore(db_path)
-    storage = LocalStorage(storage_path)
+    storage = create_storage()
     stats = RdfWorkerStats()
     health = ConnectionHealth()
     sem = asyncio.Semaphore(concurrency)
@@ -538,7 +537,6 @@ def run_rdf_worker(
     delay: float,
     page_size: int,
     db_path: str,
-    storage_path: str,
 ) -> None:
     """Entrypoint for multiprocessing.Process."""
     logging.basicConfig(
@@ -547,9 +545,9 @@ def run_rdf_worker(
     )
     logger.info(
         "rdf_worker=%d starting total_workers=%d connection=%s concurrency=%d "
-        "delay=%.1f page_size=%d storage=%s",
+        "delay=%.1f page_size=%d storage_backend=%s",
         worker_id, total_workers, connection.name, concurrency, delay,
-        page_size, storage_path,
+        page_size, settings.storage_backend,
     )
     asyncio.run(
         _worker_loop(
@@ -560,6 +558,5 @@ def run_rdf_worker(
             delay=delay,
             page_size=page_size,
             db_path=db_path,
-            storage_path=storage_path,
         )
     )

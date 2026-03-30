@@ -11,3 +11,5 @@ aiofiles>=24.1
 click>=8.1
 respx>=0.22
 apscheduler>=3.10,<4
+google-cloud-storage>=2.18
+google-auth>=2.27,<2.35  # >=2.35 uses HTTPS metadata endpoint, breaks on GCE without mTLS

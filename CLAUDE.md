@@ -309,7 +309,7 @@ python -m batch.runner --start 1 --no-vpn --delay 2.0
 6. KRS is VARCHAR(10) everywhere - the natural join key across all tables
 7. DuckDB JSON type (not JSONB) - use json_extract() for queries
 8. Feature store uses EAV pattern - pivot to wide format for ML training
-9. `STORAGE_BACKEND=gcs` is not implemented yet
+9. `STORAGE_BACKEND=gcs` requires `google-cloud-storage` and valid GCP credentials (ADC or service account)
 10. Generate fresh encryption token for EVERY search request - never cache
 
 ## Keeping docs current

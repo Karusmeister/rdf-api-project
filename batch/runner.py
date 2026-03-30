@@ -140,11 +140,7 @@ def run_batch(
         logger.info("spawned %s pid=%d", p.name, p.pid)
 
     for p in processes:
-        p.join(timeout=300)
-        if p.is_alive():
-            logger.warning("worker %s did not exit after 300s — killing", p.name)
-            p.kill()
-            p.join(timeout=5)
+        p.join()  # block until worker exits naturally or via signal
         logger.info("joined %s exitcode=%s", p.name, p.exitcode)
 
     failed = [p for p in processes if p.exitcode != 0]

@@ -52,7 +52,6 @@ def run_rdf_batch(
     delay: float | None = None,
     page_size: int | None = None,
     db_path: str | None = None,
-    storage_path: str | None = None,
 ) -> None:
     """Spawn N worker processes for RDF document discovery + download."""
     _workers = workers if workers is not None else settings.batch_workers
@@ -61,15 +60,14 @@ def run_rdf_batch(
     _delay = delay if delay is not None else settings.rdf_batch_delay_seconds
     _page_size = page_size if page_size is not None else settings.rdf_batch_page_size
     _db = db_path if db_path is not None else settings.batch_db_path
-    _storage = storage_path if storage_path is not None else settings.storage_local_path
 
     if _vpn:
         _validate_vpn_config()
 
     logger.info(
         "rdf_batch_start workers=%d vpn=%s concurrency=%d delay=%.1f "
-        "page_size=%d db=%s storage=%s",
-        _workers, _vpn, _concurrency, _delay, _page_size, _db, _storage,
+        "page_size=%d db=%s storage_backend=%s",
+        _workers, _vpn, _concurrency, _delay, _page_size, _db, settings.storage_backend,
     )
 
     processes: list[multiprocessing.Process] = []
@@ -86,7 +84,6 @@ def run_rdf_batch(
                 delay=_delay,
                 page_size=_page_size,
                 db_path=_db,
-                storage_path=_storage,
             ),
         )
         processes.append(p)
@@ -155,10 +152,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--db", type=str, default=None,
         help=f"DuckDB path (default: {settings.batch_db_path})",
     )
-    parser.add_argument(
-        "--storage-path", type=str, default=None,
-        help=f"Document storage path (default: {settings.storage_local_path})",
-    )
     return parser
 
 
@@ -183,7 +176,6 @@ def main() -> None:
         delay=args.delay,
         page_size=args.page_size,
         db_path=args.db,
-        storage_path=args.storage_path,
     )
 
 
