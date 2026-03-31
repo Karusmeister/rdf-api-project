@@ -7,7 +7,7 @@ The repository currently contains:
 
 - RDF proxy endpoints for entity lookup, document search, metadata, and ZIP download
 - Financial statement analysis endpoints
-- A bulk scraper that stores data in DuckDB and on local disk
+- A bulk scraper that stores data in PostgreSQL (migrated from DuckDB)
 - ETL and feature-engineering building blocks for a prediction pipeline
 
 ## Agent autonomy
@@ -50,10 +50,10 @@ Decision comments should be short: what was decided, why, and what alternatives 
 ## Tech stack
 
 - Python 3.12, FastAPI, uvicorn, httpx (async), pycryptodome, pydantic v2
-- DuckDB for all persistence (scraper + prediction tables in same DB file)
+- PostgreSQL for all persistence (migrated from DuckDB)
+- psycopg2-binary for PostgreSQL connections with ConnectionWrapper (preserves DuckDB-style API)
 - NO requests library - everything async with httpx
 - NO manual threading - use async + uvicorn --workers
-- NO PostgreSQL - DuckDB only
 
 ## Critical: KRS encryption
 
@@ -145,11 +145,11 @@ tests/
   e2e/                 - End-to-end tests against live APIs (--e2e flag required)
   regression/          - Live API regression tests (--e2e flag required)
 data/
-  scraper.duckdb       - Single DuckDB file for ALL tables (scraper + prediction)
+  scraper.duckdb       - Legacy DuckDB file (pre-migration backup, read-only analytics)
   documents/           - Extracted RDF files + manifest.json
 ```
 
-## Database: DuckDB tables
+## Database: PostgreSQL tables
 
 ### Scraper tables (app/scraper/db.py)
 - `krs_registry` - KRS master list, scraper priority/scheduling
@@ -204,14 +204,17 @@ Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
 
 ## Key patterns
 
-### DuckDB connection pattern
-One shared DuckDB connection managed by `app/db/connection.py`:
-- `app/db/connection.py` owns the connection lifecycle (connect/close/reset)
+### PostgreSQL connection pattern
+One shared PostgreSQL connection managed by `app/db/connection.py`:
+- `app/db/connection.py` owns the connection lifecycle (connect/close/reset) using psycopg2
+- `ConnectionWrapper` wraps psycopg2 to preserve `conn.execute(sql, params).fetchone()` API
+- Connections use `autocommit=True` to match DuckDB's per-statement commit behavior
 - `app/scraper/db.py` and `app/db/prediction_db.py` delegate to the shared connection
 - Each module has `connect()` (ensures schema), `get_conn()` (returns shared conn), `close()` (no-op)
 - `app/main.py` lifespan calls `db_conn.connect()` + both schema inits at startup
-- `db_conn.close()` at shutdown closes the single shared connection
-- Plain SQL with parameterized queries, no ORM
+- Batch workers use `make_connection(dsn)` for standalone connections (no retry/lock logic needed)
+- Plain SQL with `%s` parameterized queries, no ORM
+- Configuration via `DATABASE_URL` env var (default: `postgresql://rdf:rdf_dev@localhost:5432/rdf`)
 
 ### XML parsing
 `app/services/xml_parser.py` has ~1300 TAG_LABELS mapping XML tags to Polish labels.
@@ -307,7 +310,7 @@ python -m batch.runner --start 1 --no-vpn --delay 2.0
 4. Use StreamingResponse for download endpoint
 5. CORS must be enabled (frontend runs on different port)
 6. KRS is VARCHAR(10) everywhere - the natural join key across all tables
-7. DuckDB JSON type (not JSONB) - use json_extract() for queries
+7. PostgreSQL JSON type — use json_extract_path_text() or ->> for queries
 8. Feature store uses EAV pattern - pivot to wide format for ML training
 9. `STORAGE_BACKEND=gcs` requires `google-cloud-storage` and valid GCP credentials (ADC or service account)
 10. Generate fresh encryption token for EVERY search request - never cache

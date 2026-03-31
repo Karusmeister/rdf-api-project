@@ -1,22 +1,24 @@
-"""Tests for app.repositories.krs_repo — DuckDB storage for KRS entities."""
+"""Tests for app.repositories.krs_repo — PostgreSQL storage for KRS entities."""
 
 from datetime import date, datetime, timezone
 
 import pytest
+from unittest.mock import patch
 
+from app.config import settings
 from app.db import connection as db_conn
 from app.repositories import krs_repo
 
 
 @pytest.fixture(autouse=True)
-def _in_memory_db(monkeypatch):
-    """Use a fresh in-memory DuckDB for each test."""
-    monkeypatch.setattr("app.config.settings.scraper_db_path", ":memory:")
+def _isolated_db(pg_dsn, clean_pg):
+    """Use a clean PostgreSQL database for each test."""
     db_conn.reset()
     krs_repo._schema_initialized = False
-    krs_repo.connect()
-    yield
-    db_conn.close()
+    with patch.object(settings, "database_url", pg_dsn):
+        krs_repo.connect()
+        yield
+        db_conn.close()
     db_conn.reset()
     krs_repo._schema_initialized = False
 
@@ -104,7 +106,7 @@ def test_get_entity_not_found():
 
 def test_connect_migrates_existing_krs_entities_table():
     conn = db_conn.get_conn()
-    conn.execute("DROP TABLE krs_entities")
+    conn.execute("DROP TABLE IF EXISTS krs_entities CASCADE")
     conn.execute("""
         CREATE TABLE krs_entities (
             krs             VARCHAR(10) PRIMARY KEY,
@@ -126,7 +128,10 @@ def test_connect_migrates_existing_krs_entities_table():
     krs_repo.connect()
 
     columns = {
-        row[0] for row in conn.execute("DESCRIBE krs_entities").fetchall()
+        row[0] for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'krs_entities' AND table_schema = 'public'"
+        ).fetchall()
     }
     assert "address_street" in columns
     assert "address_postal_code" in columns
@@ -284,7 +289,7 @@ def test_multiple_scan_runs_returns_latest():
 def _version_rows(krs: str):
     conn = db_conn.get_conn()
     return conn.execute(
-        "SELECT * FROM krs_entity_versions WHERE krs = ? ORDER BY version_id",
+        "SELECT * FROM krs_entity_versions WHERE krs = %s ORDER BY version_id",
         [krs],
     ).fetchall()
 
@@ -292,7 +297,7 @@ def _version_rows(krs: str):
 def _version_dicts(krs: str) -> list[dict]:
     conn = db_conn.get_conn()
     rows = conn.execute(
-        "SELECT * FROM krs_entity_versions WHERE krs = ? ORDER BY version_id",
+        "SELECT * FROM krs_entity_versions WHERE krs = %s ORDER BY version_id",
         [krs],
     ).fetchall()
     cols = [d[0] for d in conn.execute("SELECT * FROM krs_entity_versions LIMIT 0").description]

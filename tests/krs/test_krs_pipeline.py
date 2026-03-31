@@ -122,11 +122,10 @@ def _mock_krs_api():
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _setup(monkeypatch, tmp_path):
-    """Wire up an isolated DuckDB, fast KRS client, and adapter."""
-    # Use isolated DuckDB in tmp_path
-    db_path = str(tmp_path / "test.duckdb")
-    monkeypatch.setattr("app.config.settings.scraper_db_path", db_path)
+async def _setup(monkeypatch, pg_dsn, clean_pg):
+    """Wire up an isolated PostgreSQL, fast KRS client, and adapter."""
+    # Use test PostgreSQL database
+    monkeypatch.setattr("app.config.settings.database_url", pg_dsn)
     db_conn.reset()
     db_conn.connect()
 
@@ -172,7 +171,7 @@ def _seed_registry(*krs_numbers: str):
     now = datetime.now(timezone.utc).isoformat()
     for krs in krs_numbers:
         conn.execute(
-            "INSERT OR IGNORE INTO krs_registry (krs, first_seen_at) VALUES (?, ?)",
+            "INSERT INTO krs_registry (krs, first_seen_at) VALUES (%s, %s) ON CONFLICT (krs) DO NOTHING",
             [krs, now],
         )
 
@@ -242,8 +241,8 @@ async def test_stale_entity_re_enrichment(monkeypatch):
     # Artificially age the entity's synced_at (both legacy cache and version table)
     conn = db_conn.get_conn()
     old_ts = (datetime.now(timezone.utc) - timedelta(hours=200)).isoformat()
-    conn.execute("UPDATE krs_entities SET synced_at = ? WHERE krs = ?", [old_ts, "0000694720"])
-    conn.execute("UPDATE krs_entity_versions SET valid_from = ? WHERE krs = ? AND is_current = true", [old_ts, "0000694720"])
+    conn.execute("UPDATE krs_entities SET synced_at = %s WHERE krs = %s", [old_ts, "0000694720"])
+    conn.execute("UPDATE krs_entity_versions SET valid_from = %s WHERE krs = %s AND is_current = true", [old_ts, "0000694720"])
 
     # Second run: should re-enrich the stale entity
     second = await krs_sync.run_sync()

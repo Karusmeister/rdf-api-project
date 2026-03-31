@@ -1,4 +1,4 @@
-"""Tests for app/db/prediction_db.py — uses an isolated temp DuckDB file."""
+"""Tests for app/db/prediction_db.py — uses PostgreSQL via pg_dsn fixture."""
 import pytest
 from unittest.mock import patch
 
@@ -8,12 +8,11 @@ from app.db import prediction_db as db
 
 
 @pytest.fixture(autouse=True)
-def isolated_db(tmp_path):
-    """Override DB path to a temp file and reset the shared connection."""
-    db_path = str(tmp_path / "test_prediction.duckdb")
+def isolated_db(pg_dsn, clean_pg):
+    """Override DB URL to test PostgreSQL and reset the shared connection."""
     db_conn.reset()
     db._schema_initialized = False
-    with patch.object(settings, "scraper_db_path", db_path):
+    with patch.object(settings, "database_url", pg_dsn):
         db.connect()
         yield
         db_conn.close()
@@ -30,7 +29,7 @@ def test_schema_creation():
     tables = {
         row[0]
         for row in conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
         ).fetchall()
     }
     expected = {

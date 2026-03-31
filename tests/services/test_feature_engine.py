@@ -14,18 +14,16 @@ from scripts.seed_features import FEATURE_DEFINITIONS, FEATURE_SETS
 
 
 @pytest.fixture
-def isolated_db(tmp_path):
-    """Set up isolated DuckDB for both scraper and prediction tables."""
-    db_path = str(tmp_path / "test.duckdb")
-
+def isolated_db(pg_dsn, clean_pg):
+    """Set up isolated PostgreSQL DB for both scraper and prediction tables."""
     db_conn.reset()
     scraper_db._schema_initialized = False
     prediction_db._schema_initialized = False
 
-    with patch.object(settings, "scraper_db_path", db_path):
+    with patch.object(settings, "database_url", pg_dsn):
         scraper_db.connect()
         prediction_db.connect()
-        yield tmp_path
+        yield
         db_conn.close()
 
     db_conn.reset()
@@ -255,7 +253,7 @@ class TestDivisionByZero:
         conn = prediction_db.get_conn()
         row = conn.execute("""
             SELECT is_valid, error_message FROM computed_features
-            WHERE report_id = ? AND feature_definition_id = 'roa'
+            WHERE report_id = %s AND feature_definition_id = 'roa'
         """, [report_id]).fetchone()
         assert row[0] is False
         assert row[1] == "division_by_zero"
@@ -287,7 +285,7 @@ class TestMissingTags:
         conn = prediction_db.get_conn()
         row = conn.execute("""
             SELECT error_message FROM computed_features
-            WHERE report_id = ? AND feature_definition_id = 'roa'
+            WHERE report_id = %s AND feature_definition_id = 'roa'
         """, [report_id]).fetchone()
         assert "missing_tag" in row[0]
 
@@ -311,7 +309,7 @@ class TestRecompute:
         conn = prediction_db.get_conn()
         history_count = conn.execute("""
             SELECT count(*) FROM computed_features
-            WHERE report_id = ? AND feature_definition_id = 'roa'
+            WHERE report_id = %s AND feature_definition_id = 'roa'
         """, [ctx["report_id"]]).fetchone()[0]
         assert history_count == 2
 

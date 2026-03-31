@@ -165,12 +165,12 @@ async def test_reset_cursor_accepted(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_invalid_cron_does_not_break_lifespan_shutdown(tmp_path, monkeypatch):
+async def test_invalid_cron_does_not_break_lifespan_shutdown(pg_dsn, clean_pg, monkeypatch):
     from app import krs_client, rdf_client
     from app.config import settings
 
     _reset_app_state()
-    monkeypatch.setattr(settings, "scraper_db_path", str(tmp_path / "jobs_test.duckdb"))
+    monkeypatch.setattr(settings, "database_url", pg_dsn)
     monkeypatch.setattr(settings, "krs_sync_cron", "not a cron")
 
     async def noop():

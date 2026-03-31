@@ -4,12 +4,12 @@ import io
 import logging
 import zipfile
 
-import duckdb
 import httpx
 import pytest
 import respx
 
 from app.config import settings
+from app.db.connection import make_connection
 from batch.connections import Connection
 from batch.rdf_document_store import RdfDocumentStore
 from batch.rdf_worker import (
@@ -430,11 +430,10 @@ async def test_download_zip_500_returns_none(rdf_base):
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_no_sleep")
-async def test_download_one_document_full_flow(rdf_base, tmp_path):
+async def test_download_one_document_full_flow(rdf_base, pg_dsn, clean_pg, tmp_path):
     """Full download flow: metadata + ZIP download + extract + mark in DB."""
-    db = str(tmp_path / "test.duckdb")
     storage_dir = str(tmp_path / "documents")
-    doc_store = RdfDocumentStore(db)
+    doc_store = RdfDocumentStore(pg_dsn)
     doc_store.insert_documents("0000000001", [_SAMPLE_DOC])
 
     from app.scraper.storage import LocalStorage
@@ -463,12 +462,12 @@ async def test_download_one_document_full_flow(rdf_base, tmp_path):
     assert stats.bytes_downloaded > 0
 
     # Verify DB updated
-    conn = duckdb.connect(db)
-    row = conn.execute(
-        "SELECT is_downloaded, storage_path, file_count FROM krs_documents WHERE document_id = ?",
+    wrapper = make_connection(pg_dsn)
+    row = wrapper.execute(
+        "SELECT is_downloaded, storage_path, file_count FROM krs_documents WHERE document_id = %s",
         ["abc123=="],
     ).fetchone()
-    conn.close()
+    wrapper.close()
     assert row[0] is True
     assert row[1] is not None
     assert row[2] >= 1
@@ -480,11 +479,10 @@ async def test_download_one_document_full_flow(rdf_base, tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_no_sleep")
-async def test_download_one_document_zip_failure(rdf_base, tmp_path):
+async def test_download_one_document_zip_failure(rdf_base, pg_dsn, clean_pg, tmp_path):
     """When ZIP download fails, document gets error status."""
-    db = str(tmp_path / "test.duckdb")
     storage_dir = str(tmp_path / "documents")
-    doc_store = RdfDocumentStore(db)
+    doc_store = RdfDocumentStore(pg_dsn)
     doc_store.insert_documents("0000000001", [_SAMPLE_DOC])
 
     from app.scraper.storage import LocalStorage
@@ -511,12 +509,12 @@ async def test_download_one_document_zip_failure(rdf_base, tmp_path):
     assert stats.documents_failed == 1
 
     # Verify error recorded in DB
-    conn = duckdb.connect(db)
-    row = conn.execute(
-        "SELECT is_downloaded, download_error FROM krs_documents WHERE document_id = ?",
+    wrapper = make_connection(pg_dsn)
+    row = wrapper.execute(
+        "SELECT is_downloaded, download_error FROM krs_documents WHERE document_id = %s",
         ["abc123=="],
     ).fetchone()
-    conn.close()
+    wrapper.close()
     assert row[0] is False
     assert row[1] is not None
 
@@ -525,43 +523,39 @@ async def test_download_one_document_zip_failure(rdf_base, tmp_path):
 # RdfDocumentStore — CRUD
 # ---------------------------------------------------------------------------
 
-def test_document_store_insert(tmp_path):
-    db = str(tmp_path / "test.duckdb")
-    store = RdfDocumentStore(db)
+def test_document_store_insert(pg_dsn, clean_pg):
+    store = RdfDocumentStore(pg_dsn)
     count = store.insert_documents("0000000001", [_SAMPLE_DOC])
     assert count == 1
 
-    conn = duckdb.connect(db)
-    row = conn.execute(
-        "SELECT document_id, krs, rodzaj, status, nazwa FROM krs_documents WHERE document_id = ?",
+    wrapper = make_connection(pg_dsn)
+    row = wrapper.execute(
+        "SELECT document_id, krs, rodzaj, status, nazwa FROM krs_documents WHERE document_id = %s",
         ["abc123=="],
     ).fetchone()
-    conn.close()
+    wrapper.close()
     assert row[0] == "abc123=="
     assert row[1] == "0000000001"
     assert row[2] == "SF"
     assert row[3] == "AKTUALNY"
 
 
-def test_document_store_idempotent(tmp_path):
-    db = str(tmp_path / "test.duckdb")
-    store = RdfDocumentStore(db)
+def test_document_store_idempotent(pg_dsn, clean_pg):
+    store = RdfDocumentStore(pg_dsn)
     store.insert_documents("0000000001", [_SAMPLE_DOC])
     store.insert_documents("0000000001", [_SAMPLE_DOC])  # no error
 
 
-def test_document_store_get_undownloaded(tmp_path):
-    db = str(tmp_path / "test.duckdb")
-    store = RdfDocumentStore(db)
+def test_document_store_get_undownloaded(pg_dsn, clean_pg):
+    store = RdfDocumentStore(pg_dsn)
     store.insert_documents("0000000001", [_SAMPLE_DOC])
 
     undownloaded = store.get_undownloaded("0000000001")
     assert "abc123==" in undownloaded
 
 
-def test_document_store_get_undownloaded_excludes_errored(tmp_path):
-    db = str(tmp_path / "test.duckdb")
-    store = RdfDocumentStore(db)
+def test_document_store_get_undownloaded_excludes_errored(pg_dsn, clean_pg):
+    store = RdfDocumentStore(pg_dsn)
     store.insert_documents("0000000001", [_SAMPLE_DOC])
     store.update_error("abc123==", "some error")
 
@@ -569,9 +563,8 @@ def test_document_store_get_undownloaded_excludes_errored(tmp_path):
     assert "abc123==" not in undownloaded
 
 
-def test_document_store_mark_downloaded(tmp_path):
-    db = str(tmp_path / "test.duckdb")
-    store = RdfDocumentStore(db)
+def test_document_store_mark_downloaded(pg_dsn, clean_pg):
+    store = RdfDocumentStore(pg_dsn)
     store.insert_documents("0000000001", [_SAMPLE_DOC])
     store.mark_downloaded(
         "abc123==",
@@ -583,12 +576,12 @@ def test_document_store_mark_downloaded(tmp_path):
         file_types="xml",
     )
 
-    conn = duckdb.connect(db)
-    row = conn.execute(
-        "SELECT is_downloaded, storage_path, file_size_bytes FROM krs_documents WHERE document_id = ?",
+    wrapper = make_connection(pg_dsn)
+    row = wrapper.execute(
+        "SELECT is_downloaded, storage_path, file_size_bytes FROM krs_documents WHERE document_id = %s",
         ["abc123=="],
     ).fetchone()
-    conn.close()
+    wrapper.close()
     assert row[0] is True
     assert row[1] == "krs/0000000001/abc123"
     assert row[2] == 1024
@@ -597,9 +590,8 @@ def test_document_store_mark_downloaded(tmp_path):
     assert "abc123==" not in store.get_undownloaded("0000000001")
 
 
-def test_document_store_update_metadata(tmp_path):
-    db = str(tmp_path / "test.duckdb")
-    store = RdfDocumentStore(db)
+def test_document_store_update_metadata(pg_dsn, clean_pg):
+    store = RdfDocumentStore(pg_dsn)
     store.insert_documents("0000000001", [_SAMPLE_DOC])
     store.update_metadata("abc123==", {
         "nazwaPliku": "sprawozdanie.xml",
@@ -608,12 +600,12 @@ def test_document_store_update_metadata(tmp_path):
         "dataDodania": "2024-01-15",
     })
 
-    conn = duckdb.connect(db)
-    row = conn.execute(
-        "SELECT filename, is_ifrs, metadata_fetched_at FROM krs_documents WHERE document_id = ?",
+    wrapper = make_connection(pg_dsn)
+    row = wrapper.execute(
+        "SELECT filename, is_ifrs, metadata_fetched_at FROM krs_documents WHERE document_id = %s",
         ["abc123=="],
     ).fetchone()
-    conn.close()
+    wrapper.close()
     assert row[0] == "sprawozdanie.xml"
     assert row[1] is True
     assert row[2] is not None

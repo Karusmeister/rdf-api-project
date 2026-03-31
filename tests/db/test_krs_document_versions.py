@@ -5,12 +5,12 @@ Covers both app/scraper/db.py (shared connection) and batch/rdf_document_store.p
 """
 from datetime import datetime, timezone
 
-import duckdb
 import pytest
 from unittest.mock import patch
 
 from app.config import settings
 from app.db import connection as db_conn
+from app.db.connection import make_connection
 from app.scraper import db as scraper_db
 from app.repositories import krs_repo
 from batch.rdf_document_store import RdfDocumentStore
@@ -21,16 +21,15 @@ from batch.rdf_document_store import RdfDocumentStore
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def isolated_db(tmp_path):
-    db_path = str(tmp_path / "test.duckdb")
+def isolated_db(pg_dsn, clean_pg):
     db_conn.reset()
     scraper_db._schema_initialized = False
     krs_repo._schema_initialized = False
-    with patch.object(settings, "scraper_db_path", db_path):
+    with patch.object(settings, "database_url", pg_dsn):
         db_conn.connect()
         scraper_db._ensure_schema()
         krs_repo._ensure_schema()
-        yield db_path
+        yield pg_dsn
         db_conn.close()
     db_conn.reset()
     scraper_db._schema_initialized = False
@@ -40,7 +39,7 @@ def isolated_db(tmp_path):
 def _doc_versions(document_id: str) -> list[dict]:
     conn = db_conn.get_conn()
     rows = conn.execute(
-        "SELECT * FROM krs_document_versions WHERE document_id = ? ORDER BY version_no",
+        "SELECT * FROM krs_document_versions WHERE document_id = %s ORDER BY version_no",
         [document_id],
     ).fetchall()
     cols = [d[0] for d in conn.execute("SELECT * FROM krs_document_versions LIMIT 0").description]
@@ -190,14 +189,14 @@ class TestScraperDbAppendOnly:
 class TestBatchDocumentStoreAppendOnly:
 
     @pytest.fixture()
-    def store(self, tmp_path):
-        """Separate DB file for batch store (own short-lived connections)."""
-        return RdfDocumentStore(str(tmp_path / "batch.duckdb"))
+    def store(self, pg_dsn):
+        """Separate store for batch (own short-lived connections)."""
+        return RdfDocumentStore(pg_dsn)
 
     def _versions(self, store, document_id):
-        conn = duckdb.connect(store._db_path)
+        conn = make_connection(store._dsn)
         rows = conn.execute(
-            "SELECT * FROM krs_document_versions WHERE document_id = ? ORDER BY version_no",
+            "SELECT * FROM krs_document_versions WHERE document_id = %s ORDER BY version_no",
             [document_id],
         ).fetchall()
         cols = [d[0] for d in conn.execute("SELECT * FROM krs_document_versions LIMIT 0").description]

@@ -62,15 +62,13 @@ SAMPLE_XML = """\
 
 
 @pytest.fixture
-def isolated_db(tmp_path):
+def isolated_db(pg_dsn, clean_pg, tmp_path):
     """Shared-connection based isolated DB for both scraper and prediction."""
-    db_path = str(tmp_path / "test.duckdb")
-
     db_conn.reset()
     scraper_db._schema_initialized = False
     prediction_db._schema_initialized = False
 
-    with patch.object(settings, "scraper_db_path", db_path):
+    with patch.object(settings, "database_url", pg_dsn):
         scraper_db.connect()
         prediction_db.connect()
         yield tmp_path
@@ -119,7 +117,7 @@ class TestSharedConnection:
         tables = {
             row[0]
             for row in conn.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
             ).fetchall()
         }
         assert "krs_registry" in tables
@@ -146,14 +144,13 @@ class TestETLRouteAfterStartup:
         return "asyncio"
 
     @pytest_asyncio.fixture
-    async def api_client(self, tmp_path, monkeypatch):
+    async def api_client(self, pg_dsn, clean_pg, monkeypatch):
         """AsyncClient that exercises the real app lifespan.
 
-        The lifespan initializes DB connections. We monkeypatch the path
-        BEFORE importing the app so that db_conn.connect() creates a temp DB.
+        The lifespan initializes DB connections. We monkeypatch the URL
+        BEFORE importing the app so that db_conn.connect() uses test PG.
         """
-        db_path = str(tmp_path / "startup_test.duckdb")
-        monkeypatch.setattr(settings, "scraper_db_path", db_path)
+        monkeypatch.setattr(settings, "database_url", pg_dsn)
 
         # Reset state so lifespan creates fresh connection
         db_conn.reset()
@@ -305,7 +302,7 @@ class TestFailedRetry:
 
         conn = prediction_db.get_conn()
         attempts = conn.execute(
-            "SELECT status, reason_code FROM etl_attempts WHERE document_id = ?",
+            "SELECT status, reason_code FROM etl_attempts WHERE document_id = %s",
             [doc_id],
         ).fetchall()
         assert len(attempts) == 1
@@ -341,7 +338,9 @@ class TestScraperDDL:
         conn = db_conn.get_conn()
         indexes = {
             row[0]
-            for row in conn.execute("SELECT index_name FROM duckdb_indexes()").fetchall()
+            for row in conn.execute(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
+            ).fetchall()
         }
         assert "idx_documents_not_downloaded" in indexes
 
@@ -350,7 +349,9 @@ class TestScraperDDL:
         conn = db_conn.get_conn()
         indexes = {
             row[0]
-            for row in conn.execute("SELECT index_name FROM duckdb_indexes()").fetchall()
+            for row in conn.execute(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
+            ).fetchall()
         }
         expected = [
             "idx_registry_last_checked",

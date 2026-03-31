@@ -1,4 +1,4 @@
-"""Tests for app/scraper/db.py — use an in-memory DuckDB via settings override."""
+"""Tests for app/scraper/db.py — uses PostgreSQL via pg_dsn fixture."""
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch
@@ -9,12 +9,11 @@ from app.scraper import db as scraper_db
 
 
 @pytest.fixture(autouse=True)
-def isolated_db(tmp_path):
-    """Override DB path to a temp file and reset the shared connection."""
-    db_path = str(tmp_path / "test.duckdb")
+def isolated_db(pg_dsn, clean_pg):
+    """Override DB URL to test PostgreSQL and reset the shared connection."""
     db_conn.reset()
     scraper_db._schema_initialized = False
-    with patch.object(settings, "scraper_db_path", db_path):
+    with patch.object(settings, "database_url", pg_dsn):
         scraper_db.connect()
         yield
         db_conn.close()
@@ -27,7 +26,7 @@ def test_schema_creation():
     tables = {
         row[0]
         for row in conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
         ).fetchall()
     }
     assert "krs_registry" in tables
@@ -122,7 +121,7 @@ def test_ordering_strategies():
     for krs, priority, last_checked in entries:
         conn.execute("""
             INSERT INTO krs_registry (krs, is_active, check_priority, last_checked_at, first_seen_at)
-            VALUES (?, true, ?, ?, ?)
+            VALUES (%s, true, %s, %s, %s)
         """, [krs, priority, last_checked, now])
 
     # priority_then_oldest: highest priority first, then oldest last_checked (NULLs first)
@@ -158,7 +157,7 @@ def test_error_backoff():
     # KRS with high error count, checked very recently
     conn.execute("""
         INSERT INTO krs_registry (krs, is_active, check_error_count, last_checked_at, first_seen_at)
-        VALUES ('0000099999', true, 5, ?, ?)
+        VALUES ('0000099999', true, 5, %s, %s)
     """, [now, now])
 
     results = scraper_db.get_krs_to_check("sequential", 100, 24)
@@ -215,7 +214,7 @@ def test_startup_guardrail_fails_fast_when_legacy_without_versions():
     conn.execute("""
         INSERT INTO krs_documents (
             document_id, krs, rodzaj, status, discovered_at
-        ) VALUES (?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT (document_id) DO NOTHING
     """, ["legacy-doc-guard", "0000099998", "18", "NIEUSUNIETY", now])
 

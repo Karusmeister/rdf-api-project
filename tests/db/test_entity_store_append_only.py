@@ -1,15 +1,14 @@
 """Tests for batch/entity_store.py — append-only entity versioning."""
 
-import duckdb
 import pytest
 
+from app.db.connection import make_connection
 from batch.entity_store import EntityStore
 
 
 @pytest.fixture()
-def store(tmp_path):
-    db_path = str(tmp_path / "test.duckdb")
-    return EntityStore(db_path)
+def store(pg_dsn, clean_pg):
+    return EntityStore(pg_dsn)
 
 
 @pytest.fixture()
@@ -17,7 +16,7 @@ def db(store):
     """Return a read-only helper to query the store's DB."""
     class _DB:
         def query(self, sql, params=None):
-            conn = duckdb.connect(store._db_path, read_only=True)
+            conn = make_connection(store._dsn)
             try:
                 return conn.execute(sql, params or []).fetchall()
             finally:
@@ -25,10 +24,10 @@ def db(store):
 
         def versions(self, krs):
             rows = self.query(
-                "SELECT * FROM krs_entity_versions WHERE krs = ? ORDER BY version_id",
+                "SELECT * FROM krs_entity_versions WHERE krs = %s ORDER BY version_id",
                 [krs],
             )
-            conn = duckdb.connect(store._db_path, read_only=True)
+            conn = make_connection(store._dsn)
             cols = [d[0] for d in conn.execute("SELECT * FROM krs_entity_versions LIMIT 0").description]
             conn.close()
             return [dict(zip(cols, r)) for r in rows]

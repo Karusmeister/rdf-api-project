@@ -126,7 +126,7 @@ def test_run_batch_spawns_correct_workers(mock_process_cls, monkeypatch):
     mock_proc.is_alive.return_value = False  # process exits normally
     mock_process_cls.return_value = mock_proc
 
-    run_batch(start_krs=100, workers=3, use_vpn=False, db_path="/tmp/test.duckdb")
+    run_batch(start_krs=100, workers=3, use_vpn=False, dsn="postgresql://localhost:5432/rdf_test")
 
     assert mock_process_cls.call_count == 3
     # Verify stride offsets
@@ -180,4 +180,4 @@ def test_run_batch_raises_on_worker_crash(mock_process_cls, monkeypatch):
     mock_process_cls.return_value = mock_proc
 
     with pytest.raises(SystemExit):
-        run_batch(start_krs=1, workers=1, use_vpn=False, db_path="/tmp/test.duckdb")
+        run_batch(start_krs=1, workers=1, use_vpn=False, dsn="postgresql://localhost:5432/rdf_test")

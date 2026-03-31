@@ -91,7 +91,7 @@ def _discover_new_krs_numbers(limit: int) -> list[str]:
         WHERE e.krs IS NULL
           AND r.is_active = true
         ORDER BY r.check_priority DESC, r.first_seen_at ASC
-        LIMIT ?
+        LIMIT %s
         """,
         [limit],
     ).fetchall()

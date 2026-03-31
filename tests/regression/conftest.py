@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -13,6 +15,10 @@ from app.db import prediction_db
 from app.main import app
 from app.repositories import krs_repo
 from app.scraper import db as scraper_db
+
+TEST_DATABASE_URL = os.environ.get(
+    "TEST_DATABASE_URL", "postgresql://localhost:5432/rdf_test"
+)
 
 
 def _reset_app_state() -> None:
@@ -47,9 +53,9 @@ async def live_krs_adapter():
 
 
 @pytest_asyncio.fixture
-async def live_app_client(tmp_path):
-    original_db_path = settings.scraper_db_path
-    settings.scraper_db_path = str(tmp_path / "regression.duckdb")
+async def live_app_client():
+    original_database_url = settings.database_url
+    settings.database_url = TEST_DATABASE_URL
     _reset_app_state()
 
     try:
@@ -60,7 +66,7 @@ async def live_app_client(tmp_path):
             ) as client:
                 yield client
     finally:
-        settings.scraper_db_path = original_db_path
+        settings.database_url = original_database_url
         await rdf_client.stop()
         await krs_client.stop()
         _reset_app_state()

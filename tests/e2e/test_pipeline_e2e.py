@@ -5,7 +5,7 @@ Tests the complete flow against the real RDF API for KRS 0000502004:
   1. Search for financial documents via RDF API
   2. Download a real financial statement ZIP
   3. Extract and save to local storage
-  4. Run ETL: parse XML → persist to DuckDB
+  4. Run ETL: parse XML → persist to PostgreSQL
   5. Seed feature definitions
   6. Compute features from line items
   7. Validate computed ratios make financial sense
@@ -44,17 +44,16 @@ def event_loop():
 
 
 @pytest.fixture(scope="module")
-def db_and_storage(tmp_path_factory):
-    """Set up isolated DuckDB + local storage for the entire test module."""
+def db_and_storage(tmp_path_factory, pg_dsn, pg_schema_initialized):
+    """Set up isolated PostgreSQL DB + local storage for the entire test module."""
     tmp = tmp_path_factory.mktemp("e2e")
-    db_path = str(tmp / "e2e.duckdb")
     storage_dir = tmp / "documents"
 
     db_conn.reset()
     scraper_db._schema_initialized = False
     prediction_db._schema_initialized = False
 
-    with patch.object(settings, "scraper_db_path", db_path):
+    with patch.object(settings, "database_url", pg_dsn):
         scraper_db.connect()
         prediction_db.connect()
 
@@ -81,7 +80,7 @@ def db_and_storage(tmp_path_factory):
         yield {
             "tmp": tmp,
             "storage": storage,
-            "db_path": db_path,
+            "db_path": pg_dsn,
         }
 
         db_conn.close()
@@ -274,7 +273,7 @@ class TestE2EPipeline:
         """Raw JSON is preserved in raw_financial_data."""
         conn = prediction_db.get_conn()
         rows = conn.execute(
-            "SELECT section FROM raw_financial_data WHERE report_id = ?",
+            "SELECT section FROM raw_financial_data WHERE report_id = %s",
             [downloaded_doc["document_id"]],
         ).fetchall()
         sections = {r[0] for r in rows}

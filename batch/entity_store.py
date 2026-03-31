@@ -1,7 +1,7 @@
 """Store discovered KRS entities into krs_entity_versions + krs_registry tables.
 
-Uses the same short-lived connection + retry pattern as ProgressStore,
-so multiple worker processes can write to the same DuckDB file.
+Uses short-lived PostgreSQL connections via make_connection,
+so multiple worker processes can write concurrently.
 
 Entity writes use append-only versioning: a new version row is created only
 when the snapshot hash changes.
@@ -10,16 +10,13 @@ when the snapshot hash changes.
 import hashlib
 import json
 import logging
-import random
-import time
 from datetime import datetime, timezone
 
-import duckdb
+import psycopg2
+
+from app.db.connection import make_connection
 
 logger = logging.getLogger(__name__)
-
-_MAX_LOCK_RETRIES = 20
-_BASE_LOCK_DELAY = 0.05
 
 
 def _entity_snapshot_hash(name: str, legal_form: str | None, raw: dict | None) -> str:
@@ -49,25 +46,19 @@ def _entity_snapshot_hash(name: str, legal_form: str | None, raw: dict | None) -
 class EntityStore:
     """Upsert KRS entities discovered by the batch scanner."""
 
-    def __init__(self, db_path: str, *, init_schema: bool = True):
-        self._db_path = db_path
+    def __init__(self, dsn: str, *, init_schema: bool = True):
+        self._dsn = dsn
         if init_schema:
             self._ensure_tables()
 
     def _with_conn(self, fn):
-        for attempt in range(_MAX_LOCK_RETRIES):
-            try:
-                conn = duckdb.connect(self._db_path)
-                try:
-                    result = fn(conn)
-                finally:
-                    conn.close()
-                return result
-            except duckdb.IOException:
-                if attempt == _MAX_LOCK_RETRIES - 1:
-                    raise
-                delay = min(_BASE_LOCK_DELAY * (2 ** attempt), 5.0) + random.uniform(0, 0.05)
-                time.sleep(delay)
+        """Open a short-lived connection, call fn(conn), close, return result."""
+        conn = make_connection(self._dsn)
+        try:
+            result = fn(conn)
+        finally:
+            conn.close()
+        return result
 
     def _ensure_tables(self):
         """Create tables if they don't exist. Idempotent."""
@@ -156,7 +147,7 @@ class EntityStore:
                     """
                     SELECT version_id, snapshot_hash
                     FROM krs_entity_versions
-                    WHERE krs = ? AND is_current = true
+                    WHERE krs = %s AND is_current = true
                     ORDER BY valid_from DESC, version_id DESC
                     LIMIT 1
                     """,
@@ -165,13 +156,13 @@ class EntityStore:
 
                 if current is not None and current[1] == snap_hash:
                     conn.execute(
-                        "UPDATE krs_entity_versions SET observed_at = ? WHERE version_id = ?",
+                        "UPDATE krs_entity_versions SET observed_at = %s WHERE version_id = %s",
                         [now_iso, current[0]],
                     )
                 else:
                     if current is not None:
                         conn.execute(
-                            "UPDATE krs_entity_versions SET valid_to = ?, is_current = false WHERE version_id = ? AND is_current = true",
+                            "UPDATE krs_entity_versions SET valid_to = %s, is_current = false WHERE version_id = %s AND is_current = true",
                             [now_iso, current[0]],
                         )
                     conn.execute(
@@ -179,7 +170,7 @@ class EntityStore:
                         INSERT INTO krs_entity_versions
                             (krs, name, legal_form, raw, source,
                              valid_from, is_current, snapshot_hash, observed_at)
-                        VALUES (?, ?, ?, ?, 'rdf_batch', ?, true, ?, ?)
+                        VALUES (%s, %s, %s, %s, 'rdf_batch', %s, true, %s, %s)
                         """,
                         [krs, name, legal_form, raw_json, now_iso, snap_hash, now_iso],
                     )
@@ -187,7 +178,7 @@ class EntityStore:
                 # Legacy cache (inside same transaction)
                 conn.execute("""
                     INSERT INTO krs_entities (krs, name, legal_form, raw, source, synced_at)
-                    VALUES (?, ?, ?, ?, 'rdf_batch', ?)
+                    VALUES (%s, %s, %s, %s, 'rdf_batch', %s)
                     ON CONFLICT (krs) DO UPDATE SET
                         name = COALESCE(excluded.name, krs_entities.name),
                         legal_form = COALESCE(excluded.legal_form, krs_entities.legal_form),
@@ -198,7 +189,7 @@ class EntityStore:
                 # krs_registry (inside same transaction)
                 conn.execute("""
                     INSERT INTO krs_registry (krs, company_name, legal_form, is_active, first_seen_at)
-                    VALUES (?, ?, ?, true, ?)
+                    VALUES (%s, %s, %s, true, %s)
                     ON CONFLICT (krs) DO UPDATE SET
                         company_name = COALESCE(excluded.company_name, krs_registry.company_name),
                         legal_form = COALESCE(excluded.legal_form, krs_registry.legal_form),

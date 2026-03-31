@@ -4,8 +4,6 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-import duckdb
-
 from app.db import connection as shared_conn
 
 _schema_initialized = False
@@ -22,8 +20,8 @@ def close() -> None:
     pass
 
 
-def get_conn() -> duckdb.DuckDBPyConnection:
-    """Return the shared DuckDB connection."""
+def get_conn():
+    """Return the shared database connection."""
     return shared_conn.get_conn()
 
 
@@ -96,8 +94,8 @@ def _init_schema() -> None:
             tag_path        VARCHAR(200) NOT NULL,
             extraction_version INTEGER NOT NULL DEFAULT 1,
             label_pl        VARCHAR(500),
-            value_current   DOUBLE,
-            value_previous  DOUBLE,
+            value_current   DOUBLE PRECISION,
+            value_previous  DOUBLE PRECISION,
             currency        VARCHAR(3) DEFAULT 'PLN',
             PRIMARY KEY(report_id, section, tag_path, extraction_version)
         )
@@ -147,7 +145,7 @@ def _init_schema() -> None:
             feature_definition_id   VARCHAR NOT NULL,
             krs                     VARCHAR(10) NOT NULL,
             fiscal_year             INTEGER NOT NULL,
-            value                   DOUBLE,
+            value                   DOUBLE PRECISION,
             is_valid                BOOLEAN DEFAULT true,
             error_message           VARCHAR,
             source_extraction_version INTEGER NOT NULL DEFAULT 1,
@@ -188,7 +186,7 @@ def _init_schema() -> None:
             companies_scored INTEGER,
             status          VARCHAR(20) DEFAULT 'running',
             error_message   VARCHAR,
-            duration_seconds DOUBLE,
+            duration_seconds DOUBLE PRECISION,
             created_at      TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -199,8 +197,8 @@ def _init_schema() -> None:
             prediction_run_id VARCHAR NOT NULL,
             krs             VARCHAR(10) NOT NULL,
             report_id       VARCHAR NOT NULL,
-            raw_score       DOUBLE,
-            probability     DOUBLE,
+            raw_score       DOUBLE PRECISION,
+            probability     DOUBLE PRECISION,
             classification  SMALLINT,
             risk_category   VARCHAR(20),
             feature_contributions JSON,
@@ -266,7 +264,7 @@ def _init_schema() -> None:
     # Indexes (check existing first to stay idempotent)
     existing = {
         row[0]
-        for row in conn.execute("SELECT index_name FROM duckdb_indexes()").fetchall()
+        for row in conn.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'public'").fetchall()
     }
 
     index_defs = [
@@ -433,13 +431,13 @@ def get_latest_extraction_version(report_id: str) -> int:
         WITH extraction_versions AS (
             SELECT coalesce(max(extraction_version), 0) AS version
             FROM raw_financial_data
-            WHERE report_id = ?
+            WHERE report_id = %s
 
             UNION ALL
 
             SELECT coalesce(max(extraction_version), 0) AS version
             FROM financial_line_items
-            WHERE report_id = ?
+            WHERE report_id = %s
         )
         SELECT coalesce(max(version), 0) FROM extraction_versions
     """, [report_id, report_id]).fetchone()
@@ -458,7 +456,7 @@ def upsert_company(krs: str, nip: Optional[str] = None, regon: Optional[str] = N
     now = datetime.now(timezone.utc)
     conn.execute("""
         INSERT INTO companies (krs, nip, regon, pkd_code, incorporation_date, voivodeship, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (krs) DO UPDATE SET
             nip               = COALESCE(excluded.nip, companies.nip),
             regon             = COALESCE(excluded.regon, companies.regon),
@@ -472,7 +470,7 @@ def upsert_company(krs: str, nip: Optional[str] = None, regon: Optional[str] = N
 def get_company(krs: str) -> Optional[dict]:
     conn = get_conn()
     row = conn.execute(
-        "SELECT krs, nip, regon, pkd_code, incorporation_date, voivodeship FROM companies WHERE krs = ?", [krs]
+        "SELECT krs, nip, regon, pkd_code, incorporation_date, voivodeship FROM companies WHERE krs = %s", [krs]
     ).fetchone()
     if row is None:
         return None
@@ -504,7 +502,7 @@ def create_financial_report(report_id: str, krs: str, fiscal_year: int, period_s
     existing_by_id = conn.execute("""
         SELECT id, logical_key, report_version, supersedes_report_id
         FROM financial_reports
-        WHERE id = ?
+        WHERE id = %s
     """, [report_id]).fetchone()
 
     if existing_by_id is not None:
@@ -512,17 +510,17 @@ def create_financial_report(report_id: str, krs: str, fiscal_year: int, period_s
             UPDATE financial_reports
             SET ingestion_status = 'pending',
                 ingestion_error = NULL,
-                source_file_path = ?,
-                taxonomy_version = ?,
-                source_document_id = coalesce(?, source_document_id)
-            WHERE id = ?
+                source_file_path = %s,
+                taxonomy_version = %s,
+                source_document_id = coalesce(%s, source_document_id)
+            WHERE id = %s
         """, [source_file_path, taxonomy_version, source_document_id, report_id])
         return existing_by_id[3]
 
     previous_latest = conn.execute("""
         SELECT id, report_version
         FROM latest_financial_reports
-        WHERE logical_key = ?
+        WHERE logical_key = %s
     """, [logical_key]).fetchone()
 
     superseded_id = previous_latest[0] if previous_latest is not None else None
@@ -533,7 +531,7 @@ def create_financial_report(report_id: str, krs: str, fiscal_year: int, period_s
             (id, logical_key, report_version, supersedes_report_id, krs, data_source_id,
              report_type, fiscal_year, period_start, period_end, taxonomy_version,
              source_document_id, source_file_path, ingestion_status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s)
         ON CONFLICT (id) DO NOTHING
     """, [report_id, logical_key, report_version, superseded_id, krs, data_source_id,
           report_type, fiscal_year, period_start, period_end, taxonomy_version,
@@ -545,7 +543,7 @@ def create_financial_report(report_id: str, krs: str, fiscal_year: int, period_s
 def update_report_status(report_id: str, status: str, error: Optional[str] = None) -> None:
     conn = get_conn()
     conn.execute("""
-        UPDATE financial_reports SET ingestion_status = ?, ingestion_error = ? WHERE id = ?
+        UPDATE financial_reports SET ingestion_status = %s, ingestion_error = %s WHERE id = %s
     """, [status, error, report_id])
 
 
@@ -555,7 +553,7 @@ def get_financial_report(report_id: str) -> Optional[dict]:
         SELECT id, logical_key, report_version, supersedes_report_id, krs, data_source_id,
                report_type, fiscal_year, period_start, period_end,
                ingestion_status, ingestion_error, source_document_id
-        FROM financial_reports WHERE id = ?
+        FROM financial_reports WHERE id = %s
     """, [report_id]).fetchone()
     if row is None:
         return None
@@ -583,7 +581,7 @@ def get_reports_for_krs(krs: str) -> list[dict]:
         SELECT id, logical_key, report_version, supersedes_report_id,
                fiscal_year, period_start, period_end, report_type, ingestion_status
         FROM financial_reports
-        WHERE krs = ?
+        WHERE krs = %s
         ORDER BY period_end DESC, report_version DESC, created_at DESC
     """, [krs]).fetchall()
     cols = [
@@ -612,7 +610,7 @@ def upsert_raw_financial_data(report_id: str, section: str, data: dict,
     conn.execute("""
         INSERT INTO raw_financial_data
             (report_id, section, extraction_version, data_json, taxonomy_version, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (report_id, section, extraction_version) DO NOTHING
     """, [report_id, section, extraction_version, json.dumps(data), taxonomy_version, now])
 
@@ -637,7 +635,7 @@ def batch_insert_line_items(items: list[dict], extraction_version: Optional[int]
         conn.execute("""
             INSERT INTO financial_line_items
                 (report_id, section, tag_path, extraction_version, label_pl, value_current, value_previous, currency)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (report_id, section, tag_path, extraction_version) DO NOTHING
         """, [
             item["report_id"], item["section"], item["tag_path"],
@@ -654,14 +652,14 @@ def get_line_items(report_id: str, section: Optional[str] = None) -> list[dict]:
             SELECT report_id, section, tag_path, extraction_version,
                    label_pl, value_current, value_previous, currency
             FROM latest_financial_line_items
-            WHERE report_id = ? AND section = ?
+            WHERE report_id = %s AND section = %s
         """, [report_id, section]).fetchall()
     else:
         rows = conn.execute("""
             SELECT report_id, section, tag_path, extraction_version,
                    label_pl, value_current, value_previous, currency
             FROM latest_financial_line_items
-            WHERE report_id = ?
+            WHERE report_id = %s
         """, [report_id]).fetchall()
     cols = ["report_id", "section", "tag_path", "extraction_version", "label_pl", "value_current", "value_previous", "currency"]
     return [dict(zip(cols, row)) for row in rows]
@@ -680,7 +678,7 @@ def upsert_feature_definition(feature_id: str, name: str, description: Optional[
         INSERT INTO feature_definitions
             (id, name, description, category, formula_description, formula_numerator,
              formula_denominator, required_tags, computation_logic, version, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (id) DO UPDATE SET
             name                = excluded.name,
             description         = excluded.description,
@@ -727,7 +725,7 @@ def upsert_feature_set(set_id: str, name: str, description: Optional[str] = None
     now = datetime.now(timezone.utc)
     conn.execute("""
         INSERT INTO feature_sets (id, name, description, created_at)
-        VALUES (?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s)
         ON CONFLICT (id) DO UPDATE SET name = excluded.name, description = excluded.description
     """, [set_id, name, description, now])
 
@@ -736,7 +734,7 @@ def add_feature_set_member(set_id: str, feature_definition_id: str, ordinal: int
     conn = get_conn()
     conn.execute("""
         INSERT INTO feature_set_members (feature_set_id, feature_definition_id, ordinal)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
         ON CONFLICT (feature_set_id, feature_definition_id) DO UPDATE SET ordinal = excluded.ordinal
     """, [set_id, feature_definition_id, ordinal])
 
@@ -748,7 +746,7 @@ def get_feature_set_members(set_id: str) -> list[dict]:
                fd.name, fd.computation_logic
         FROM feature_set_members fsm
         JOIN feature_definitions fd ON fd.id = fsm.feature_definition_id
-        WHERE fsm.feature_set_id = ?
+        WHERE fsm.feature_set_id = %s
         ORDER BY fsm.ordinal
     """, [set_id]).fetchall()
     cols = ["feature_set_id", "feature_definition_id", "ordinal", "feature_name", "computation_logic"]
@@ -768,7 +766,7 @@ def upsert_computed_feature(report_id: str, feature_definition_id: str, krs: str
         row = conn.execute("""
             SELECT coalesce(max(computation_version), 0)
             FROM computed_features
-            WHERE report_id = ? AND feature_definition_id = ?
+            WHERE report_id = %s AND feature_definition_id = %s
         """, [report_id, feature_definition_id]).fetchone()
         computation_version = int(row[0] or 0) + 1
 
@@ -779,7 +777,7 @@ def upsert_computed_feature(report_id: str, feature_definition_id: str, krs: str
         INSERT INTO computed_features
             (report_id, feature_definition_id, krs, fiscal_year, value,
              is_valid, error_message, source_extraction_version, computation_version, computed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (report_id, feature_definition_id, computation_version) DO NOTHING
     """, [report_id, feature_definition_id, krs, fiscal_year, value,
           is_valid, error_message, source_extraction_version, computation_version, now])
@@ -792,7 +790,7 @@ def get_computed_features_for_report(report_id: str, valid_only: bool = True) ->
             SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid,
                    error_message, source_extraction_version, computation_version
             FROM latest_computed_features
-            WHERE report_id = ? AND is_valid = true
+            WHERE report_id = %s AND is_valid = true
             ORDER BY feature_definition_id
         """, [report_id]).fetchall()
     else:
@@ -800,7 +798,7 @@ def get_computed_features_for_report(report_id: str, valid_only: bool = True) ->
             SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid,
                    error_message, source_extraction_version, computation_version
             FROM latest_computed_features
-            WHERE report_id = ?
+            WHERE report_id = %s
             ORDER BY feature_definition_id
         """, [report_id]).fetchall()
     cols = [
@@ -825,7 +823,7 @@ def get_computed_features(krs: str, fiscal_year: Optional[int] = None) -> list[d
                    cf.is_valid, cf.error_message, cf.source_extraction_version, cf.computation_version
             FROM latest_computed_features cf
             JOIN latest_financial_reports fr ON fr.id = cf.report_id
-            WHERE cf.krs = ? AND cf.fiscal_year = ? AND cf.is_valid = true
+            WHERE cf.krs = %s AND cf.fiscal_year = %s AND cf.is_valid = true
             ORDER BY cf.report_id, cf.feature_definition_id
         """, [krs, fiscal_year]).fetchall()
     else:
@@ -834,7 +832,7 @@ def get_computed_features(krs: str, fiscal_year: Optional[int] = None) -> list[d
                    cf.is_valid, cf.error_message, cf.source_extraction_version, cf.computation_version
             FROM latest_computed_features cf
             JOIN latest_financial_reports fr ON fr.id = cf.report_id
-            WHERE cf.krs = ? AND cf.is_valid = true
+            WHERE cf.krs = %s AND cf.is_valid = true
             ORDER BY cf.report_id, cf.feature_definition_id
         """, [krs]).fetchall()
     cols = [
@@ -865,7 +863,7 @@ def register_model(model_id: str, name: str, model_type: str, version: str,
             (id, name, model_type, version, feature_set_id, description,
              hyperparameters, training_metrics, training_date, training_data_spec,
              artifact_path, is_baseline, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (name, version) DO UPDATE SET
             model_type       = excluded.model_type,
             feature_set_id   = excluded.feature_set_id,
@@ -900,7 +898,7 @@ def create_prediction_run(run_id: str, model_id: str, parameters: Optional[dict]
     now = datetime.now(timezone.utc)
     conn.execute("""
         INSERT INTO prediction_runs (id, model_id, parameters, status, run_date, created_at)
-        VALUES (?, ?, ?, 'running', ?, ?)
+        VALUES (%s, %s, %s, 'running', %s, %s)
     """, [run_id, model_id, json.dumps(parameters) if parameters else None, now, now])
 
 
@@ -910,11 +908,11 @@ def finish_prediction_run(run_id: str, status: str, companies_scored: int = 0,
     conn = get_conn()
     conn.execute("""
         UPDATE prediction_runs SET
-            status           = ?,
-            companies_scored = ?,
-            duration_seconds = ?,
-            error_message    = ?
-        WHERE id = ?
+            status           = %s,
+            companies_scored = %s,
+            duration_seconds = %s,
+            error_message    = %s
+        WHERE id = %s
     """, [status, companies_scored, duration_seconds, error_message, run_id])
 
 
@@ -930,7 +928,7 @@ def insert_prediction(prediction_id: str, prediction_run_id: str, krs: str, repo
         INSERT INTO predictions
             (id, prediction_run_id, krs, report_id, raw_score, probability,
              classification, risk_category, feature_contributions, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (id) DO NOTHING
     """, [prediction_id, prediction_run_id, krs, report_id, raw_score, probability,
           classification, risk_category,
@@ -946,7 +944,7 @@ def get_latest_prediction(krs: str) -> Optional[dict]:
         FROM predictions p
         JOIN prediction_runs pr ON pr.id = p.prediction_run_id
         JOIN model_registry mr ON mr.id = pr.model_id
-        WHERE p.krs = ?
+        WHERE p.krs = %s
         ORDER BY p.created_at DESC
         LIMIT 1
     """, [krs]).fetchone()
@@ -968,7 +966,7 @@ def get_prediction_history(krs: str) -> list[dict]:
         JOIN prediction_runs pr ON pr.id = p.prediction_run_id
         JOIN model_registry mr ON mr.id = pr.model_id
         JOIN financial_reports fr ON fr.id = p.report_id
-        WHERE p.krs = ?
+        WHERE p.krs = %s
         ORDER BY p.created_at DESC
     """, [krs]).fetchall()
     cols = ["id", "raw_score", "probability", "classification", "risk_category",
@@ -991,7 +989,7 @@ def insert_bankruptcy_event(event_id: str, krs: str, event_type: str, event_date
         INSERT INTO bankruptcy_events
             (id, krs, event_type, event_date, data_source_id, court_case_ref,
              announcement_id, is_confirmed, notes, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (krs, event_type, event_date) DO NOTHING
     """, [event_id, krs, event_type, event_date, data_source_id, court_case_ref,
           announcement_id, is_confirmed, notes, now])
@@ -1001,7 +999,7 @@ def get_bankruptcy_events(krs: str) -> list[dict]:
     conn = get_conn()
     rows = conn.execute("""
         SELECT id, krs, event_type, event_date, is_confirmed, court_case_ref, notes
-        FROM bankruptcy_events WHERE krs = ? ORDER BY event_date DESC
+        FROM bankruptcy_events WHERE krs = %s ORDER BY event_date DESC
     """, [krs]).fetchall()
     cols = ["id", "krs", "event_type", "event_date", "is_confirmed", "court_case_ref", "notes"]
     return [dict(zip(cols, row)) for row in rows]
@@ -1014,7 +1012,7 @@ def create_assessment_job(job_id: str, krs: str) -> None:
     now = datetime.now(timezone.utc)
     conn.execute("""
         INSERT INTO assessment_jobs (id, krs, status, stage, created_at, updated_at)
-        VALUES (?, ?, 'pending', NULL, ?, ?)
+        VALUES (%s, %s, 'pending', NULL, %s, %s)
         ON CONFLICT (id) DO NOTHING
     """, [job_id, krs, now, now])
 
@@ -1026,12 +1024,12 @@ def update_assessment_job(job_id: str, status: str, stage: Optional[str] = None,
     now = datetime.now(timezone.utc)
     conn.execute("""
         UPDATE assessment_jobs SET
-            status        = ?,
-            stage         = ?,
-            error_message = ?,
-            result_json   = ?,
-            updated_at    = ?
-        WHERE id = ?
+            status        = %s,
+            stage         = %s,
+            error_message = %s,
+            result_json   = %s,
+            updated_at    = %s
+        WHERE id = %s
     """, [status, stage, error_message,
           json.dumps(result) if result else None, now, job_id])
 
@@ -1040,7 +1038,7 @@ def get_assessment_job(job_id: str) -> Optional[dict]:
     conn = get_conn()
     row = conn.execute("""
         SELECT id, krs, status, stage, error_message, result_json, created_at, updated_at
-        FROM assessment_jobs WHERE id = ?
+        FROM assessment_jobs WHERE id = %s
     """, [job_id]).fetchone()
     if row is None:
         return None

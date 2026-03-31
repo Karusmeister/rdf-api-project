@@ -1,4 +1,4 @@
-"""Tests for the XML-to-DuckDB ETL pipeline."""
+"""Tests for the XML-to-PostgreSQL ETL pipeline."""
 
 import io
 import json
@@ -131,15 +131,13 @@ def _make_zip(xml_content: str) -> bytes:
 
 
 @pytest.fixture
-def isolated_db(tmp_path):
-    """Set up isolated DuckDB for both scraper and prediction tables."""
-    db_path = str(tmp_path / "test.duckdb")
-
+def isolated_db(tmp_path, pg_dsn, clean_pg):
+    """Set up isolated PostgreSQL DB for both scraper and prediction tables."""
     db_conn.reset()
     scraper_db._schema_initialized = False
     prediction_db._schema_initialized = False
 
-    with patch.object(settings, "scraper_db_path", db_path):
+    with patch.object(settings, "database_url", pg_dsn):
         scraper_db.connect()
         prediction_db.connect()
         yield tmp_path
@@ -232,7 +230,7 @@ class TestIngestDocument:
 
         conn = prediction_db.get_conn()
         rows = conn.execute(
-            "SELECT section FROM raw_financial_data WHERE report_id = ?",
+            "SELECT section FROM raw_financial_data WHERE report_id = %s",
             [ctx["document_id"]],
         ).fetchall()
         sections = {r[0] for r in rows}
@@ -321,7 +319,7 @@ class TestReIngest:
         history_versions = conn.execute("""
             SELECT count(DISTINCT extraction_version)
             FROM financial_line_items
-            WHERE report_id = ?
+            WHERE report_id = %s
         """, [ctx["document_id"]]).fetchone()[0]
         assert history_versions == 2
 
@@ -372,7 +370,7 @@ class TestEtlAttempts:
         # etl_attempts should have a row
         conn = prediction_db.get_conn()
         attempts = conn.execute(
-            "SELECT status, reason_code FROM etl_attempts WHERE document_id = ?",
+            "SELECT status, reason_code FROM etl_attempts WHERE document_id = %s",
             [doc_id],
         ).fetchall()
         assert len(attempts) == 1
@@ -382,7 +380,7 @@ class TestEtlAttempts:
         # NO sentinel financial_reports should exist
         sentinel_count = conn.execute("""
             SELECT count(*) FROM financial_reports
-            WHERE source_document_id = ? AND fiscal_year = 0
+            WHERE source_document_id = %s AND fiscal_year = 0
         """, [doc_id]).fetchone()[0]
         assert sentinel_count == 0
 
@@ -411,7 +409,7 @@ class TestEtlAttempts:
 
         conn = prediction_db.get_conn()
         attempts = conn.execute(
-            "SELECT status, reason_code FROM etl_attempts WHERE document_id = ?",
+            "SELECT status, reason_code FROM etl_attempts WHERE document_id = %s",
             [doc_id],
         ).fetchall()
         assert len(attempts) == 1
@@ -420,7 +418,7 @@ class TestEtlAttempts:
 
         sentinel_count = conn.execute("""
             SELECT count(*) FROM financial_reports
-            WHERE source_document_id = ? AND fiscal_year = 0
+            WHERE source_document_id = %s AND fiscal_year = 0
         """, [doc_id]).fetchone()[0]
         assert sentinel_count == 0
 
@@ -432,7 +430,7 @@ class TestEtlAttempts:
 
         conn = prediction_db.get_conn()
         row = conn.execute(
-            "SELECT status, report_id, started_at, finished_at FROM etl_attempts WHERE document_id = ?",
+            "SELECT status, report_id, started_at, finished_at FROM etl_attempts WHERE document_id = %s",
             [ctx["document_id"]],
         ).fetchone()
         assert row[0] == "completed"
@@ -470,7 +468,7 @@ class TestEtlAttempts:
 
         conn = prediction_db.get_conn()
         row = conn.execute(
-            "SELECT status, reason_code, error_message FROM etl_attempts WHERE document_id = ?",
+            "SELECT status, reason_code, error_message FROM etl_attempts WHERE document_id = %s",
             [ctx["document_id"]],
         ).fetchone()
         assert row is not None
