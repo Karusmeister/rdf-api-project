@@ -46,8 +46,8 @@ class Settings(BaseSettings):
     batch_concurrency_per_worker: int = 3
     batch_delay_seconds: float = 2.5
     # --- RDF Batch document discovery ---
-    rdf_batch_concurrency: int = 2        # lower than KRS scanner (heavier calls)
-    rdf_batch_delay_seconds: float = 2.5
+    rdf_batch_concurrency: int = 3
+    rdf_batch_delay_seconds: float = 1.5
     rdf_batch_page_size: int = 100        # max docs per page to minimize pagination
 
     # NordVPN SOCKS5 credentials (only used when batch_use_vpn=true)
