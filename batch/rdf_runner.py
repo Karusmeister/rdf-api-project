@@ -27,12 +27,13 @@ def _pick_connection(worker_id: int, use_vpn: bool) -> Connection:
     pool = build_pool()
     if not use_vpn:
         return pool[0]
-    vpn_conns = [c for c in pool if c.proxy_url is not None]
-    if not vpn_conns:
+    # Pool = [direct, vpn0, vpn1, ...]. Round-robin across all entries
+    # so one worker uses the VM's direct IP and the rest use VPN proxies.
+    if len(pool) < 2:
         raise RuntimeError(
             "VPN enabled but NORDVPN_SERVERS is empty. Set NORDVPN_SERVERS in .env."
         )
-    return vpn_conns[worker_id % len(vpn_conns)]
+    return pool[worker_id % len(pool)]
 
 
 def _validate_vpn_config() -> None:
