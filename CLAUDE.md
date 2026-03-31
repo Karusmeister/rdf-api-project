@@ -7,7 +7,7 @@ The repository currently contains:
 
 - RDF proxy endpoints for entity lookup, document search, metadata, and ZIP download
 - Financial statement analysis endpoints
-- A bulk scraper that stores data in PostgreSQL (migrated from DuckDB)
+- A bulk scraper that stores data in PostgreSQL
 - ETL and feature-engineering building blocks for a prediction pipeline
 
 ## Agent autonomy
@@ -50,8 +50,8 @@ Decision comments should be short: what was decided, why, and what alternatives 
 ## Tech stack
 
 - Python 3.12, FastAPI, uvicorn, httpx (async), pycryptodome, pydantic v2
-- PostgreSQL for all persistence (migrated from DuckDB)
-- psycopg2-binary for PostgreSQL connections with ConnectionWrapper (preserves DuckDB-style API)
+- PostgreSQL for all persistence (local dev via docker-compose)
+- psycopg2-binary for PostgreSQL connections with ConnectionWrapper
 - NO requests library - everything async with httpx
 - NO manual threading - use async + uvicorn --workers
 
@@ -103,25 +103,25 @@ app/
       routes.py        - /api/etl/ingest
   services/
     xml_parser.py      - e-Sprawozdanie XML parser (~1300 TAG_LABELS for Bilans, RZiS, CF)
-    etl.py             - XML-to-DuckDB ingestion pipeline
+    etl.py             - XML-to-PostgreSQL ingestion pipeline
     feature_engine.py  - Computes financial ratios from line items
   monitoring/
     metrics.py         - Per-call metrics ring buffer, record_api_call(), get_stats()
   repositories/
-    krs_repo.py        - DuckDB CRUD for krs_entities + krs_sync_log tables
+    krs_repo.py        - PostgreSQL CRUD for krs_entities + krs_sync_log tables
   db/
-    connection.py      - Shared DuckDB connection manager (single lifecycle)
-    prediction_db.py   - DuckDB schema init + CRUD for prediction tables
+    connection.py      - Shared PostgreSQL connection manager (single lifecycle)
+    prediction_db.py   - PostgreSQL schema init + CRUD for prediction tables
   scraper/
     cli.py             - Scraper CLI (import-krs, import-range, run, status)
-    db.py              - DuckDB schema + CRUD for scraper tables (existing)
+    db.py              - PostgreSQL schema + CRUD for scraper tables
     job.py             - Scraper job logic
     storage.py         - Document storage abstraction
 batch/
   __init__.py          - Package marker
   __main__.py          - `python -m batch` entrypoint
   connections.py       - Connection dataclass + NordVPN SOCKS5 pool builder
-  progress.py          - DuckDB-backed progress store (batch_progress table)
+  progress.py          - PostgreSQL-backed progress store (batch_progress table)
   entity_store.py      - Append-only entity store for batch scanner
   rdf_document_store.py - Append-only document store for batch RDF worker
   rdf_progress.py      - RDF document discovery progress store
@@ -131,12 +131,10 @@ batch/
   rdf_runner.py        - RDF document batch orchestrator
 scripts/
   seed_features.py     - Populate feature_definitions and feature_sets
-  run_db_migration.py  - Run schema migrations (e.g., append-only backfill)
-  db_migrations/       - Migration scripts (001_append_only_backfill.py, etc.)
 tests/
   api/                 - FastAPI endpoint tests (endpoints, jobs routes)
   db/                  - DB schema + CRUD tests (prediction_db, krs_repo, scraper_db,
-                         append-only versioning, document versions, migrations)
+                         append-only versioning, document versions)
   batch/               - Batch processing tests (worker, runner, progress, connections,
                          rdf_worker, rdf_progress, rdf_runner)
   services/            - ETL, feature engine, crypto, code review fixes
@@ -145,7 +143,6 @@ tests/
   e2e/                 - End-to-end tests against live APIs (--e2e flag required)
   regression/          - Live API regression tests (--e2e flag required)
 data/
-  scraper.duckdb       - Legacy DuckDB file (pre-migration backup, read-only analytics)
   documents/           - Extracted RDF files + manifest.json
 ```
 
@@ -207,8 +204,8 @@ Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
 ### PostgreSQL connection pattern
 One shared PostgreSQL connection managed by `app/db/connection.py`:
 - `app/db/connection.py` owns the connection lifecycle (connect/close/reset) using psycopg2
-- `ConnectionWrapper` wraps psycopg2 to preserve `conn.execute(sql, params).fetchone()` API
-- Connections use `autocommit=True` to match DuckDB's per-statement commit behavior
+- `ConnectionWrapper` wraps psycopg2 with convenient `conn.execute(sql, params).fetchone()` API
+- Connections use `autocommit=True` for per-statement commit behavior
 - `app/scraper/db.py` and `app/db/prediction_db.py` delegate to the shared connection
 - Each module has `connect()` (ensures schema), `get_conn()` (returns shared conn), `close()` (no-op)
 - `app/main.py` lifespan calls `db_conn.connect()` + both schema inits at startup
@@ -229,6 +226,9 @@ computation_logic types: 'ratio' (num/denom), 'difference', 'raw_value', 'custom
 ## Commands
 
 ```bash
+# Start PostgreSQL (Docker)
+docker compose up -d
+
 # Install
 pip install -r requirements.txt
 

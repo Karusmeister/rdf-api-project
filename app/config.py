@@ -45,8 +45,6 @@ class Settings(BaseSettings):
     batch_start_krs: int = 1
     batch_concurrency_per_worker: int = 3
     batch_delay_seconds: float = 2.5
-    batch_db_path: str = "data/scraper.duckdb"
-
     # --- RDF Batch document discovery ---
     rdf_batch_concurrency: int = 2        # lower than KRS scanner (heavier calls)
     rdf_batch_delay_seconds: float = 2.5
@@ -58,7 +56,6 @@ class Settings(BaseSettings):
     nordvpn_servers: list[str] = []
 
     # --- Scraper ---
-    scraper_db_path: str = "data/scraper.duckdb"
 
     # Storage
     storage_backend: str = "local"           # 'local' or 'gcs'

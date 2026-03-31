@@ -97,13 +97,13 @@ def test_parser_defaults():
 
 def test_parser_all_flags():
     parser = _build_parser()
-    args = parser.parse_args(["--start", "500", "--workers", "5", "--vpn", "--concurrency", "2", "--delay", "0.5", "--db", "/tmp/test.duckdb"])
+    args = parser.parse_args(["--start", "500", "--workers", "5", "--vpn", "--concurrency", "2", "--delay", "0.5", "--db", "postgresql://localhost/test"])
     assert args.start == 500
     assert args.workers == 5
     assert args.vpn is True
     assert args.concurrency == 2
     assert args.delay == 0.5
-    assert args.db == "/tmp/test.duckdb"
+    assert args.db == "postgresql://localhost/test"
 
 
 def test_parser_vpn_no_vpn_mutually_exclusive():
@@ -116,8 +116,10 @@ def test_parser_vpn_no_vpn_mutually_exclusive():
 # run_batch — mock worker processes
 # ---------------------------------------------------------------------------
 
+@patch("batch.runner.EntityStore")
+@patch("batch.runner.ProgressStore")
 @patch("batch.runner.multiprocessing.Process")
-def test_run_batch_spawns_correct_workers(mock_process_cls, monkeypatch):
+def test_run_batch_spawns_correct_workers(mock_process_cls, _mock_ps, _mock_es, monkeypatch):
     """run_batch spawns N workers with correct stride offsets."""
     monkeypatch.setattr(settings, "nordvpn_servers", [])
     mock_proc = MagicMock()
@@ -141,8 +143,10 @@ def test_run_batch_spawns_correct_workers(mock_process_cls, monkeypatch):
     assert mock_proc.join.call_count == 3
 
 
+@patch("batch.runner.EntityStore")
+@patch("batch.runner.ProgressStore")
 @patch("batch.runner.multiprocessing.Process")
-def test_run_batch_defaults_from_settings(mock_process_cls, monkeypatch):
+def test_run_batch_defaults_from_settings(mock_process_cls, _mock_ps, _mock_es, monkeypatch):
     """run_batch with no args uses settings defaults."""
     monkeypatch.setattr(settings, "nordvpn_servers", [])
     monkeypatch.setattr(settings, "batch_start_krs", 42)
@@ -169,8 +173,10 @@ def test_run_batch_vpn_validation_fails(monkeypatch):
         run_batch(use_vpn=True)
 
 
+@patch("batch.runner.EntityStore")
+@patch("batch.runner.ProgressStore")
 @patch("batch.runner.multiprocessing.Process")
-def test_run_batch_raises_on_worker_crash(mock_process_cls, monkeypatch):
+def test_run_batch_raises_on_worker_crash(mock_process_cls, _mock_ps, _mock_es, monkeypatch):
     """run_batch raises SystemExit(1) when any worker exits non-zero."""
     monkeypatch.setattr(settings, "nordvpn_servers", [])
     mock_proc = MagicMock()

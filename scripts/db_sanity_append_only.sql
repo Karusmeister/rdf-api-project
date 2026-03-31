@@ -1,7 +1,6 @@
 -- db_sanity_append_only.sql
 -- Post-migration sanity checks. Each query should return 0 rows for a healthy DB.
--- Run with: python scripts/run_db_migration.py scripts/db_sanity_append_only.sql
--- Or manually: ./.venv/bin/python -c "import duckdb; ..."
+-- Run with: psql $DATABASE_URL -f scripts/db_sanity_append_only.sql
 
 -- 1. Max 1 current entity version per krs
 SELECT 'multi_current_entities' AS check_name, krs, COUNT(*) AS cnt

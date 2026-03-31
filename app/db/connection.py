@@ -4,9 +4,8 @@ Shared PostgreSQL connection manager.
 Single connection lifecycle for the entire application. Both scraper
 and prediction modules use this shared connection to the same database.
 
-Provides a ConnectionWrapper that preserves the DuckDB-style
-conn.execute(sql, params).fetchone() / .fetchall() API so that
-callers require minimal changes.
+Provides a ConnectionWrapper around psycopg2 with a convenient
+conn.execute(sql, params).fetchone() / .fetchall() API.
 """
 
 from __future__ import annotations
@@ -27,14 +26,11 @@ _conn: Optional[ConnectionWrapper] = None  # type: ignore[assignment]
 
 
 class ConnectionWrapper:
-    """Wraps a psycopg2 connection to match DuckDB's execute().fetchone() API.
+    """Wraps a psycopg2 connection with a convenient execute().fetchone() API.
 
-    DuckDB: conn.execute(sql, params) returns a result set with .fetchone()/.fetchall().
-    psycopg2: conn.cursor().execute(sql, params) returns None; results are on the cursor.
-
-    This wrapper bridges the gap so call-sites like:
+    psycopg2's cursor-based API requires separate execute() and fetch calls.
+    This wrapper lets call-sites use:
         row = conn.execute("SELECT ... WHERE x = %s", [val]).fetchone()
-    continue to work without modification.
     """
 
     def __init__(self, conn: psycopg2.extensions.connection):
@@ -71,7 +67,7 @@ def connect() -> ConnectionWrapper:
         return _conn
     dsn = settings.database_url
     raw = psycopg2.connect(dsn)
-    raw.autocommit = True  # match DuckDB's per-statement autocommit behavior
+    raw.autocommit = True
     _conn = ConnectionWrapper(raw)
     logger.info("db_connected", extra={"event": "db_connected", "dsn": dsn.split("@")[-1]})
     return _conn

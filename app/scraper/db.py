@@ -105,10 +105,9 @@ def _init_schema() -> None:
             metadata_fetched_at TIMESTAMP,
             download_error      VARCHAR
 
-            -- NOTE: No FK to krs_registry. DuckDB FK enforcement blocks UPDATE
-            -- on the parent row when child rows exist (a known DuckDB limitation).
-            -- Referential integrity is enforced by application logic instead:
-            -- scraper job always upserts krs_registry before inserting documents.
+            -- NOTE: No FK to krs_registry. Referential integrity is enforced
+            -- by application logic: scraper job always upserts krs_registry
+            -- before inserting documents.
         )
     """)
 
@@ -201,8 +200,7 @@ def _init_schema() -> None:
         WHERE rn = 1
     """)
 
-    # Indexes (CREATE INDEX IF NOT EXISTS not supported in all DuckDB versions,
-    # so we check manually via information_schema)
+    # Indexes (check existence before creating to be idempotent)
     existing = {
         row[0]
         for row in conn.execute(
@@ -232,14 +230,10 @@ def _check_backfill_needed() -> None:
     legacy = conn.execute("SELECT count(*) FROM krs_documents").fetchone()[0]
     versions = conn.execute("SELECT count(*) FROM krs_document_versions").fetchone()[0]
     if legacy > 0 and versions == 0:
-        migration_cmd = (
-            "python -m scripts.run_db_migration "
-            "scripts/db_migrations/001_append_only_backfill.py "
-            f"--db {settings.scraper_db_path}"
-        )
         msg = (
             "Cutover blocked: krs_document_versions is empty while legacy "
-            f"krs_documents has {legacy} rows. Run backfill before startup: {migration_cmd}"
+            f"krs_documents has {legacy} rows. "
+            "Run the append-only backfill migration against PostgreSQL before startup."
         )
         logger.error(
             "krs_document_backfill_required",
@@ -247,7 +241,7 @@ def _check_backfill_needed() -> None:
                 "event": "backfill_required",
                 "legacy_count": legacy,
                 "versions_count": versions,
-                "hint": migration_cmd,
+                "hint": msg,
             },
         )
         raise RuntimeError(msg)

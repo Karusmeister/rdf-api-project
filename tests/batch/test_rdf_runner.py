@@ -34,14 +34,14 @@ def test_parser_all_flags():
         "--concurrency", "1",
         "--delay", "3.0",
         "--page-size", "50",
-        "--db", "/tmp/test.duckdb",
+        "--db", "postgresql://localhost/test",
         "--no-vpn",
     ])
     assert args.workers == 2
     assert args.concurrency == 1
     assert args.delay == 3.0
     assert args.page_size == 50
-    assert args.db == "/tmp/test.duckdb"
+    assert args.db == "postgresql://localhost/test"
     assert args.no_vpn is True
 
 

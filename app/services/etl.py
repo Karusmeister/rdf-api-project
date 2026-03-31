@@ -1,5 +1,5 @@
 """
-XML-to-DuckDB ETL pipeline.
+XML-to-PostgreSQL ETL pipeline.
 
 Reads downloaded/extracted XML files from disk, parses via xml_parser,
 and persists structured data into prediction engine tables.

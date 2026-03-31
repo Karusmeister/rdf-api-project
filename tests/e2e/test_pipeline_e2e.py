@@ -195,7 +195,7 @@ class TestE2EPipeline:
     """End-to-end pipeline tests for KRS 0000502004."""
 
     def test_01_etl_ingest(self, downloaded_doc, db_and_storage):
-        """ETL ingests the downloaded document into DuckDB."""
+        """ETL ingests the downloaded document into the database."""
         result = etl.ingest_document(
             downloaded_doc["document_id"],
             storage=downloaded_doc["storage"],

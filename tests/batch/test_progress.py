@@ -69,7 +69,7 @@ def _worker_mark(dsn: str, krs: int, worker_id: int):
 def test_multi_process_writes_do_not_deadlock(pg_dsn):
     """Two separate OS processes can write to the same DB without lock errors.
 
-    This was the core bug in finding #1 — persistent DuckDB connections
+    This was the core bug in finding #1 — persistent database connections
     held exclusive locks, preventing multi-worker operation.
     """
     # Ensure schema exists before spawning

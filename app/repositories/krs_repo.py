@@ -1,4 +1,4 @@
-"""DuckDB repository for KRS entity data and sync logging.
+"""PostgreSQL repository for KRS entity data and sync logging.
 
 Tables are created via _init_schema() at app startup. Company-level address
 fields used by the adapter contract are stored in columns; sensitive personal
@@ -17,7 +17,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from app.config import settings
 from app.db import connection as shared_conn
 
 logger = logging.getLogger(__name__)
@@ -251,14 +250,10 @@ def _check_backfill_needed() -> None:
     legacy = conn.execute("SELECT count(*) FROM krs_entities").fetchone()[0]
     versions = conn.execute("SELECT count(*) FROM krs_entity_versions").fetchone()[0]
     if legacy > 0 and versions == 0:
-        migration_cmd = (
-            "python -m scripts.run_db_migration "
-            "scripts/db_migrations/001_append_only_backfill.py "
-            f"--db {settings.scraper_db_path}"
-        )
         msg = (
             "Cutover blocked: krs_entity_versions is empty while legacy "
-            f"krs_entities has {legacy} rows. Run backfill before startup: {migration_cmd}"
+            f"krs_entities has {legacy} rows. "
+            "Run the append-only backfill migration against PostgreSQL before startup."
         )
         logger.error(
             "krs_entity_backfill_required",
@@ -266,7 +261,7 @@ def _check_backfill_needed() -> None:
                 "event": "backfill_required",
                 "legacy_count": legacy,
                 "versions_count": versions,
-                "hint": migration_cmd,
+                "hint": msg,
             },
         )
         raise RuntimeError(msg)

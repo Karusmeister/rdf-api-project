@@ -6,7 +6,7 @@ The repository currently contains four connected pieces:
 
 1. An RDF proxy API that hides the upstream KRS encryption and exposes a cleaner HTTP interface.
 2. Analysis endpoints that download and parse Polish GAAP XML statements server-side.
-3. A bulk scraper that keeps a local DuckDB inventory of KRS entities and downloaded documents.
+3. A bulk scraper that keeps a PostgreSQL inventory of KRS entities and downloaded documents.
 4. An ETL and feature-engineering foundation for building a bankruptcy-prediction pipeline.
 
 ## Current State
@@ -15,7 +15,7 @@ Implemented today:
 
 - RDF lookup, document search, metadata, and ZIP download endpoints
 - Financial statement parsing, period discovery, year-over-year comparison, and time-series analysis
-- Shared DuckDB persistence for scraper and prediction tables
+- Shared PostgreSQL persistence for scraper and prediction tables
 - Local extracted-file storage for downloaded RDF documents
 - Scraper CLI for importing KRS numbers and downloading document corpora
 - ETL ingestion from extracted XML into analytical tables
@@ -47,17 +47,17 @@ FastAPI app
     |
     +--> app/scraper/job.py --> extracted files on disk
     |
-    +--> app/services/etl.py --> prediction tables in DuckDB
+    +--> app/services/etl.py --> prediction tables in PostgreSQL
 
 Shared persistence
-  - DuckDB: data/scraper.duckdb
+  - PostgreSQL: rdf database (see docker-compose.yml)
   - Files:  data/documents/krs/<krs>/<document_id_safe>/
 ```
 
 Key design choices:
 
-- One shared DuckDB connection lifecycle, managed in [`app/db/connection.py`](/Users/piotrkraus/piotr/rdf-api-project/app/db/connection.py)
-- Scraper tables and prediction/ETL tables live in the same database file
+- One shared PostgreSQL connection, managed in [`app/db/connection.py`](/Users/piotrkraus/piotr/rdf-api-project/app/db/connection.py)
+- Scraper tables and prediction/ETL tables live in the same PostgreSQL database
 - Downloaded RDF ZIPs are extracted immediately and stored as raw files plus `manifest.json`
 - KRS encryption is handled internally by [`app/crypto.py`](/Users/piotrkraus/piotr/rdf-api-project/app/crypto.py); clients never need to reproduce it
 
@@ -70,7 +70,7 @@ app/
   crypto.py               RDF KRS encryption
   rdf_client.py           Async HTTP client for the upstream RDF API
   db/
-    connection.py         Shared DuckDB connection manager
+    connection.py         Shared PostgreSQL connection manager
     prediction_db.py      Prediction/ETL schema and CRUD helpers
   routers/
     rdf/                  Proxy endpoints for the upstream RDF API
@@ -84,7 +84,7 @@ app/
     storage.py            Local extracted-file storage
   services/
     xml_parser.py         Statement parsing and comparison logic
-    etl.py                XML -> DuckDB ingestion
+    etl.py                XML -> PostgreSQL ingestion
     feature_engine.py     Ratio and feature computation
 scripts/
   seed_features.py        Seeds feature definitions and feature sets
@@ -100,11 +100,16 @@ docs/
 ### Prerequisites
 
 - Python 3.12
+- Docker (for PostgreSQL)
 - Network access to `rdf-przegladarka.ms.gov.pl` if you want to call the live upstream API
 
 ### Local setup
 
 ```bash
+# Start PostgreSQL
+docker compose up -d
+
+# Python environment
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -140,7 +145,7 @@ Most useful settings from [`.env.example`](/Users/piotrkraus/piotr/rdf-api-proje
 | `MAX_CONNECTIONS` | `20` | Connection limit for the shared `httpx` client |
 | `CORS_ORIGINS` | localhost frontend origins | Allowed CORS origins |
 | `WORKERS` | `4` | Uvicorn worker count in Docker/prod |
-| `SCRAPER_DB_PATH` | `data/scraper.duckdb` | Shared DuckDB file |
+| `DATABASE_URL` | `postgresql://rdf:rdf_dev@localhost:5432/rdf` | PostgreSQL connection string |
 | `STORAGE_BACKEND` | `local` | Storage backend; only `local` works today |
 | `STORAGE_LOCAL_PATH` | `data/documents` | Extracted document root |
 | `SCRAPER_ORDER_STRATEGY` | `priority_then_oldest` | KRS scheduling strategy |
@@ -148,7 +153,7 @@ Most useful settings from [`.env.example`](/Users/piotrkraus/piotr/rdf-api-proje
 
 ## Data Layout
 
-DuckDB tables are split by responsibility but share one database file:
+PostgreSQL tables are split by responsibility but share one database:
 
 - Scraper control-plane tables: `krs_registry`, `krs_documents`, `scraper_runs`
 - Prediction/ETL tables: `financial_reports`, `raw_financial_data`, `financial_line_items`, `computed_features`, and related metadata tables
@@ -274,7 +279,7 @@ curl -X POST http://localhost:8000/api/etl/ingest \
 
 The scraper is CLI-driven. Typical flow:
 
-1. Import KRS numbers into DuckDB.
+1. Import KRS numbers into the database.
 2. Run the scraper to discover and download documents.
 3. Check status via CLI or `/api/scraper/status`.
 4. Run ETL to ingest downloaded XML into analytical tables.
