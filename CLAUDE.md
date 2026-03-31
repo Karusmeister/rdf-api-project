@@ -100,11 +100,13 @@ app/
     jobs/
       routes.py        - /jobs/krs-sync/* (status, trigger)
     etl/
-      routes.py        - /api/etl/ingest
+      routes.py        - /api/etl/ingest, /api/etl/training/dataset-stats
   services/
     xml_parser.py      - e-Sprawozdanie XML parser (~1300 TAG_LABELS for Bilans, RZiS, CF)
     etl.py             - XML-to-PostgreSQL ingestion pipeline
-    feature_engine.py  - Computes financial ratios from line items
+    feature_engine.py  - Computes financial ratios from line items (incl. x1_maczynska custom)
+    maczynska.py       - Maczynska 1994 discriminant model (baseline bankruptcy predictor)
+    training_data.py   - EAV-to-wide pivot, bankruptcy label joining, dataset stats
   monitoring/
     metrics.py         - Per-call metrics ring buffer, record_api_call(), get_stats()
   repositories/
@@ -137,7 +139,7 @@ tests/
                          append-only versioning, document versions)
   batch/               - Batch processing tests (worker, runner, progress, connections,
                          rdf_worker, rdf_progress, rdf_runner)
-  services/            - ETL, feature engine, crypto, code review fixes
+  services/            - ETL, feature engine, crypto, Maczynska model, training data, code review fixes
   scraper/             - Scraper integration, storage
   krs/                 - KRS adapter, client, sync pipeline, scanner, monitoring
   e2e/                 - End-to-end tests against live APIs (--e2e flag required)
@@ -287,6 +289,7 @@ python -m batch.runner --start 1 --no-vpn --delay 2.0
 |--------|------|-------|
 | GET | /api/scraper/status | Aggregate scraper stats + last run |
 | POST | /api/etl/ingest | Trigger document ingestion |
+| GET | /api/etl/training/dataset-stats | Training dataset quality summary (feature_set query param) |
 
 ### KRS sync job
 | Method | Path | Notes |

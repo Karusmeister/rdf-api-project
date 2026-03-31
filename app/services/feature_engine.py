@@ -51,6 +51,27 @@ def _log_total_assets(values: dict[str, Optional[float]], fdef: dict) -> Optiona
     return math.log(v)
 
 
+@register_custom("x1_maczynska")
+def _x1_maczynska(
+    values: dict[str, Optional[float]], fdef: dict
+) -> Optional[float]:
+    """(Gross profit + Depreciation) / Total liabilities.
+
+    Gross profit       = RZiS.I  (Zysk brutto)
+    Depreciation       = CF.A_II_1  (Amortyzacja from cash flow)
+    Total liabilities  = Pasywa_B  (Zobowiazania i rezerwy)
+    """
+    gross_profit = values.get("RZiS.I")
+    depreciation = values.get("CF.A_II_1")
+    liabilities = values.get("Pasywa_B")
+
+    if gross_profit is None or liabilities is None or liabilities == 0:
+        return None
+    # Depreciation may be absent for micro entities (no cash flow statement)
+    dep = depreciation or 0.0
+    return (gross_profit + dep) / liabilities
+
+
 @register_custom("log_revenue")
 def _log_revenue(values: dict[str, Optional[float]], fdef: dict) -> Optional[float]:
     """ln(Revenue)."""

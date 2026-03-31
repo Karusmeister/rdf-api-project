@@ -3,10 +3,10 @@ import functools
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from app.services import etl
+from app.services import etl, training_data
 
 logger = logging.getLogger(__name__)
 
@@ -36,4 +36,28 @@ async def ingest(body: IngestRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error("etl_ingest_error", extra={"event": "etl_ingest_error", "error": str(e)}, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/training/dataset-stats")
+async def dataset_stats(
+    feature_set: str = Query(..., description="Feature set ID (e.g. 'maczynska_6')"),
+    min_year: Optional[int] = Query(None),
+    max_year: Optional[int] = Query(None),
+):
+    """Return summary statistics about the training dataset for a feature set."""
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            functools.partial(
+                training_data.get_dataset_stats,
+                feature_set, min_year=min_year, max_year=max_year,
+            ),
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error("dataset_stats_error", extra={"event": "dataset_stats_error", "error": str(e)}, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

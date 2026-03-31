@@ -184,13 +184,19 @@ class TestComputeFeatures:
             ctx["report_id"], feature_set_id="maczynska_6"
         )
 
-        assert result["computed"] == 6
-        assert result["failed"] == 0
-
-        # X1 = Gross Profit / Assets = 80000 / 1000000 = 0.08
-        assert result["features"]["x1_maczynska"] == pytest.approx(0.08, abs=1e-4)
-        # X5 = Revenue / Assets = 2000000 / 1000000 = 2.0
-        assert result["features"]["x5_maczynska"] == pytest.approx(2.0, abs=1e-4)
+        # X1 is custom: (RZiS.I + CF.A_II_1) / Pasywa_B — CF.A_II_1 missing → dep=0
+        # (80000 + 0) / 500000 = 0.16
+        assert result["features"]["x1_maczynska"] == pytest.approx(0.16, abs=1e-4)
+        # X2 = Aktywa / Pasywa_B = 1000000 / 500000 = 2.0
+        assert result["features"]["x2_maczynska"] == pytest.approx(2.0, abs=1e-4)
+        # X3 = RZiS.I / Aktywa = 80000 / 1000000 = 0.08
+        assert result["features"]["x3_maczynska"] == pytest.approx(0.08, abs=1e-4)
+        # X4 = RZiS.I / RZiS.A = 80000 / 2000000 = 0.04
+        assert result["features"]["x4_maczynska"] == pytest.approx(0.04, abs=1e-4)
+        # X5 = Aktywa_B_I / RZiS.A = 100000 / 2000000 = 0.05
+        assert result["features"]["x5_maczynska"] == pytest.approx(0.05, abs=1e-4)
+        # X6 = RZiS.A / Aktywa = 2000000 / 1000000 = 2.0
+        assert result["features"]["x6_maczynska"] == pytest.approx(2.0, abs=1e-4)
 
     def test_compute_with_feature_set_filter(self, report_with_data):
         ctx = report_with_data
