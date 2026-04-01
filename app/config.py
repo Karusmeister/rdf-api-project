@@ -12,7 +12,16 @@ class Settings(BaseSettings):
     rdf_origin: str = "https://rdf-przegladarka.ms.gov.pl"
     request_timeout: int = 30
     max_connections: int = 20
-    cors_origins: List[str] = ["*"]
+    cors_origins: List[str] = [
+        # Local development
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
+        # Lovable preview
+        "https://id-preview--aaed77c9-b864-4814-8747-ad97402d1f70.lovable.app",
+        "https://joy-forge-express.lovable.app",
+    ]
     workers: int = 4
     log_level: str = "INFO"
 
