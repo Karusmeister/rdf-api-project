@@ -6,11 +6,16 @@ and prediction modules use this shared connection to the same database.
 
 Provides a ConnectionWrapper around psycopg2 with a convenient
 conn.execute(sql, params).fetchone() / .fetchall() API.
+
+Request-scoped connections are managed via a ContextVar and middleware,
+ensuring each request gets its own pooled connection that is returned
+on completion. Scripts and tests fall back to the shared connection.
 """
 
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 from contextlib import contextmanager
 from typing import Optional
 
@@ -23,6 +28,25 @@ logger = logging.getLogger(__name__)
 
 _pool: Optional[pool.ThreadedConnectionPool] = None
 _conn: Optional[ConnectionWrapper] = None  # type: ignore[assignment]
+_request_conn: ContextVar[Optional[ConnectionWrapper]] = ContextVar("_request_conn", default=None)
+
+
+def init_pool(dsn: str, minconn: int, maxconn: int) -> None:
+    """Initialize the ThreadedConnectionPool for concurrent access."""
+    global _pool
+    if _pool is not None:
+        return
+    _pool = pool.ThreadedConnectionPool(minconn, maxconn, dsn)
+    logger.info("pool_initialized", extra={"event": "pool_initialized", "min": minconn, "max": maxconn})
+
+
+def close_pool() -> None:
+    """Close the connection pool."""
+    global _pool
+    if _pool is not None:
+        _pool.closeall()
+        _pool = None
+        logger.info("pool_closed", extra={"event": "pool_closed"})
 
 
 class ConnectionWrapper:
@@ -74,11 +98,46 @@ def connect() -> ConnectionWrapper:
 
 
 def get_conn() -> ConnectionWrapper:
-    """Return the shared connection. Raises if not yet opened."""
+    """Return the best available connection.
+
+    Priority:
+    1. Request-scoped pooled connection (set by middleware during HTTP requests)
+    2. Shared global connection (for CLI scripts, jobs, tests)
+    """
+    req = _request_conn.get()
+    if req is not None:
+        return req
     if _conn is None or _conn.closed:
         raise RuntimeError("DB not connected - call app.db.connection.connect() first")
     return _conn
 
+
+# ---------------------------------------------------------------------------
+# Request-scoped connection lifecycle (used by middleware)
+# ---------------------------------------------------------------------------
+
+def acquire_request_conn() -> None:
+    """Acquire a pooled connection and bind it to the current request context."""
+    if _pool is None:
+        return  # no pool → fall back to shared conn via get_conn()
+    raw = _pool.getconn()
+    raw.autocommit = True
+    _request_conn.set(ConnectionWrapper(raw))
+
+
+def release_request_conn() -> None:
+    """Return the request-scoped connection to the pool."""
+    if _pool is None:
+        return
+    wrapper = _request_conn.get()
+    if wrapper is not None:
+        _pool.putconn(wrapper.raw)
+        _request_conn.set(None)
+
+
+# ---------------------------------------------------------------------------
+# Standalone helpers
+# ---------------------------------------------------------------------------
 
 def close() -> None:
     """Close the shared connection."""
@@ -93,20 +152,25 @@ def reset() -> None:
     """Force-clear the connection reference (for test isolation)."""
     global _conn
     _conn = None
+    _request_conn.set(None)
 
 
 @contextmanager
 def get_db():
-    """Context manager that gets a connection from the pool, commits on success, rolls back on error."""
+    """Context manager: per-request pooled connection. Autocommit for consistency with shared conn.
+
+    Usage from FastAPI endpoints that need concurrency-safe DB access:
+        with get_db() as conn:
+            conn.execute(...)
+    Falls back to the shared connection if pool is not initialized (tests, CLI scripts).
+    """
     if _pool is None:
-        raise RuntimeError("Connection pool not initialized")
+        yield get_conn()
+        return
     raw = _pool.getconn()
+    raw.autocommit = True
     try:
         yield ConnectionWrapper(raw)
-        raw.commit()
-    except Exception:
-        raw.rollback()
-        raise
     finally:
         _pool.putconn(raw)
 

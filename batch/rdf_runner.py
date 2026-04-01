@@ -51,6 +51,7 @@ def run_rdf_batch(
     use_vpn: bool | None = None,
     concurrency: int | None = None,
     delay: float | None = None,
+    download_delay: float | None = None,
     page_size: int | None = None,
     dsn: str | None = None,
 ) -> None:
@@ -59,6 +60,7 @@ def run_rdf_batch(
     _vpn = use_vpn if use_vpn is not None else settings.batch_use_vpn
     _concurrency = concurrency if concurrency is not None else settings.rdf_batch_concurrency
     _delay = delay if delay is not None else settings.rdf_batch_delay_seconds
+    _dl_delay = download_delay if download_delay is not None else settings.rdf_batch_download_delay
     _page_size = page_size if page_size is not None else settings.rdf_batch_page_size
     _db = dsn if dsn is not None else settings.database_url
 
@@ -67,8 +69,9 @@ def run_rdf_batch(
 
     logger.info(
         "rdf_batch_start workers=%d vpn=%s concurrency=%d delay=%.1f "
-        "page_size=%d db=%s storage_backend=%s",
-        _workers, _vpn, _concurrency, _delay, _page_size, _db, settings.storage_backend,
+        "download_delay=%.1f page_size=%d db=%s storage_backend=%s",
+        _workers, _vpn, _concurrency, _delay, _dl_delay, _page_size, _db,
+        settings.storage_backend,
     )
 
     processes: list[multiprocessing.Process] = []
@@ -83,6 +86,7 @@ def run_rdf_batch(
                 connection=conn,
                 concurrency=_concurrency,
                 delay=_delay,
+                download_delay=_dl_delay,
                 page_size=_page_size,
                 dsn=_db,
             ),
@@ -143,7 +147,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--delay", type=float, default=None,
-        help=f"Delay between requests in seconds (default: {settings.rdf_batch_delay_seconds})",
+        help=f"Delay between discovery requests in seconds (default: {settings.rdf_batch_delay_seconds})",
+    )
+    parser.add_argument(
+        "--download-delay", type=float, default=None,
+        help=f"Delay between download requests in seconds (default: {settings.rdf_batch_download_delay})",
     )
     parser.add_argument(
         "--page-size", type=int, default=None,
@@ -175,6 +183,7 @@ def main() -> None:
         use_vpn=use_vpn,
         concurrency=args.concurrency,
         delay=args.delay,
+        download_delay=args.download_delay,
         page_size=args.page_size,
         dsn=args.db,
     )

@@ -387,6 +387,7 @@ async def _worker_loop(
     connection: Connection,
     concurrency: int,
     delay: float,
+    download_delay: float,
     page_size: int,
     dsn: str,
 ) -> None:
@@ -483,15 +484,21 @@ async def _worker_loop(
                 else:
                     stats.krs_errors += 1
 
-            # Phase 2: Download undownloaded documents
+            # Phase 2: Download undownloaded documents (parallel within KRS)
             try:
                 undownloaded = doc_store.get_undownloaded(krs)
-                for doc_id in undownloaded:
-                    async with sem:
-                        await _download_one_document(
-                            client, krs, doc_id, doc_store, storage,
-                            delay, worker_id, stats,
-                        )
+                if undownloaded:
+                    async def _dl_one(doc_id: str) -> None:
+                        async with sem:
+                            await _download_one_document(
+                                client, krs, doc_id, doc_store, storage,
+                                download_delay, worker_id, stats,
+                            )
+
+                    await asyncio.gather(
+                        *(_dl_one(did) for did in undownloaded),
+                        return_exceptions=True,
+                    )
             except Exception as exc:
                 logger.warning(
                     "rdf_worker=%d krs=%s download_phase_error %s: %s",
@@ -535,6 +542,7 @@ def run_rdf_worker(
     connection: Connection,
     concurrency: int,
     delay: float,
+    download_delay: float,
     page_size: int,
     dsn: str,
 ) -> None:
@@ -545,9 +553,9 @@ def run_rdf_worker(
     )
     logger.info(
         "rdf_worker=%d starting total_workers=%d connection=%s concurrency=%d "
-        "delay=%.1f page_size=%d storage_backend=%s",
+        "delay=%.1f download_delay=%.1f page_size=%d storage_backend=%s",
         worker_id, total_workers, connection.name, concurrency, delay,
-        page_size, settings.storage_backend,
+        download_delay, page_size, settings.storage_backend,
     )
     asyncio.run(
         _worker_loop(
@@ -556,6 +564,7 @@ def run_rdf_worker(
             connection=connection,
             concurrency=concurrency,
             delay=delay,
+            download_delay=download_delay,
             page_size=page_size,
             dsn=dsn,
         )

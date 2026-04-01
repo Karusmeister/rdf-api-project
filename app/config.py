@@ -46,14 +46,38 @@ class Settings(BaseSettings):
     batch_concurrency_per_worker: int = 3
     batch_delay_seconds: float = 2.5
     # --- RDF Batch document discovery ---
-    rdf_batch_concurrency: int = 3
-    rdf_batch_delay_seconds: float = 1.5
-    rdf_batch_page_size: int = 100        # max docs per page to minimize pagination
+    rdf_batch_concurrency: int = 5
+    rdf_batch_delay_seconds: float = 1.5   # delay for discovery (encrypted search)
+    rdf_batch_download_delay: float = 0.3  # delay for metadata + ZIP download (lighter endpoints)
+    rdf_batch_page_size: int = 100         # max docs per page to minimize pagination
 
     # NordVPN SOCKS5 credentials (only used when batch_use_vpn=true)
     nordvpn_username: str = ""
     nordvpn_password: str = ""
     nordvpn_servers: list[str] = []
+
+    # --- Auth ---
+    jwt_secret: str = "change-me-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 1440  # 24 hours
+    google_client_id: str = ""
+    verification_code_expire_minutes: int = 15
+    verification_email_mode: str = "log"  # 'log' (dev) or 'smtp' (prod)
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "noreply@example.com"
+    environment: str = "local"  # 'local', 'staging', 'production'
+
+    def validate_jwt_secret(self) -> None:
+        if self.environment != "local" and self.jwt_secret == "change-me-in-production":
+            raise ValueError(
+                "JWT_SECRET must be set to a non-default value outside local dev. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        if len(self.jwt_secret.encode()) < 32 and self.environment != "local":
+            raise ValueError("JWT_SECRET must be at least 32 bytes for HMAC-SHA256")
 
     # --- Scraper ---
 

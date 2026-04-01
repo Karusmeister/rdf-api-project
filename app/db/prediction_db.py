@@ -9,6 +9,12 @@ from app.db import connection as shared_conn
 _schema_initialized = False
 
 
+def _cursor_to_dicts(cursor) -> list[dict]:
+    """Convert cursor rows to list of dicts using cursor.description column names."""
+    cols = [desc[0] for desc in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
 def connect() -> None:
     """Ensure shared connection is open and prediction schema exists."""
     shared_conn.connect()
@@ -261,6 +267,45 @@ def _init_schema() -> None:
         )
     """)
 
+    # ----- Auth tables -----
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id              VARCHAR PRIMARY KEY,
+            email           VARCHAR NOT NULL UNIQUE,
+            name            VARCHAR,
+            auth_method     VARCHAR(20) NOT NULL,
+            password_hash   VARCHAR,
+            is_verified     BOOLEAN DEFAULT false,
+            has_full_access BOOLEAN DEFAULT false,
+            is_active       BOOLEAN DEFAULT true,
+            created_at      TIMESTAMP DEFAULT current_timestamp,
+            last_login_at   TIMESTAMP
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS verification_codes (
+            id              VARCHAR PRIMARY KEY,
+            user_id         VARCHAR NOT NULL REFERENCES users(id),
+            code            VARCHAR(6) NOT NULL,
+            purpose         VARCHAR(20) NOT NULL,
+            expires_at      TIMESTAMP NOT NULL,
+            used_at         TIMESTAMP,
+            created_at      TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_krs_access (
+            user_id         VARCHAR NOT NULL REFERENCES users(id),
+            krs             VARCHAR(10) NOT NULL,
+            granted_at      TIMESTAMP DEFAULT current_timestamp,
+            granted_by      VARCHAR,
+            PRIMARY KEY (user_id, krs)
+        )
+    """)
+
     # Indexes (check existing first to stay idempotent)
     existing = {
         row[0]
@@ -283,6 +328,8 @@ def _init_schema() -> None:
         ("idx_assess_jobs_krs",     "CREATE INDEX idx_assess_jobs_krs ON assessment_jobs(krs)"),
         ("idx_etl_attempts_doc",    "CREATE INDEX idx_etl_attempts_doc ON etl_attempts(document_id)"),
         ("idx_etl_attempts_status", "CREATE INDEX idx_etl_attempts_status ON etl_attempts(status)"),
+        ("idx_verification_user",   "CREATE INDEX idx_verification_user ON verification_codes(user_id, purpose)"),
+        ("idx_user_krs",            "CREATE INDEX idx_user_krs ON user_krs_access(user_id)"),
     ]
 
     for name, sql in index_defs:
@@ -977,6 +1024,121 @@ def get_prediction_history(krs: str) -> list[dict]:
     return results
 
 
+# --- Fat queries for predictions API (PKR-64) ---
+
+def get_predictions_fat(krs: str) -> list[dict]:
+    """Single JOINed query returning all prediction data for a KRS number."""
+    conn = get_conn()
+    cur = conn.execute("""
+        SELECT
+            p.raw_score, p.probability, p.classification, p.risk_category,
+            p.feature_contributions, p.created_at AS scored_at,
+            mr.id AS model_id, mr.name AS model_name, mr.model_type,
+            mr.version AS model_version, mr.is_baseline, mr.description AS model_description,
+            mr.hyperparameters, mr.feature_set_id,
+            fr.id AS report_id, fr.fiscal_year, fr.period_start, fr.period_end,
+            fr.report_version, fr.data_source_id, fr.created_at AS ingested_at
+        FROM predictions p
+        JOIN prediction_runs pr ON pr.id = p.prediction_run_id
+        JOIN model_registry mr ON mr.id = pr.model_id
+        JOIN financial_reports fr ON fr.id = p.report_id
+        WHERE p.krs = %s AND mr.is_active = true
+        ORDER BY p.created_at DESC
+    """, [krs])
+    results = _cursor_to_dicts(cur)
+    for d in results:
+        for key in ("scored_at", "ingested_at", "period_start", "period_end"):
+            d[key] = str(d[key]) if d[key] else None
+        if isinstance(d["feature_contributions"], str):
+            d["feature_contributions"] = json.loads(d["feature_contributions"])
+        if isinstance(d["hyperparameters"], str):
+            d["hyperparameters"] = json.loads(d["hyperparameters"])
+    return results
+
+
+def get_features_for_report(report_id: str, feature_set_id: str) -> list[dict]:
+    """Get computed features with definitions and source line items for a report."""
+    conn = get_conn()
+    cur = conn.execute("""
+        SELECT
+            cf.feature_definition_id, cf.value,
+            fd.name, fd.category, fd.formula_description, fd.required_tags,
+            fd.computation_logic
+        FROM latest_computed_features cf
+        JOIN feature_definitions fd ON fd.id = cf.feature_definition_id
+        JOIN feature_set_members fsm ON fsm.feature_definition_id = fd.id
+        WHERE cf.report_id = %s AND fsm.feature_set_id = %s AND cf.is_valid = true
+        ORDER BY fsm.ordinal
+    """, [report_id, feature_set_id])
+    results = _cursor_to_dicts(cur)
+    for d in results:
+        if isinstance(d["required_tags"], str):
+            d["required_tags"] = json.loads(d["required_tags"])
+    return results
+
+
+def get_source_line_items_for_report(report_id: str, tag_paths: list[str]) -> list[dict]:
+    """Get financial line items for specific tag paths from a report."""
+    if not tag_paths:
+        return []
+    conn = get_conn()
+    placeholders = ",".join(["%s"] * len(tag_paths))
+    cur = conn.execute(f"""
+        SELECT tag_path, label_pl, value_current, value_previous, section
+        FROM latest_financial_line_items
+        WHERE report_id = %s AND tag_path IN ({placeholders})
+    """, [report_id] + tag_paths)
+    return _cursor_to_dicts(cur)
+
+
+def get_models_with_details() -> list[dict]:
+    """Get all active models with full metadata."""
+    conn = get_conn()
+    cur = conn.execute("""
+        SELECT id, name, model_type, version, feature_set_id, description,
+               hyperparameters, is_baseline, is_active, created_at
+        FROM model_registry
+        WHERE is_active = true
+        ORDER BY is_baseline DESC, created_at DESC
+    """)
+    results = _cursor_to_dicts(cur)
+    for d in results:
+        d["created_at"] = str(d["created_at"]) if d["created_at"] else None
+        if isinstance(d["hyperparameters"], str):
+            d["hyperparameters"] = json.loads(d["hyperparameters"])
+    return results
+
+
+def get_prediction_history_fat(krs: str, model_id: str | None = None) -> list[dict]:
+    """Get prediction history with report context for charting."""
+    conn = get_conn()
+    params: list = [krs]
+    model_filter = ""
+    if model_id:
+        model_filter = "AND mr.id = %s"
+        params.append(model_id)
+    cur = conn.execute(f"""
+        SELECT
+            p.raw_score, p.probability, p.classification, p.risk_category,
+            p.feature_contributions, p.created_at AS scored_at,
+            mr.id AS model_id, mr.name AS model_name, mr.version AS model_version,
+            fr.fiscal_year, fr.period_start, fr.period_end
+        FROM predictions p
+        JOIN prediction_runs pr ON pr.id = p.prediction_run_id
+        JOIN model_registry mr ON mr.id = pr.model_id
+        JOIN financial_reports fr ON fr.id = p.report_id
+        WHERE p.krs = %s AND mr.is_active = true {model_filter}
+        ORDER BY fr.fiscal_year ASC, p.created_at DESC
+    """, params)
+    results = _cursor_to_dicts(cur)
+    for d in results:
+        for key in ("scored_at", "period_start", "period_end"):
+            d[key] = str(d[key]) if d[key] else None
+        if isinstance(d["feature_contributions"], str):
+            d["feature_contributions"] = json.loads(d["feature_contributions"])
+    return results
+
+
 # --- bankruptcy_events ---
 
 def insert_bankruptcy_event(event_id: str, krs: str, event_type: str, event_date: str,
@@ -1047,3 +1209,127 @@ def get_assessment_job(job_id: str) -> Optional[dict]:
     result["created_at"] = str(result["created_at"])
     result["updated_at"] = str(result["updated_at"])
     return result
+
+
+# --- users ---
+
+_USER_COLS = ["id", "email", "name", "auth_method", "password_hash", "is_verified",
+              "has_full_access", "is_active", "created_at", "last_login_at"]
+_USER_SELECT = "SELECT " + ", ".join(_USER_COLS) + " FROM users"
+
+
+def _row_to_user(row) -> Optional[dict]:
+    if row is None:
+        return None
+    result = dict(zip(_USER_COLS, row))
+    result["created_at"] = str(result["created_at"]) if result["created_at"] else None
+    result["last_login_at"] = str(result["last_login_at"]) if result["last_login_at"] else None
+    return result
+
+
+def create_user(user_id: str, email: str, name: Optional[str], auth_method: str,
+                password_hash: Optional[str] = None) -> None:
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    conn.execute("""
+        INSERT INTO users (id, email, name, auth_method, password_hash, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, [user_id, email, name, auth_method, password_hash, now])
+
+
+def get_user_by_email(email: str) -> Optional[dict]:
+    conn = get_conn()
+    row = conn.execute(f"{_USER_SELECT} WHERE email = %s", [email]).fetchone()
+    return _row_to_user(row)
+
+
+def get_user_by_id(user_id: str) -> Optional[dict]:
+    conn = get_conn()
+    row = conn.execute(f"{_USER_SELECT} WHERE id = %s", [user_id]).fetchone()
+    return _row_to_user(row)
+
+
+def update_last_login(user_id: str) -> None:
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    conn.execute("UPDATE users SET last_login_at = %s WHERE id = %s", [now, user_id])
+
+
+def verify_user(user_id: str) -> None:
+    conn = get_conn()
+    conn.execute("UPDATE users SET is_verified = true WHERE id = %s", [user_id])
+
+
+def delete_unverified_user(user_id: str) -> None:
+    """Remove an unverified user and associated verification codes (signup compensation)."""
+    conn = get_conn()
+    conn.execute("DELETE FROM verification_codes WHERE user_id = %s", [user_id])
+    conn.execute("DELETE FROM users WHERE id = %s AND is_verified = false", [user_id])
+
+
+# --- verification_codes ---
+
+def create_verification_code(user_id: str, code: str, purpose: str, expires_at) -> str:
+    import uuid as _uuid
+    code_id = str(_uuid.uuid4())
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    conn.execute("""
+        INSERT INTO verification_codes (id, user_id, code, purpose, expires_at, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, [code_id, user_id, code, purpose, expires_at, now])
+    return code_id
+
+
+def consume_verification_code(user_id: str, code: str, purpose: str) -> bool:
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    row = conn.execute("""
+        UPDATE verification_codes
+        SET used_at = %s
+        WHERE id = (
+            SELECT id FROM verification_codes
+            WHERE user_id = %s AND code = %s AND purpose = %s
+              AND used_at IS NULL AND expires_at > %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id
+    """, [now, user_id, code, purpose, now]).fetchone()
+    return row is not None
+
+
+# --- user_krs_access ---
+
+def get_user_krs_access(user_id: str) -> list[str]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT krs FROM user_krs_access WHERE user_id = %s ORDER BY krs", [user_id]
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def grant_krs_access(user_id: str, krs: str, granted_by: Optional[str] = None) -> None:
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    conn.execute("""
+        INSERT INTO user_krs_access (user_id, krs, granted_at, granted_by)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (user_id, krs) DO NOTHING
+    """, [user_id, krs, now, granted_by])
+
+
+def check_krs_access(user_id: str, krs: str) -> bool:
+    conn = get_conn()
+    # Check has_full_access first
+    row = conn.execute(
+        "SELECT has_full_access FROM users WHERE id = %s", [user_id]
+    ).fetchone()
+    if row and row[0]:
+        return True
+    # Check specific KRS grant
+    row = conn.execute(
+        "SELECT 1 FROM user_krs_access WHERE user_id = %s AND krs = %s", [user_id, krs]
+    ).fetchone()
+    return row is not None

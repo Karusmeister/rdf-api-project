@@ -14,3 +14,7 @@ apscheduler>=3.10,<4
 pandas>=2.2
 google-cloud-storage>=2.18
 google-auth>=2.27,<2.35  # >=2.35 uses HTTPS metadata endpoint, breaks on GCE without mTLS
+pyjwt>=2.8
+bcrypt>=4.0
+email-validator>=2.1
+slowapi>=0.1.9

@@ -150,6 +150,11 @@ Most useful settings from [`.env.example`](/Users/piotrkraus/piotr/rdf-api-proje
 | `STORAGE_LOCAL_PATH` | `data/documents` | Extracted document root |
 | `SCRAPER_ORDER_STRATEGY` | `priority_then_oldest` | KRS scheduling strategy |
 | `SCRAPER_MAX_KRS_PER_RUN` | `0` | `0` means unlimited |
+| `ENVIRONMENT` | `local` | `local`, `staging`, or `production` |
+| `JWT_SECRET` | `change-me-in-production` | **Required** in staging/prod (>=32 bytes). Generate: `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `JWT_EXPIRE_MINUTES` | `1440` | JWT token lifetime (24h default) |
+| `GOOGLE_CLIENT_ID` | _(empty)_ | Google OAuth2 client ID for SSO |
+| `VERIFICATION_EMAIL_MODE` | `log` | `log` (dev, prints code) or `smtp` (sends real email) |
 
 ## Data Layout
 

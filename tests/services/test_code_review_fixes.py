@@ -23,7 +23,8 @@ from app.db import connection as db_conn
 from app.db import prediction_db
 from app.scraper import db as scraper_db
 from app.scraper.storage import LocalStorage
-from app.services import etl
+from app.services import etl, feature_engine
+from scripts.seed_features import FEATURE_DEFINITIONS, FEATURE_SETS
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -139,6 +140,25 @@ class TestSharedConnection:
 # ---------------------------------------------------------------------------
 
 class TestETLRouteAfterStartup:
+    @staticmethod
+    def _seed_feature_catalog():
+        for fdef in FEATURE_DEFINITIONS:
+            prediction_db.upsert_feature_definition(
+                feature_id=fdef["id"],
+                name=fdef["name"],
+                description=fdef.get("description"),
+                category=fdef.get("category"),
+                formula_description=fdef.get("formula_description"),
+                formula_numerator=fdef.get("formula_numerator"),
+                formula_denominator=fdef.get("formula_denominator"),
+                required_tags=fdef.get("required_tags"),
+                computation_logic=fdef.get("computation_logic", "ratio"),
+            )
+        for set_id, info in FEATURE_SETS.items():
+            prediction_db.upsert_feature_set(set_id, info["name"], info.get("description"))
+            for ordinal, member_id in enumerate(info["members"], start=1):
+                prediction_db.add_feature_set_member(set_id, member_id, ordinal)
+
     @pytest.fixture
     def anyio_backend(self):
         return "asyncio"
@@ -170,6 +190,11 @@ class TestETLRouteAfterStartup:
         monkeypatch.setattr(rdf_client, "stop", noop_start)
         monkeypatch.setattr(rdf_client, "_client", object())
 
+        # Ensure DB-backed routes can run even when app lifespan is not exercised.
+        db_conn.connect()
+        scraper_db.connect()
+        prediction_db.connect()
+
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
             yield ac
 
@@ -192,6 +217,78 @@ class TestETLRouteAfterStartup:
         """POST /api/etl/ingest with unknown document_id returns 404, not 500."""
         resp = await api_client.post("/api/etl/ingest", json={"document_id": "nonexistent"})
         assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_dataset_stats_requires_feature_set(self, api_client):
+        resp = await api_client.get("/api/etl/training/dataset-stats")
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_dataset_stats_unknown_feature_set_returns_404(self, api_client):
+        resp = await api_client.get(
+            "/api/etl/training/dataset-stats",
+            params={"feature_set": "does_not_exist"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_dataset_stats_empty_schema_is_stable(self, api_client):
+        self._seed_feature_catalog()
+
+        resp = await api_client.get(
+            "/api/etl/training/dataset-stats",
+            params={"feature_set": "maczynska_6"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["row_count"] == 0
+        assert body["single_year_companies"] == 0
+        assert body["unique_companies"] == 0
+        assert body["year_range"] == []
+
+    @pytest.mark.asyncio
+    async def test_dataset_stats_returns_200_with_expected_keys(self, api_client):
+        self._seed_feature_catalog()
+
+        krs = "0000011111"
+        report_id = "dataset-stats-rpt"
+        prediction_db.upsert_company(krs=krs, pkd_code="62.01.Z")
+        prediction_db.create_financial_report(
+            report_id=report_id,
+            krs=krs,
+            fiscal_year=2023,
+            period_start="2023-01-01",
+            period_end="2023-12-31",
+        )
+        prediction_db.update_report_status(report_id, "completed")
+        prediction_db.batch_insert_line_items([
+            {"report_id": report_id, "section": "RZiS", "tag_path": "RZiS.I", "value_current": 200000},
+            {"report_id": report_id, "section": "CF", "tag_path": "CF.A_II_1", "value_current": 50000},
+            {"report_id": report_id, "section": "Bilans", "tag_path": "Pasywa_B", "value_current": 500000},
+            {"report_id": report_id, "section": "Bilans", "tag_path": "Aktywa", "value_current": 1000000},
+            {"report_id": report_id, "section": "RZiS", "tag_path": "RZiS.A", "value_current": 2000000},
+            {"report_id": report_id, "section": "Bilans", "tag_path": "Aktywa_B_I", "value_current": 100000},
+        ])
+        feature_engine.compute_features_for_report(report_id, feature_set_id="maczynska_6")
+
+        resp = await api_client.get(
+            "/api/etl/training/dataset-stats",
+            params={"feature_set": "maczynska_6"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["feature_set_id"] == "maczynska_6"
+        assert body["row_count"] == 1
+        assert body["feature_count"] == 6
+        for key in (
+            "class_balance",
+            "missing_pct",
+            "high_missing_features",
+            "single_year_companies",
+            "unique_companies",
+            "year_range",
+        ):
+            assert key in body
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,8 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from app import krs_client, rdf_client
 from app.adapters.ms_gov import MsGovKrsAdapter
@@ -26,6 +28,10 @@ from app.routers.analysis import router as analysis_router
 from app.routers.scraper import router as scraper_router
 from app.routers.etl.routes import router as etl_router
 from app.routers.jobs.routes import router as jobs_router
+from app.routers.predictions import router as predictions_router
+from app.routers.auth import router as auth_router
+from app.rate_limit import limiter
+from app.services import predictions as predictions_service
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +40,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     configure_logging()
     logger.info("app_startup", extra={"event": "startup"})
+    settings.validate_jwt_secret()
     db_conn.connect()
+    db_conn.init_pool(settings.database_url, settings.db_pool_min, settings.db_pool_max)
     scraper_db.connect()
     prediction_db.connect()
     krs_repo.connect()
+    predictions_service.warm_caches()
     await rdf_client.start()
     await krs_client.start()
     register_adapter("ms_gov", MsGovKrsAdapter())
@@ -72,9 +81,12 @@ async def lifespan(app: FastAPI):
     await krs_client.stop()
     await rdf_client.stop()
     db_conn.close()
+    db_conn.close_pool()
 
 
 app = FastAPI(title="RDF API Proxy", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -88,6 +100,17 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Request / response logging middleware
 # ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def db_connection_middleware(request: Request, call_next):
+    """Acquire a per-request pooled DB connection and release it after the response."""
+    db_conn.acquire_request_conn()
+    try:
+        response = await call_next(request)
+    finally:
+        db_conn.release_request_conn()
+    return response
+
 
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
@@ -121,6 +144,8 @@ app.include_router(analysis_router)
 app.include_router(scraper_router)
 app.include_router(etl_router)
 app.include_router(jobs_router)
+app.include_router(predictions_router)
+app.include_router(auth_router)
 
 
 @app.exception_handler(httpx.HTTPStatusError)

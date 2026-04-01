@@ -12,3 +12,6 @@ dist/
 .vscode/
 
 data/
+
+# pip output artifacts from misquoted install commands (e.g. pip install foo>=1.0)
+=*
