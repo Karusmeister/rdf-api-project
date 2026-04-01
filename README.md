@@ -80,21 +80,39 @@ app/
     cli.py                Scraper CLI
     db.py                 Scraper schema and CRUD helpers
     job.py                Bulk scraping job
-    storage.py            Local extracted-file storage
+    storage.py            Storage abstraction (Local + GCS, with async_save_extracted)
   services/
     xml_parser.py         Statement parsing and comparison logic
     etl.py                XML -> PostgreSQL ingestion
     feature_engine.py     Ratio and feature computation
     predictions.py        Scoring, caching, response assembly for predictions API
+batch/
+  connections.py          Connection pool + shared VPN validation
+  worker.py               KRS entity scanner worker (async, stride-partitioned)
+  runner.py               KRS scanner multiprocessing orchestrator
+  rdf_worker.py           RDF document discovery + download (supports --skip-metadata)
+  rdf_runner.py           RDF download multiprocessing orchestrator
+  metadata_backfill.py    Metadata backfill worker (keyset-paginated batches)
+  metadata_runner.py      Metadata backfill multiprocessing orchestrator
+  rdf_document_store.py   Append-only document store for batch workers
+  rdf_progress.py         RDF discovery progress store
+  progress.py             KRS scanner progress store
+  entity_store.py         Append-only entity store for KRS scanner
 scripts/
   seed_features.py        Seeds feature definitions and feature sets
   seed_admin.py           Bootstrap admin user (--password or --google)
   quick_scan.py           Find N valid KRS entities, scrape docs, run ETL
+deploy/
+  krs-scanner.service     systemd unit for KRS scanner
+  rdf-worker.service      systemd unit for RDF download workers
+  metadata-backfill.service systemd unit for metadata backfill
+  rdf-backup.cron         Cron job for RDF backup
 tests/
   unit/integration tests plus optional networked e2e coverage
 docs/
-  RDF_API_DOCUMENTATION.md    Reverse-engineered upstream RDF API reference
-  PREDICTION_SCHEMA_DESIGN.md Prediction-layer schema reference
+  RDF_API_DOCUMENTATION.md      Reverse-engineered upstream RDF API reference
+  PREDICTION_SCHEMA_DESIGN.md   Prediction-layer schema reference
+  download_speed_up_tasks.md    Download pipeline optimization design
 ```
 
 ## Quick Start
@@ -157,6 +175,12 @@ Most useful settings from [`.env.example`](/Users/piotrkraus/piotr/rdf-api-proje
 | `JWT_EXPIRE_MINUTES` | `1440` | JWT token lifetime (24h default) |
 | `GOOGLE_CLIENT_ID` | _(empty)_ | Google OAuth2 client ID for SSO |
 | `VERIFICATION_EMAIL_MODE` | `log` | `log` (dev, prints code) or `smtp` (sends real email) |
+| `RDF_BATCH_SKIP_METADATA` | `false` | Skip metadata fetch during download (backfill later) |
+| `METADATA_BACKFILL_FETCH_BATCH_SIZE` | `500` | Rows per keyset page in metadata backfill |
+| `BATCH_USE_VPN` | `false` | Enable VPN connections for batch workers |
+| `NORDVPN_USERNAME` | _(empty)_ | NordVPN SOCKS5 username (required when VPN enabled) |
+| `NORDVPN_PASSWORD` | _(empty)_ | NordVPN SOCKS5 password (required when VPN enabled) |
+| `NORDVPN_SERVERS` | `[]` | NordVPN server hostnames (JSON list) |
 
 ## Data Layout
 
@@ -375,6 +399,38 @@ Supported scraper modes:
 - `retry_errors`
 - `specific_krs` when `--krs` is passed
 
+## Batch Processing (Production)
+
+The production VM runs three independent systemd services for high-throughput document processing:
+
+| Service | Module | Purpose |
+|---------|--------|---------|
+| `krs-scanner` | `batch.runner` | Probes KRS integers to discover valid entities |
+| `rdf-worker` | `batch.rdf_runner` | Discovers documents per KRS, downloads ZIPs to GCS |
+| `metadata-backfill` | `batch.metadata_runner` | Backfills metadata for docs downloaded with `--skip-metadata` |
+
+Recommended workflow for maximum throughput:
+
+```bash
+# 1. Fast download: skip metadata, async GCS uploads (~2-3x faster)
+python -m batch.rdf_runner --skip-metadata --workers 5 --concurrency 5
+
+# 2. Backfill metadata in parallel (lightweight GET requests)
+python -m batch.metadata_runner --workers 3 --concurrency 10 --delay 0.2
+```
+
+Both can run simultaneously — they write to different columns and never overlap. The download worker writes `is_downloaded`/storage fields; the backfill worker writes `metadata_fetched_at`/filename/flags.
+
+Key flags:
+
+| Flag | Runner | Purpose |
+|------|--------|---------|
+| `--skip-metadata` | `rdf_runner` | Skip per-doc metadata fetch (backfill later) |
+| `--no-vpn` | both | Disable VPN connections (default: VPN ON) |
+| `--workers N` | both | Number of parallel worker processes |
+| `--concurrency N` | both | Async concurrency per worker |
+| `--delay N` | both | Delay between requests (seconds) |
+
 ## Admin Setup
 
 Bootstrap an admin user to access predictions and grant KRS access to others:
@@ -435,12 +491,14 @@ Those tests live under `tests/regression/` and are kept separate from the regula
 
 ## Cloud Deployment
 
-The project runs on GCP (`rdf-api-project`, `europe-central2`). Two components:
+The project runs on GCP (`rdf-api-project`, `europe-central2`):
 
 | Component | Runs on | Deploy method |
 |-----------|---------|---------------|
 | **FastAPI app** | Cloud Run | `gcloud run deploy rdf-api --source . --region europe-central2` |
-| **Batch scrapers** | GCE VM (`rdf-batch-vm`) | `git pull` + `systemctl restart` |
+| **KRS scanner** | GCE VM (`rdf-batch-vm`) | `git pull` + `systemctl restart krs-scanner` |
+| **RDF download worker** | GCE VM (`rdf-batch-vm`) | `git pull` + `systemctl restart rdf-worker` |
+| **Metadata backfill** | GCE VM (`rdf-batch-vm`) | `git pull` + `systemctl restart metadata-backfill` |
 
 Shared persistence:
 - **Cloud SQL** (`rdf-postgres`) — PostgreSQL 16, all tables
@@ -475,3 +533,4 @@ See [`docs/CLOUD_DEPLOYMENT.md`](docs/CLOUD_DEPLOYMENT.md) for full details: arc
 - [`docs/ARCHITECTURE_REVIEW.md`](docs/ARCHITECTURE_REVIEW.md) — Full architecture review with diagrams, assessment, and recommendations
 - [`docs/RDF_API_DOCUMENTATION.md`](docs/RDF_API_DOCUMENTATION.md) — Upstream RDF API contract
 - [`docs/PREDICTION_SCHEMA_DESIGN.md`](docs/PREDICTION_SCHEMA_DESIGN.md) — Prediction schema and lineage model
+- [`docs/download_speed_up_tasks.md`](docs/download_speed_up_tasks.md) — Download pipeline optimization design

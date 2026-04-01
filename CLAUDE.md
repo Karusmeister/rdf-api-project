@@ -46,6 +46,7 @@ Decision comments should be short: what was decided, why, and what alternatives 
 - `docs/PREDICTION_SCHEMA_DESIGN.md` - prediction schema and lineage design (Layer 1 updated: `data_sources`/`company_identifiers` removed)
 - `docs/KRS_OPEN_API.md` - official MS KRS Open API reference (endpoints, response structure, GDPR)
 - `docs/KRS_SYNC_RUNBOOK.md` - operational runbook for KRS sync pipeline
+- `docs/download_speed_up_tasks.md` - download pipeline optimization design (--skip-metadata, async GCS, metadata backfill)
 
 ## Tech stack
 
@@ -127,11 +128,11 @@ app/
     cli.py             - Scraper CLI (import-krs, import-range, run, status)
     db.py              - PostgreSQL schema + CRUD for scraper tables
     job.py             - Scraper job logic
-    storage.py         - Document storage abstraction
+    storage.py         - Document storage abstraction (Local + GCS, with async_save_extracted)
 batch/
   __init__.py          - Package marker
   __main__.py          - `python -m batch` entrypoint
-  connections.py       - Connection dataclass + NordVPN SOCKS5 pool builder
+  connections.py       - Connection dataclass, NordVPN SOCKS5 pool builder, shared validate_vpn_config()
   progress.py          - PostgreSQL-backed progress store (batch_progress table)
   entity_store.py      - Append-only entity store for batch scanner
   rdf_document_store.py - Append-only document store for batch RDF worker
@@ -157,6 +158,11 @@ tests/
   krs/                 - KRS adapter, client, sync pipeline, scanner, monitoring
   e2e/                 - End-to-end tests against live APIs (--e2e flag required)
   regression/          - Live API regression tests (--e2e flag required)
+deploy/
+  krs-scanner.service    - systemd unit for KRS batch scanner
+  rdf-worker.service     - systemd unit for RDF document download worker
+  metadata-backfill.service - systemd unit for metadata backfill worker
+  rdf-backup.cron        - Cron job for RDF backup
 data/
   documents/           - Extracted RDF files + manifest.json
 ```
@@ -372,6 +378,11 @@ python -m batch.metadata_runner --workers 3 --concurrency 10 --delay 0.2
 11. JWT_SECRET must be >=32 bytes in staging/production — app refuses to start otherwise
 12. Auth endpoints are rate-limited via slowapi (signup 5/min, verify 10/min, grant-access 20/min)
 13. `get_conn()` returns per-request pooled connection during HTTP requests, shared connection in scripts/tests
+14. `--skip-metadata` is off by default — download workers fetch metadata unless explicitly skipped. Use `metadata_runner` to backfill later
+15. Metadata backfill uses keyset pagination (`(krs, document_id)` cursor) — memory stays O(batch_size) regardless of backlog
+16. VPN is ON by default for `metadata_runner` unless `--no-vpn` is passed. VPN config is validated before spawning workers (fail-fast)
+17. `async_save_extracted()` on storage classes runs sync I/O in `run_in_executor` — keeps the event loop unblocked during GCS uploads
+18. `batch/connections.py` has shared `validate_vpn_config()` — used by both `rdf_runner` and `metadata_runner`
 
 ## Keeping docs current
 
