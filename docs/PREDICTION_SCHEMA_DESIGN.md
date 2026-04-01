@@ -6,21 +6,24 @@
 2. **Model agnostic** - Feature definitions are metadata, not hardcoded columns. Adding a new model = inserting rows, not ALTER TABLE.
 3. **EAV for features, wide-format via PIVOT for training** - Store flexibly, query efficiently.
 4. **Separate raw from computed** - Raw XML extractions preserved immutably; computed features are reproducible and versioned.
-5. **DuckDB throughout** - Extends the existing scraper DB. Columnar storage is ideal for analytical queries over financial data. No need for a separate PostgreSQL instance.
+5. **PostgreSQL throughout** - All tables live in the shared PostgreSQL database alongside scraper tables. Per-request pooled connections via `ContextVar` middleware.
 6. **Append-only analytical facts** - Source filings, ETL extractions, and computed features are insert-only. Current-state reads come from “latest” views, not destructive overwrites.
 
 ## Relationship to Existing System
 
-The existing DuckDB database (`data/scraper.duckdb`) already has `krs_registry`, `krs_documents`, and `scraper_runs`. We extend this same database with new tables for the prediction pipeline. The `krs_registry.krs` field is the natural join key between scraper and prediction layers.
+The shared PostgreSQL database already has `krs_registry`, `krs_documents`, and `scraper_runs`. We extend this same database with new tables for the prediction pipeline. The `krs_registry.krs` field is the natural join key between scraper and prediction layers.
 
 ```
 [RDF API] --> [Scraper] --> [krs_registry + krs_documents (existing)]
                                      |
                                      v
-                            [ETL: XML Parser] --> [New tables in same DuckDB]
+                            [ETL: XML Parser] --> [Prediction tables in PostgreSQL]
                                                         |
                                                         v
                                                 [Feature Engine] --> [Model Training/Scoring]
+                                                                            |
+                                                                            v
+                                                                    [Predictions API] <-- [Auth: JWT + KRS access control]
 ```
 
 `krs_registry` and `scraper_runs` remain operational control-plane tables for scheduling and monitoring. The append-only requirement applies to analytical source data and derived data, where auditability and reproducibility matter most.
@@ -296,15 +299,56 @@ CREATE INDEX IF NOT EXISTS idx_bankruptcy_krs ON bankruptcy_events(krs);
 CREATE INDEX IF NOT EXISTS idx_bankruptcy_date ON bankruptcy_events(event_date);
 ```
 
+### Layer 6: Auth & Access Control
+
+```sql
+-- User accounts (local email/password or Google SSO)
+CREATE TABLE IF NOT EXISTS users (
+    id              VARCHAR PRIMARY KEY,
+    email           VARCHAR NOT NULL UNIQUE,
+    name            VARCHAR,
+    auth_method     VARCHAR(20) NOT NULL,       -- 'local' or 'google'
+    password_hash   VARCHAR,                    -- bcrypt, NULL for Google SSO users
+    is_verified     BOOLEAN DEFAULT false,
+    has_full_access BOOLEAN DEFAULT false,      -- admin: bypasses per-KRS checks
+    is_active       BOOLEAN DEFAULT true,
+    created_at      TIMESTAMP DEFAULT current_timestamp,
+    last_login_at   TIMESTAMP
+);
+
+-- 6-digit email verification codes with expiry
+CREATE TABLE IF NOT EXISTS verification_codes (
+    id              VARCHAR PRIMARY KEY,
+    user_id         VARCHAR NOT NULL REFERENCES users(id),
+    code            VARCHAR(6) NOT NULL,
+    purpose         VARCHAR(20) NOT NULL,       -- 'email_verify'
+    expires_at      TIMESTAMP NOT NULL,
+    used_at         TIMESTAMP,                  -- atomic consume via UPDATE...RETURNING
+    created_at      TIMESTAMP DEFAULT current_timestamp
+);
+
+-- Per-user KRS access grants (predictions API gate)
+CREATE TABLE IF NOT EXISTS user_krs_access (
+    user_id         VARCHAR NOT NULL REFERENCES users(id),
+    krs             VARCHAR(10) NOT NULL,
+    granted_at      TIMESTAMP DEFAULT current_timestamp,
+    granted_by      VARCHAR,                    -- admin user_id who granted
+    PRIMARY KEY (user_id, krs)
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_user ON verification_codes(user_id, purpose);
+CREATE INDEX IF NOT EXISTS idx_user_krs ON user_krs_access(user_id);
+```
+
 ---
 
 ## Key Queries for ML Consumption
 
-### Wide-format training data (using DuckDB PIVOT)
+### Wide-format training data (pivot query)
 
 ```sql
 -- Build feature matrix: one row per (krs, fiscal_year), columns = feature codes
--- DuckDB's PIVOT makes this clean without manual CASE WHEN
+-- Uses crosstab or application-level pivot (pandas) for wide format
 WITH feature_data AS (
     SELECT
         cf.krs,

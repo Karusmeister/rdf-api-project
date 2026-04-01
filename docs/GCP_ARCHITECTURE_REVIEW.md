@@ -12,7 +12,7 @@
 | Entities with RDF docs discovered | 1,461 |
 | Documents discovered | 35,454 |
 | Documents downloaded | 264 |
-| DuckDB file size | 253 MB |
+| PostgreSQL data size | ~253 MB |
 | Extracted documents on disk | 168 MB |
 
 The scanning is ~70% complete (708K of ~1M KRS integers). Document discovery has barely started (1,461 of 315K entities). Downloads are negligible (264 of 35K). **The heavy work is ahead** — this is the right time to move to cloud before the dataset grows by 100x+.
@@ -30,28 +30,28 @@ The scanning is ~70% complete (708K of ~1M KRS integers). Document discovery has
 | **Append-only versioning** | Ready | Entity and document stores use snapshot hashing. No data loss on reruns. |
 | **Progress tracking** | Ready | `batch_progress` and `batch_rdf_progress` tables enable resume from any point. |
 | **Stride partitioning** | Ready | Workers divide work by modulo. Adding/removing workers is safe. |
-| **Lock contention handling** | Ready | DuckDB file lock retry with exponential backoff + jitter (20 retries). |
+| **PostgreSQL** | Ready | Migrated from DuckDB. Shared DB with connection pool + per-request ContextVar middleware. |
+| **Auth + access control** | Ready | JWT auth, Google SSO, per-KRS access grants, rate limiting (slowapi). |
+| **Predictions API** | Ready | Per-KRS scores, feature detail, history. Auth-gated. |
 | **Dockerfile** | Partial | Exists but minimal — no health check, runs as root, single stage. |
-| **Storage abstraction** | Partial | `StorageBackend` protocol exists, `LocalStorage` works, GCS is a stub. |
+| **Storage abstraction** | Ready | `StorageBackend` protocol, `LocalStorage`, and `GcsStorage` all implemented. |
 
 ### What Needs Work Before Cloud
 
 | Area | Effort | Blocker? | Notes |
 |------|--------|----------|-------|
-| **GCS storage backend** | 2-3 hours | **Yes** for RDF downloads | `create_storage()` raises `NotImplementedError` for GCS. Must implement. |
+| **GCS storage backend** | Done | ~~Blocker~~ | `GcsStorage` implemented and tested. |
 | **Dockerfile hardening** | 1 hour | No (works as-is) | Add non-root user, health check, `.dockerignore`, multi-stage build. |
 | **Cloud Logging integration** | 1 hour | No | Workers log to stdout — Cloud Run/GCE captures this automatically. Minor formatting changes for structured JSON logs. |
-| **DB migration to cloud** | 2-3 hours | **Yes** | Upload local DuckDB to GCS, download to VM on startup. Script needed. |
-| **Secrets management** | 30 min | No | Use GCP Secret Manager for NordVPN creds (if VPN used in cloud). Env vars work initially. |
+| **DB migration to cloud** | 1 hour | **Yes** | `pg_dump` / `pg_restore` to move PostgreSQL data to cloud VM. |
+| **Secrets management** | 30 min | No | JWT_SECRET required in production (>=32 bytes). Use GCP Secret Manager or env vars. |
 
 ### Architecture Risks
 
-#### 1. DuckDB File Locking in Multi-Worker Setup
-**Risk: Medium** — DuckDB uses exclusive file-level locks. Multiple worker processes on one VM contend for writes.
+#### 1. PostgreSQL Connection Concurrency
+**Risk: Low** — PostgreSQL handles concurrent connections natively. The app uses a `ThreadedConnectionPool` with per-request `ContextVar` middleware, so each HTTP request gets its own connection.
 
-**Current mitigation:** Short-lived connections with retry backoff. Works locally with 4 workers.
-
-**Cloud impact:** Same pattern works on a single VM. Does NOT work across multiple VMs/containers sharing a network filesystem. Keep all workers on one VM.
+**Cloud impact:** No contention issues. Pool size (`DB_POOL_MIN`/`DB_POOL_MAX`) may need tuning under high API load.
 
 #### 2. Document Storage at Scale
 **Risk: Low** — 315K entities × ~25 docs average = ~8M documents. At ~50KB average ZIP, that's ~400GB of extracted files.

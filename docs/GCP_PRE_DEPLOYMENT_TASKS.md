@@ -83,7 +83,7 @@ USER worker
 
 # Health check (optional — useful if managed by systemd)
 HEALTHCHECK --interval=60s --timeout=5s \
-  CMD python -c "import duckdb; duckdb.connect('/data/scraper.duckdb', read_only=True).close()"
+  CMD python -c "import psycopg2; psycopg2.connect('postgresql://rdf:rdf_prod@localhost:5432/rdf').close()"
 
 # Default: run KRS scanner
 CMD ["python", "-m", "batch.runner"]
@@ -192,39 +192,33 @@ Key flags:
 
 ## Phase 3: Database Migration (local → cloud)
 
-### Task 8: Upload Local DuckDB to Cloud
+### Task 8: Migrate Local PostgreSQL to Cloud
 **Priority:** Blocker
 **Effort:** 30 minutes
 
-This carries your 315K entities, 35K document metadata, and 708K progress records to the cloud VM.
+This carries your entities, document metadata, and progress records to the cloud VM.
 
 ```bash
-# Step 1: On your Mac — upload to GCS
-CLOUDSDK_ACTIVE_CONFIG=rdf-project gsutil cp data/scraper.duckdb gs://rdf-project-data/seed/scraper.duckdb
+# Step 1: On your Mac — dump and upload to GCS
+pg_dump -U rdf rdf | gzip > /tmp/rdf-seed.sql.gz
+CLOUDSDK_ACTIVE_CONFIG=rdf-project gsutil cp /tmp/rdf-seed.sql.gz gs://rdf-project-data/seed/rdf-seed.sql.gz
 
-# Step 2: On the VM — download
+# Step 2: On the VM — install PostgreSQL, download and restore
 CLOUDSDK_ACTIVE_CONFIG=rdf-project gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --command="
-  gsutil cp gs://rdf-project-data/seed/scraper.duckdb /data/scraper.duckdb
-  ls -lh /data/scraper.duckdb
+  sudo apt-get install -y postgresql postgresql-client
+  sudo -u postgres createuser rdf && sudo -u postgres createdb -O rdf rdf
+  gsutil cp gs://rdf-project-data/seed/rdf-seed.sql.gz /tmp/rdf-seed.sql.gz
+  gunzip -c /tmp/rdf-seed.sql.gz | psql -U rdf rdf
 "
 
 # Step 3: Verify data integrity on VM
 CLOUDSDK_ACTIVE_CONFIG=rdf-project gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --command="
-  cd /opt/rdf-api-project && source .venv/bin/activate && python3 -c \"
-import duckdb
-c = duckdb.connect('/data/scraper.duckdb', read_only=True)
-for t in ['batch_progress','krs_entities','krs_documents']:
-    print(f'{t}: {c.execute(f\"SELECT COUNT(*) FROM {t}\").fetchone()[0]:,}')
-c.close()
-\"
+  psql -U rdf rdf -c \"
+    SELECT 'batch_progress', COUNT(*) FROM batch_progress
+    UNION ALL SELECT 'krs_entities_current', COUNT(*) FROM krs_entities_current
+    UNION ALL SELECT 'krs_documents_current', COUNT(*) FROM krs_documents_current;
+  \"
 "
-```
-
-**Expected output:**
-```
-batch_progress: 708,163
-krs_entities: 315,816
-krs_documents: 35,485
 ```
 
 ### Task 9: Decide What to Do with Locally Downloaded Documents
@@ -238,7 +232,7 @@ You have 264 downloaded documents locally (168MB). Options:
    CLOUDSDK_ACTIVE_CONFIG=rdf-project gsutil -m cp -r data/documents/krs/ gs://rdf-project-documents/krs/
    ```
 
-2. **Re-download in cloud** — the 264 docs are a tiny fraction. The cloud workers will skip already-marked documents in DuckDB and won't re-download them. But the files won't be in GCS unless uploaded.
+2. **Re-download in cloud** — the 264 docs are a tiny fraction. The cloud workers will skip already-marked documents in PostgreSQL and won't re-download them. But the files won't be in GCS unless uploaded.
 
 3. **Ignore** — keep locally for development/testing. Cloud workers will discover the same documents independently.
 
@@ -266,8 +260,7 @@ pip install -r requirements.txt
 
 # Create .env (use the GCP config from GCP_VS_LOCAL_SETUP.md)
 cat > .env << 'EOF'
-SCRAPER_DB_PATH=/data/scraper.duckdb
-BATCH_DB_PATH=/data/scraper.duckdb
+DATABASE_URL=postgresql://rdf:rdf_prod@localhost:5432/rdf
 STORAGE_BACKEND=gcs
 STORAGE_GCS_BUCKET=rdf-project-documents
 STORAGE_GCS_PREFIX=krs/
@@ -280,6 +273,11 @@ RDF_BATCH_DELAY_SECONDS=2.0
 RDF_BATCH_PAGE_SIZE=100
 REQUEST_TIMEOUT=30
 SCRAPER_DOWNLOAD_TIMEOUT=60
+
+# Auth (only needed if running the API server on this VM)
+ENVIRONMENT=production
+JWT_SECRET=<generate: python -c "import secrets; print(secrets.token_hex(32))">
+VERIFICATION_EMAIL_MODE=log
 EOF
 ```
 

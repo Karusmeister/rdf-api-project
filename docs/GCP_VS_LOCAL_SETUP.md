@@ -12,7 +12,7 @@ This document explains how the same codebase runs in two modes: **local developm
 | KRS batch scanner (`batch/runner`) | No (done enough) | Yes | 708K probed locally; finish the remaining ~300K in cloud |
 | RDF doc discovery (`batch/rdf_runner`) | No | Yes | 315K entities need document discovery — heavy, long-running |
 | RDF doc download | No | Yes | Tens of thousands of ZIPs to download and extract |
-| DuckDB database | Local file | VM local SSD | Each environment has its own copy; sync via GCS snapshots |
+| PostgreSQL | Docker Compose locally | Cloud SQL or VM-local | Each environment has its own instance |
 | Document storage | `data/documents/` | GCS bucket | Cloud uses `STORAGE_BACKEND=gcs`; local stays `local` |
 | Tests | Yes | No | Tests run on your machine and in CI (if added later) |
 
@@ -27,12 +27,16 @@ REQUEST_TIMEOUT=30
 CORS_ORIGINS=["http://localhost:3000","http://localhost:5173"]
 
 # --- Database ---
-SCRAPER_DB_PATH=data/scraper.duckdb
-BATCH_DB_PATH=data/scraper.duckdb
+DATABASE_URL=postgresql://rdf:rdf_dev@localhost:5432/rdf
 
 # --- Storage ---
 STORAGE_BACKEND=local
 STORAGE_LOCAL_PATH=data/documents
+
+# --- Auth ---
+ENVIRONMENT=local
+JWT_SECRET=change-me-in-production
+VERIFICATION_EMAIL_MODE=log
 
 # --- Batch (not typically run locally anymore) ---
 BATCH_USE_VPN=false
@@ -44,13 +48,23 @@ BATCH_DELAY_SECONDS=2.5
 
 ```bash
 # --- Database ---
-SCRAPER_DB_PATH=/data/scraper.duckdb
-BATCH_DB_PATH=/data/scraper.duckdb
+DATABASE_URL=postgresql://rdf:rdf_prod@localhost:5432/rdf
 
 # --- Storage ---
 STORAGE_BACKEND=gcs
 STORAGE_GCS_BUCKET=rdf-project-documents
 STORAGE_GCS_PREFIX=krs/
+
+# --- Auth (required if running the API server on GCP) ---
+ENVIRONMENT=production
+JWT_SECRET=<generate with: python -c "import secrets; print(secrets.token_hex(32))">
+VERIFICATION_EMAIL_MODE=smtp
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USER=noreply@example.com
+SMTP_PASSWORD=<smtp-password>
+SMTP_FROM=noreply@example.com
+GOOGLE_CLIENT_ID=<google-oauth-client-id>
 
 # --- KRS Batch Scanner ---
 BATCH_USE_VPN=false
@@ -70,9 +84,11 @@ SCRAPER_DOWNLOAD_TIMEOUT=60
 ```
 
 Key differences:
+- `DATABASE_URL` points to the VM-local or Cloud SQL PostgreSQL instance
 - `STORAGE_BACKEND=gcs` — documents go to a GCS bucket, not local disk
+- `ENVIRONMENT=production` — enforces JWT secret validation at startup
+- Auth vars (`JWT_SECRET`, SMTP, `GOOGLE_CLIENT_ID`) required if running the API server
 - `BATCH_DELAY_SECONDS` may be tuned lower/higher depending on rate limiting from cloud IPs
-- No CORS, no API server config — the VM only runs batch workers
 - VPN is optional — cloud IPs provide natural IP diversity; enable if rate-limited
 
 ## How the VM Runs Batch Workers
@@ -126,13 +142,12 @@ gcloud compute ssh rdf-batch-vm --zone=europe-central2-a \
 # Query progress directly on VM
 gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --command="
 cd /opt/rdf-api-project && source .venv/bin/activate && python3 -c \"
-import duckdb
-conn = duckdb.connect('/data/scraper.duckdb', read_only=True)
-for row in conn.execute('SELECT status, COUNT(*) FROM batch_progress GROUP BY status').fetchall():
+import psycopg2
+conn = psycopg2.connect('postgresql://rdf:rdf_prod@localhost:5432/rdf')
+cur = conn.cursor()
+cur.execute('SELECT status, COUNT(*) FROM batch_progress GROUP BY status')
+for row in cur.fetchall():
     print(f'{row[0]}: {row[1]:,}')
-print('---')
-for row in conn.execute('SELECT status, COUNT(*), COALESCE(SUM(documents_found),0) FROM batch_rdf_progress GROUP BY status').fetchall():
-    print(f'{row[0]}: {row[1]:,} krs, {int(row[2]):,} docs')
 conn.close()
 \""
 ```
@@ -141,37 +156,33 @@ conn.close()
 
 ### Cloud → Local (pull DB snapshot to your Mac)
 
-When you want to analyze the latest cloud data locally:
+When you want to analyze the latest cloud data locally, use `pg_dump` / `pg_restore`:
 
 ```bash
-# On the VM: backup DuckDB to GCS
+# On the VM: dump PostgreSQL to GCS
 gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --command="
-  gsutil cp /data/scraper.duckdb gs://rdf-project-data/backups/scraper-$(date +%Y%m%d-%H%M).duckdb
+  pg_dump -U rdf rdf | gzip > /tmp/rdf-dump.sql.gz
+  gsutil cp /tmp/rdf-dump.sql.gz gs://rdf-project-data/backups/rdf-$(date +%Y%m%d-%H%M).sql.gz
 "
 
-# On your Mac: download the snapshot
-gsutil cp gs://rdf-project-data/backups/scraper-latest.duckdb data/scraper-cloud.duckdb
-
-# Query the cloud DB locally (read-only, separate from your dev DB)
-python3 -c "
-import duckdb
-conn = duckdb.connect('data/scraper-cloud.duckdb', read_only=True)
-print(conn.execute('SELECT COUNT(*) FROM krs_entities').fetchone())
-conn.close()
-"
+# On your Mac: download and restore into local dev DB
+gsutil cp gs://rdf-project-data/backups/rdf-latest.sql.gz /tmp/rdf-cloud.sql.gz
+gunzip -c /tmp/rdf-cloud.sql.gz | psql postgresql://rdf:rdf_dev@localhost:5432/rdf_cloud
 ```
 
 ### Local → Cloud (push local DB to the VM)
 
-Initial migration of your 315K entities + 35K documents metadata:
+Initial migration of your entities + document metadata:
 
 ```bash
-# On your Mac: upload to GCS
-gsutil cp data/scraper.duckdb gs://rdf-project-data/seed/scraper.duckdb
+# On your Mac: dump and upload to GCS
+pg_dump -U rdf rdf | gzip > /tmp/rdf-seed.sql.gz
+gsutil cp /tmp/rdf-seed.sql.gz gs://rdf-project-data/seed/rdf-seed.sql.gz
 
-# On the VM: download and use
+# On the VM: download and restore
 gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --command="
-  gsutil cp gs://rdf-project-data/seed/scraper.duckdb /data/scraper.duckdb
+  gsutil cp gs://rdf-project-data/seed/rdf-seed.sql.gz /tmp/rdf-seed.sql.gz
+  gunzip -c /tmp/rdf-seed.sql.gz | psql -U rdf rdf
 "
 ```
 
@@ -198,15 +209,15 @@ gcloud compute ssh rdf-batch-vm --zone=europe-central2-a \
 
 ### During the day (local development)
 ```bash
-# Work on API, ETL, analysis — everything uses local DuckDB
+# Work on API, ETL, analysis — everything uses local PostgreSQL
 uvicorn app.main:app --reload --port 8000
 pytest tests/ -v
 ```
 
 ### When you need fresh cloud data
 ```bash
-# Pull latest DB snapshot
-gsutil cp gs://rdf-project-data/backups/scraper-latest.duckdb data/scraper-cloud.duckdb
+# Pull latest DB snapshot (see Data Synchronization above)
+gsutil cp gs://rdf-project-data/backups/rdf-latest.sql.gz /tmp/
 ```
 
 ### If workers crash or stall
@@ -223,7 +234,7 @@ nohup python -m batch.rdf_runner --workers 4 > /var/log/rdf-worker.log 2>&1 &
 | Resource | Spec | Monthly Cost |
 |----------|------|-------------|
 | GCE VM (spot) | e2-standard-2 (2 vCPU, 8GB RAM) | ~$15-20 |
-| Persistent disk | 50GB SSD (DuckDB + OS) | ~$8 |
+| Persistent disk | 50GB SSD (PostgreSQL + OS) | ~$8 |
 | GCS storage | ~500GB (documents, growing) | ~$10-15 |
 | GCS operations | PUT/GET for documents | ~$2-5 |
 | Network egress | Minimal (data stays in GCP) | ~$1 |
