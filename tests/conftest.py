@@ -53,6 +53,7 @@ _ALL_TABLES = [
     "krs_scan_cursor",
     "krs_scan_runs",
     "scraper_runs",
+    "password_reset_tokens",
     "activity_log",
     "batch_progress",
     "batch_rdf_progress",

@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from: str = "noreply@example.com"
+    recaptcha_secret_key: str = ""  # Google reCAPTCHA v3 secret; empty = skip verification (dev)
+    frontend_url: str = "http://localhost:5173"  # base URL for password-reset links
     environment: str = "local"  # 'local', 'staging', 'production'
 
     # --- Activity Logging ---

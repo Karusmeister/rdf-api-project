@@ -17,6 +17,7 @@ class SignupRequest(BaseModel):
     email: EmailStr = Field(description="User email address")
     password: str = Field(min_length=8, description="Password (minimum 8 characters)")
     name: str | None = Field(default=None, description="Display name (optional)")
+    captcha_token: str | None = Field(default=None, description="reCAPTCHA v3 token (required in production)")
 
     model_config = {"json_schema_extra": {"examples": [{"email": "user@example.com", "password": "securepass123", "name": "Jan Kowalski"}]}}
 
@@ -35,8 +36,27 @@ class LoginRequest(BaseModel):
 
     email: EmailStr = Field(description="Registered email address")
     password: str = Field(description="Account password")
+    captcha_token: str | None = Field(default=None, description="reCAPTCHA v3 token (required in production)")
 
     model_config = {"json_schema_extra": {"examples": [{"email": "user@example.com", "password": "securepass123"}]}}
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Request a password reset email."""
+
+    email: EmailStr = Field(description="Registered email address")
+    captcha_token: str | None = Field(default=None, description="reCAPTCHA v3 token (required in production)")
+
+    model_config = {"json_schema_extra": {"examples": [{"email": "user@example.com"}]}}
+
+
+class ResetPasswordRequest(BaseModel):
+    """Reset password using a token from the reset email."""
+
+    token: str = Field(description="Password reset token from the email link")
+    new_password: str = Field(min_length=8, description="New password (minimum 8 characters)")
+
+    model_config = {"json_schema_extra": {"examples": [{"token": "abc123...", "new_password": "newSecurePass!"}]}}
 
 
 class SignupResponse(BaseModel):

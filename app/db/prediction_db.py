@@ -306,6 +306,19 @@ def _init_schema() -> None:
         )
     """)
 
+    # ----- Password Reset Tokens -----
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id              VARCHAR PRIMARY KEY,
+            user_id         VARCHAR NOT NULL REFERENCES users(id),
+            token_hash      VARCHAR NOT NULL,
+            expires_at      TIMESTAMP NOT NULL,
+            used_at         TIMESTAMP,
+            created_at      TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+
     # ----- Activity Log -----
 
     conn.execute("""
@@ -1350,3 +1363,48 @@ def check_krs_access(user_id: str, krs: str) -> bool:
         "SELECT 1 FROM user_krs_access WHERE user_id = %s AND krs = %s", [user_id, krs]
     ).fetchone()
     return row is not None
+
+
+# --- password_reset_tokens ---
+
+def create_password_reset_token(user_id: str, token_hash: str, expires_at) -> str:
+    """Store a hashed password reset token. Returns the row ID."""
+    import uuid as _uuid
+    token_id = str(_uuid.uuid4())
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    conn.execute("""
+        INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, created_at)
+        VALUES (%s, %s, %s, %s, %s)
+    """, [token_id, user_id, token_hash, expires_at, now])
+    return token_id
+
+
+def consume_password_reset_token(token_hash: str) -> Optional[str]:
+    """Consume a valid reset token. Returns user_id on success, None if invalid/expired/used."""
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    row = conn.execute("""
+        UPDATE password_reset_tokens
+        SET used_at = %s
+        WHERE id = (
+            SELECT id FROM password_reset_tokens
+            WHERE token_hash = %s
+              AND used_at IS NULL
+              AND expires_at > %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING user_id
+    """, [now, token_hash, now]).fetchone()
+    return row[0] if row else None
+
+
+def update_password(user_id: str, password_hash: str) -> None:
+    """Update a user's password hash."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE users SET password_hash = %s WHERE id = %s",
+        [password_hash, user_id],
+    )
