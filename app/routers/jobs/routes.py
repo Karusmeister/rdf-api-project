@@ -6,7 +6,7 @@ import logging
 
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.jobs import krs_scanner, krs_sync
 from app.repositories import krs_repo
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 sync_router = APIRouter(prefix="/jobs/krs-sync", tags=["jobs"])
 
 
-@sync_router.get("/status")
+@sync_router.get("/status", summary="Last KRS sync run")
 async def sync_status():
     """Return the last sync log entry."""
     last = krs_repo.get_last_sync(source="ms_gov")
@@ -29,7 +29,7 @@ async def sync_status():
     return last
 
 
-@sync_router.post("/trigger")
+@sync_router.post("/trigger", summary="Trigger KRS sync")
 async def trigger_sync():
     """Manually trigger a KRS sync run without holding the request open."""
     logger.info("krs_sync_manual_trigger", extra={"event": "krs_sync_manual_trigger"})
@@ -53,10 +53,12 @@ scan_router = APIRouter(prefix="/jobs/krs-scan", tags=["jobs"])
 
 
 class ResetCursorBody(BaseModel):
-    next_krs_int: int
+    """Reset the sequential scanner cursor."""
+
+    next_krs_int: int = Field(description="KRS integer to resume scanning from (0-99999999)")
 
 
-@scan_router.get("/status")
+@scan_router.get("/status", summary="Scanner status")
 async def scan_status():
     """Return current scanner state: cursor, running status, last run."""
     cursor = krs_repo.get_cursor()
@@ -70,7 +72,7 @@ async def scan_status():
     }
 
 
-@scan_router.post("/trigger")
+@scan_router.post("/trigger", summary="Trigger KRS scan")
 async def trigger_scan():
     """Fire run_scan() in a background task. 202 if accepted, 409 if running."""
     logger.info("krs_scan_manual_trigger", extra={"event": "krs_scan_manual_trigger"})
@@ -86,14 +88,14 @@ async def trigger_scan():
     )
 
 
-@scan_router.post("/stop")
+@scan_router.post("/stop", summary="Stop running scan")
 async def stop_scan():
     """Signal the running scan to stop after its current probe."""
     krs_scanner.request_stop()
     return {"status": "stop_requested"}
 
 
-@scan_router.post("/reset-cursor")
+@scan_router.post("/reset-cursor", summary="Reset scan cursor")
 async def reset_cursor(body: ResetCursorBody):
     """Reset the scan cursor to an arbitrary position. Rejected if running."""
     if not 0 <= body.next_krs_int <= 99_999_999:

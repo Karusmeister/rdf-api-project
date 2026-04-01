@@ -15,8 +15,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/podmiot", tags=["rdf - podmiot"])
 
 
-@router.post("/lookup", response_model=LookupResponse)
+@router.post("/lookup", response_model=LookupResponse, summary="Look up a KRS entity")
 async def lookup(body: KrsRequest):
+    """Validate a KRS number and return entity details (name, legal form, deregistration status)."""
     logger.info("entity_lookup", extra={"event": "entity_lookup", "krs": body.krs})
     data = await rdf_client.dane_podstawowe(body.krs)
     if not isinstance(data, dict):
@@ -37,8 +38,9 @@ async def lookup(body: KrsRequest):
     )
 
 
-@router.post("/document-types", response_model=list[DocumentTypeResponse])
+@router.post("/document-types", response_model=list[DocumentTypeResponse], summary="List document types for a KRS entity")
 async def document_types(body: KrsRequest):
+    """Return available document categories (e.g. financial statements, reports) for the given KRS."""
     logger.info("document_types_lookup", extra={"event": "document_types_lookup", "krs": body.krs})
     data = await rdf_client.rodzaje_dokumentow(body.krs)
     return [DocumentTypeResponse(nazwa=item["nazwa"]) for item in data]

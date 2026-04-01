@@ -155,7 +155,7 @@ def _ratio_with_change(current: Optional[float], previous: Optional[float]) -> d
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@router.post("/statement")
+@router.post("/statement", summary="Parse a financial statement")
 async def get_statement(body: StatementRequest):
     """Parse a single financial statement and return the full hierarchical tree."""
     logger.info("statement_parse", extra={"event": "statement_parse", "krs": body.krs, "period_end": body.period_end})
@@ -163,7 +163,7 @@ async def get_statement(body: StatementRequest):
     return stmt
 
 
-@router.post("/compare")
+@router.post("/compare", summary="Compare two periods")
 async def compare(body: CompareRequest):
     """
     Compare two financial statements year-over-year.
@@ -241,7 +241,7 @@ async def compare(body: CompareRequest):
     }
 
 
-@router.post("/time-series")
+@router.post("/time-series", summary="Track fields across years")
 async def time_series(body: TimeSeriesRequest):
     """Track selected financial fields across multiple years."""
     logger.info(
@@ -365,7 +365,7 @@ async def time_series(body: TimeSeriesRequest):
     }
 
 
-@router.get("/available-periods/{krs}")
+@router.get("/available-periods/{krs}", summary="List available statement periods")
 async def available_periods(krs: str):
     """
     List all available Polish-GAAP financial statement periods for a company.

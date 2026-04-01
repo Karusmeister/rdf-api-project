@@ -17,8 +17,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/dokumenty", tags=["rdf - dokumenty"])
 
 
-@router.post("/search", response_model=SearchResponse)
+@router.post("/search", response_model=SearchResponse, summary="Search financial documents")
 async def search(body: SearchRequest):
+    """Paginated search for financial documents filed by a KRS entity. KRS encryption is handled server-side."""
     logger.info("document_search", extra={"event": "document_search", "krs": body.krs, "page": body.page})
     data = await rdf_client.wyszukiwanie(
         krs=body.krs,
@@ -54,14 +55,16 @@ async def search(body: SearchRequest):
     )
 
 
-@router.get("/metadata/{doc_id:path}")
+@router.get("/metadata/{doc_id:path}", summary="Get document metadata")
 async def get_metadata(doc_id: str):
+    """Return raw metadata for a single document. The doc_id is Base64-encoded and must stay URL-encoded."""
     logger.info("metadata_fetch", extra={"event": "metadata_fetch", "doc_id": doc_id})
     return await rdf_client.metadata(doc_id)
 
 
-@router.post("/download")
+@router.post("/download", summary="Download documents as ZIP")
 async def download(body: DownloadRequest):
+    """Download one or more financial documents as a ZIP archive. Accepts 1-20 document IDs per request."""
     logger.info("document_download", extra={"event": "document_download", "doc_count": len(body.document_ids)})
     data = await rdf_client.download(body.document_ids)
     return StreamingResponse(

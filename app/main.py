@@ -84,7 +84,30 @@ async def lifespan(app: FastAPI):
     db_conn.close_pool()
 
 
-app = FastAPI(title="RDF API Proxy", lifespan=lifespan)
+tags_metadata = [
+    {"name": "health", "description": "Liveness and dependency health checks."},
+    {"name": "rdf - podmiot", "description": "KRS entity lookup via the upstream RDF registry."},
+    {"name": "rdf - dokumenty", "description": "Financial document search, metadata, and download."},
+    {"name": "analysis", "description": "Parse and compare Polish GAAP financial statements."},
+    {"name": "scraper", "description": "Scraper status dashboard."},
+    {"name": "etl", "description": "ETL ingestion trigger and training dataset statistics."},
+    {"name": "jobs", "description": "Scheduled KRS sync and sequential scanner jobs."},
+    {"name": "auth", "description": "User authentication: signup, login, email verification, Google SSO."},
+    {"name": "predictions", "description": "Bankruptcy prediction scores, feature detail, and model catalog."},
+    {"name": "admin", "description": "Admin-only operations (cache flush, access grants)."},
+]
+
+app = FastAPI(
+    title="RDF API",
+    description=(
+        "FastAPI service for the Polish financial document registry (RDF). "
+        "Provides KRS entity lookup, financial statement analysis, ETL ingestion, "
+        "bankruptcy prediction scores, and user authentication with per-KRS access control."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+    openapi_tags=tags_metadata,
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -192,12 +215,13 @@ async def upstream_request_error_handler(request: Request, exc: httpx.RequestErr
     )
 
 
-@app.get("/health")
+@app.get("/health", tags=["health"], summary="Liveness check")
 async def health():
+    """Returns `{"status": "ok"}` if the service is running."""
     return {"status": "ok"}
 
 
-@app.get("/health/krs")
+@app.get("/health/krs", tags=["health"], summary="KRS adapter health")
 async def health_krs():
     """Check KRS adapter connectivity. Returns 200 if reachable, 503 otherwise."""
     try:
@@ -216,7 +240,7 @@ async def health_krs():
     )
 
 
-@app.get("/metrics/krs")
+@app.get("/metrics/krs", tags=["health"], summary="KRS call metrics")
 async def metrics_krs():
     """Return last-N call stats: p50/p95 latency, error rate, calls per source."""
     return metrics.get_stats()

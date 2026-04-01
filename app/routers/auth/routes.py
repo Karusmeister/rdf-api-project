@@ -59,8 +59,9 @@ def _send_verification_email(email: str, code: str) -> None:
             s.send_message(msg)
 
 
-@router.post("/google")
+@router.post("/google", summary="Google SSO login")
 def google_login(body: GoogleLoginRequest) -> AuthResponse:
+    """Exchange a Google OAuth2 ID token for a JWT. Auto-creates and verifies the user on first login."""
     from google.auth.transport import requests
     from google.oauth2 import id_token
 
@@ -92,9 +93,11 @@ def google_login(body: GoogleLoginRequest) -> AuthResponse:
     )
 
 
-@router.post("/signup", response_model=SignupResponse)
+@router.post("/signup", response_model=SignupResponse, summary="Register new account")
 @limiter.limit("5/minute")
 def signup(request: Request, body: SignupRequest):
+    """Create an account with email and password. Sends a 6-digit verification code.
+    Rate limited to 5 requests/minute per IP. Retrying for an unverified email resends the code."""
     existing = prediction_db.get_user_by_email(body.email)
     if existing:
         if existing["is_verified"]:
@@ -129,9 +132,11 @@ def signup(request: Request, body: SignupRequest):
     return {"message": "Verification code sent", "user_id": user_id}
 
 
-@router.post("/verify", response_model=AuthResponse)
+@router.post("/verify", response_model=AuthResponse, summary="Verify email address")
 @limiter.limit("10/minute")
 def verify_email(request: Request, body: VerifyRequest):
+    """Submit the 6-digit code from the signup email. Returns a JWT on success.
+    Rate limited to 10 requests/minute per IP."""
     success = prediction_db.consume_verification_code(body.user_id, body.code, "email_verify")
     if not success:
         raise HTTPException(400, "Invalid or expired verification code")
@@ -151,8 +156,9 @@ def verify_email(request: Request, body: VerifyRequest):
     )
 
 
-@router.post("/login")
+@router.post("/login", summary="Login with email and password")
 def login(body: LoginRequest) -> AuthResponse:
+    """Authenticate with email and password. Returns a JWT. Account must be verified and active."""
     user = prediction_db.get_user_by_email(body.email)
     if user is None:
         raise HTTPException(401, "Invalid email or password")
@@ -180,8 +186,9 @@ def login(body: LoginRequest) -> AuthResponse:
     )
 
 
-@router.get("/me", response_model=UserProfile)
+@router.get("/me", response_model=UserProfile, summary="Get current user profile")
 def me(user: CurrentUser) -> UserProfile:
+    """Return the authenticated user's profile including KRS access list."""
     krs_list = prediction_db.get_user_krs_access(user["id"])
     return UserProfile(
         id=user["id"],
@@ -192,9 +199,10 @@ def me(user: CurrentUser) -> UserProfile:
     )
 
 
-@router.post("/admin/grant-access")
+@router.post("/admin/grant-access", summary="Grant KRS access to a user", tags=["admin"])
 @limiter.limit("20/minute")
 def grant_access(request: Request, body: GrantAccessRequest, user: CurrentUser):
+    """Admin-only. Grant a user permission to query predictions for a specific KRS number."""
     if not user.get("has_full_access"):
         raise HTTPException(403, "Admin access required")
     target_user = prediction_db.get_user_by_id(body.user_id)

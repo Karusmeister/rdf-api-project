@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/scraper", tags=["scraper"])
 
 
-@router.get("/status")
+@router.get("/status", summary="Scraper dashboard stats")
 async def scraper_status():
     """Return scraper dashboard stats. Read-only, fast."""
     logger.debug("scraper_status", extra={"event": "scraper_status"})

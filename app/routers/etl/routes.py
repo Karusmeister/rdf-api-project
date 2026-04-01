@@ -4,7 +4,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.services import etl, training_data
 
@@ -14,12 +14,14 @@ router = APIRouter(prefix="/api/etl", tags=["etl"])
 
 
 class IngestRequest(BaseModel):
-    document_id: Optional[str] = None
+    """ETL ingestion trigger."""
+
+    document_id: Optional[str] = Field(default=None, description="Specific document ID to ingest. Omit to process all pending.")
 
 
-@router.post("/ingest")
+@router.post("/ingest", summary="Trigger ETL ingestion")
 async def ingest(body: IngestRequest):
-    """Trigger ETL ingestion for a specific document or all pending."""
+    """Ingest a specific downloaded document or all pending documents into the prediction tables."""
     logger.info("etl_ingest", extra={"event": "etl_ingest", "document_id": body.document_id})
     loop = asyncio.get_running_loop()
     try:
@@ -39,7 +41,7 @@ async def ingest(body: IngestRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/training/dataset-stats")
+@router.get("/training/dataset-stats", summary="Training dataset statistics")
 async def dataset_stats(
     feature_set: str = Query(..., description="Feature set ID (e.g. 'maczynska_6')"),
     min_year: Optional[int] = Query(None),
