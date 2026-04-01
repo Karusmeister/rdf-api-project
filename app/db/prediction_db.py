@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 from app.db import connection as shared_conn
 
 _schema_initialized = False
+logger = logging.getLogger(__name__)
 
 
 def _cursor_to_dicts(cursor) -> list[dict]:
@@ -319,6 +321,44 @@ def _init_schema() -> None:
         )
     """)
 
+    # Deduplicate any active reset-token hash collisions before enforcing unique index.
+    # Keep newest active token per hash; mark older active duplicates as used.
+    deduped = conn.execute("""
+        WITH duplicate_hashes AS (
+            SELECT token_hash
+            FROM password_reset_tokens
+            WHERE used_at IS NULL
+            GROUP BY token_hash
+            HAVING count(*) > 1
+        ),
+        ranked AS (
+            SELECT
+                prt.id,
+                row_number() OVER (
+                    PARTITION BY prt.token_hash
+                    ORDER BY prt.created_at DESC, prt.id DESC
+                ) AS rn
+            FROM password_reset_tokens prt
+            JOIN duplicate_hashes d ON d.token_hash = prt.token_hash
+            WHERE prt.used_at IS NULL
+        ),
+        marked AS (
+            UPDATE password_reset_tokens t
+            SET used_at = current_timestamp
+            FROM ranked r
+            WHERE t.id = r.id
+              AND r.rn > 1
+            RETURNING t.id
+        )
+        SELECT count(*) FROM marked
+    """).fetchone()
+    deduped_count = int(deduped[0] or 0)
+    if deduped_count > 0:
+        logger.warning(
+            "reset_token_hash_dedup_applied",
+            extra={"event": "reset_token_hash_dedup_applied", "rows_marked_used": deduped_count},
+        )
+
     # ----- Activity Log -----
 
     conn.execute("""
@@ -334,10 +374,21 @@ def _init_schema() -> None:
     """)
 
     # Indexes (check existing first to stay idempotent)
-    existing = {
-        row[0]
-        for row in conn.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'public'").fetchall()
-    }
+    existing_rows = conn.execute(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'"
+    ).fetchall()
+    existing = {row[0] for row in existing_rows}
+    indexdef_by_name = {row[0]: row[1] for row in existing_rows}
+
+    # Migrate old full unique index to partial unique index (active tokens only).
+    reset_idx_def = indexdef_by_name.get("idx_reset_token_hash")
+    if reset_idx_def and "WHERE (used_at IS NULL)" not in reset_idx_def:
+        conn.execute("DROP INDEX idx_reset_token_hash")
+        existing.discard("idx_reset_token_hash")
+        logger.info(
+            "reset_token_index_migrated",
+            extra={"event": "reset_token_index_migrated", "index": "idx_reset_token_hash"},
+        )
 
     index_defs = [
         ("idx_companies_pkd",       "CREATE INDEX idx_companies_pkd ON companies(pkd_code)"),
@@ -360,7 +411,8 @@ def _init_schema() -> None:
         ("idx_activity_krs",        "CREATE INDEX idx_activity_krs ON activity_log(krs_number, created_at DESC)"),
         ("idx_activity_user",       "CREATE INDEX idx_activity_user ON activity_log(user_id, created_at DESC)"),
         ("idx_activity_time",       "CREATE INDEX idx_activity_time ON activity_log(created_at DESC)"),
-        ("idx_reset_token_hash",    "CREATE UNIQUE INDEX idx_reset_token_hash ON password_reset_tokens(token_hash)"),
+        ("idx_reset_token_hash",    "CREATE UNIQUE INDEX idx_reset_token_hash ON password_reset_tokens(token_hash) WHERE used_at IS NULL"),
+        ("idx_reset_token_lookup",  "CREATE INDEX idx_reset_token_lookup ON password_reset_tokens(token_hash, expires_at, created_at DESC) WHERE used_at IS NULL"),
         ("idx_reset_token_user",    "CREATE INDEX idx_reset_token_user ON password_reset_tokens(user_id, used_at, expires_at)"),
     ]
 

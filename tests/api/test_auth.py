@@ -703,3 +703,88 @@ class TestResetTokenLogSafety:
         # Fingerprint should be present and short (12 hex chars)
         fingerprint = getattr(reset_records[0], "token_fingerprint", "")
         assert len(fingerprint) == 12
+
+
+# ---------------------------------------------------------------------------
+# AUTH-005: Reset-token index safety on existing production data
+# ---------------------------------------------------------------------------
+
+class TestResetTokenIndexSafety:
+    def test_schema_dedups_active_hash_collisions_and_enforces_partial_unique_index(self, pg_dsn, clean_pg):
+        """AUTH-005: startup schema init must not fail on duplicate historical token hashes."""
+        from datetime import datetime, timedelta, timezone
+        import uuid
+        from unittest.mock import patch
+
+        from app.config import settings
+        from app.db import connection as db_conn
+        from app.db import prediction_db
+
+        with patch.object(settings, "database_url", pg_dsn):
+            db_conn.reset()
+            prediction_db._schema_initialized = False
+            db_conn.connect()
+            conn = db_conn.get_conn()
+            try:
+                prediction_db._ensure_schema()
+
+                # Simulate an older DB state before reset-token indexes were added/migrated.
+                conn.execute("DROP INDEX IF EXISTS idx_reset_token_hash")
+                conn.execute("DROP INDEX IF EXISTS idx_reset_token_lookup")
+
+                user_id = f"user-reset-dup-{uuid.uuid4().hex[:8]}"
+                conn.execute(
+                    """
+                    INSERT INTO users (id, email, auth_method, is_verified, is_active, created_at)
+                    VALUES (%s, %s, 'local', true, true, current_timestamp)
+                    """,
+                    [user_id, f"{user_id}@example.com"],
+                )
+
+                token_hash = "duplicate-hash-for-test"
+                now = datetime.now(timezone.utc)
+                conn.execute(
+                    """
+                    INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, used_at, created_at)
+                    VALUES (%s, %s, %s, %s, NULL, %s)
+                    """,
+                    ["reset-dup-a", user_id, token_hash, now + timedelta(hours=1), now - timedelta(minutes=1)],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, used_at, created_at)
+                    VALUES (%s, %s, %s, %s, NULL, %s)
+                    """,
+                    ["reset-dup-b", user_id, token_hash, now + timedelta(hours=1), now],
+                )
+
+                # Re-run schema init logic: should dedupe active duplicates and recreate indexes.
+                prediction_db._schema_initialized = False
+                prediction_db._ensure_schema()
+
+                active_count = conn.execute(
+                    """
+                    SELECT count(*) FROM password_reset_tokens
+                    WHERE token_hash = %s AND used_at IS NULL
+                    """,
+                    [token_hash],
+                ).fetchone()[0]
+                assert active_count == 1
+
+                total_count = conn.execute(
+                    "SELECT count(*) FROM password_reset_tokens WHERE token_hash = %s",
+                    [token_hash],
+                ).fetchone()[0]
+                assert total_count == 2  # history preserved (no row deletion)
+
+                idx_def = conn.execute(
+                    """
+                    SELECT indexdef FROM pg_indexes
+                    WHERE schemaname = 'public' AND indexname = 'idx_reset_token_hash'
+                    """
+                ).fetchone()[0]
+                assert "WHERE (used_at IS NULL)" in idx_def
+            finally:
+                db_conn.close()
+                db_conn.reset()
+                prediction_db._schema_initialized = False

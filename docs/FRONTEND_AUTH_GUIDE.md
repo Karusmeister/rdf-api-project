@@ -241,6 +241,11 @@ The email contains a link: `{FRONTEND_URL}/reset-password?token={token}`
 
 The frontend must have a `/reset-password` page that reads the `token` query parameter.
 
+Security note for operators:
+- In `VERIFICATION_EMAIL_MODE=log` (dev mode), backend logs include only a safe
+  `token_fingerprint` field for observability.
+- Raw reset token and full reset URL are never written to logs.
+
 ---
 
 ### POST `/api/auth/reset-password`
