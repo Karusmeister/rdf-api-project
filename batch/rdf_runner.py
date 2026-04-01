@@ -17,7 +17,7 @@ import signal
 import sys
 
 from app.config import settings
-from batch.connections import Connection, build_pool
+from batch.connections import Connection, build_pool, validate_vpn_config
 from batch.rdf_worker import run_rdf_worker
 
 logger = logging.getLogger(__name__)
@@ -37,12 +37,8 @@ def _pick_connection(worker_id: int, use_vpn: bool) -> Connection:
 
 
 def _validate_vpn_config() -> None:
-    if not settings.nordvpn_username:
-        raise RuntimeError("VPN enabled but NORDVPN_USERNAME is empty.")
-    if not settings.nordvpn_password:
-        raise RuntimeError("VPN enabled but NORDVPN_PASSWORD is empty.")
-    if not settings.nordvpn_servers:
-        raise RuntimeError("VPN enabled but NORDVPN_SERVERS is empty.")
+    """Delegate to shared validator in batch.connections."""
+    validate_vpn_config()
 
 
 def run_rdf_batch(
@@ -54,6 +50,7 @@ def run_rdf_batch(
     download_delay: float | None = None,
     page_size: int | None = None,
     dsn: str | None = None,
+    skip_metadata: bool | None = None,
 ) -> None:
     """Spawn N worker processes for RDF document discovery + download."""
     _workers = workers if workers is not None else settings.batch_workers
@@ -63,15 +60,16 @@ def run_rdf_batch(
     _dl_delay = download_delay if download_delay is not None else settings.rdf_batch_download_delay
     _page_size = page_size if page_size is not None else settings.rdf_batch_page_size
     _db = dsn if dsn is not None else settings.database_url
+    _skip_meta = skip_metadata if skip_metadata is not None else settings.rdf_batch_skip_metadata
 
     if _vpn:
         _validate_vpn_config()
 
     logger.info(
         "rdf_batch_start workers=%d vpn=%s concurrency=%d delay=%.1f "
-        "download_delay=%.1f page_size=%d db=%s storage_backend=%s",
+        "download_delay=%.1f page_size=%d db=%s storage_backend=%s skip_metadata=%s",
         _workers, _vpn, _concurrency, _delay, _dl_delay, _page_size, _db,
-        settings.storage_backend,
+        settings.storage_backend, _skip_meta,
     )
 
     processes: list[multiprocessing.Process] = []
@@ -89,6 +87,7 @@ def run_rdf_batch(
                 download_delay=_dl_delay,
                 page_size=_page_size,
                 dsn=_db,
+                skip_metadata=_skip_meta,
             ),
         )
         processes.append(p)
@@ -161,6 +160,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--db", type=str, default=None,
         help=f"PostgreSQL DSN (default: DATABASE_URL from .env)",
     )
+    parser.add_argument(
+        "--skip-metadata", action="store_true", default=None,
+        help="Skip per-document metadata fetch (backfill later with metadata_runner)",
+    )
     return parser
 
 
@@ -186,6 +189,7 @@ def main() -> None:
         download_delay=args.download_delay,
         page_size=args.page_size,
         dsn=args.db,
+        skip_metadata=args.skip_metadata,
     )
 
 

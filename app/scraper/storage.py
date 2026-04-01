@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -126,6 +127,13 @@ class GcsStorage:
     def get_full_path(self, path: str) -> str:
         return f"gs://{self._bucket_name}/{self._blob_path(path)}"
 
+    async def async_save_extracted(self, doc_dir: str, zip_bytes: bytes, document_id: str) -> dict:
+        """Non-blocking version of save_extracted. Runs GCS I/O in a thread."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self.save_extracted, doc_dir, zip_bytes, document_id,
+        )
+
 
 class LocalStorage:
     def __init__(self, base_path: str):
@@ -200,6 +208,13 @@ class LocalStorage:
 
     def get_full_path(self, path: str) -> str:
         return str(self._base / path)
+
+    async def async_save_extracted(self, doc_dir: str, zip_bytes: bytes, document_id: str) -> dict:
+        """Non-blocking version of save_extracted. Runs I/O in a thread."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self.save_extracted, doc_dir, zip_bytes, document_id,
+        )
 
 
 def create_storage() -> LocalStorage | GcsStorage:

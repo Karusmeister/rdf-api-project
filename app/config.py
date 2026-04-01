@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     rdf_batch_delay_seconds: float = 1.5   # delay for discovery (encrypted search)
     rdf_batch_download_delay: float = 0.3  # delay for metadata + ZIP download (lighter endpoints)
     rdf_batch_page_size: int = 100         # max docs per page to minimize pagination
+    rdf_batch_skip_metadata: bool = False  # skip metadata fetch during download (backfill later)
+    metadata_backfill_fetch_batch_size: int = 500  # rows per keyset page in metadata backfill
 
     # NordVPN SOCKS5 credentials (only used when batch_use_vpn=true)
     nordvpn_username: str = ""

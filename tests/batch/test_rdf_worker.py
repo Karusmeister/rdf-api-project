@@ -590,6 +590,68 @@ def test_document_store_mark_downloaded(pg_dsn, clean_pg):
     assert "abc123==" not in store.get_undownloaded("0000000001")
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_sleep")
+async def test_download_one_document_skip_metadata(rdf_base, pg_dsn, clean_pg, tmp_path):
+    """When skip_metadata=True, no metadata HTTP call is made but ZIP still downloads."""
+    storage_dir = str(tmp_path / "documents")
+    doc_store = RdfDocumentStore(pg_dsn)
+    doc_store.insert_documents("0000000001", [_SAMPLE_DOC])
+
+    from app.scraper.storage import LocalStorage
+    storage = LocalStorage(storage_dir)
+    stats = RdfWorkerStats()
+
+    zip_bytes = _make_zip("report.xml", b"<sprawozdanie/>")
+
+    with respx.mock:
+        # NO metadata mock — if it's called, respx will raise
+        respx.post(f"{rdf_base}/dokumenty/tresc").mock(
+            return_value=httpx.Response(200, content=zip_bytes)
+        )
+
+        async with httpx.AsyncClient(base_url=rdf_base) as client:
+            ok = await _download_one_document(
+                client, "0000000001", "abc123==",
+                doc_store, storage, delay=0, worker_id=0, stats=stats,
+                skip_metadata=True,
+            )
+
+    assert ok is True
+    assert stats.documents_downloaded == 1
+
+    # Verify DB: downloaded but no metadata
+    wrapper = make_connection(pg_dsn)
+    row = wrapper.execute(
+        "SELECT is_downloaded, metadata_fetched_at, file_count FROM krs_documents WHERE document_id = %s",
+        ["abc123=="],
+    ).fetchone()
+    wrapper.close()
+    assert row[0] is True
+    assert row[1] is None  # metadata was skipped
+    assert row[2] >= 1
+
+
+@pytest.mark.asyncio
+async def test_async_save_extracted_local(tmp_path):
+    """async_save_extracted delegates to save_extracted in a thread and returns same manifest."""
+    from app.scraper.storage import LocalStorage
+
+    storage = LocalStorage(str(tmp_path / "docs"))
+    zip_bytes = _make_zip("test.xml", b"<data/>")
+
+    # Sync call
+    manifest_sync = storage.save_extracted("krs/0000000001/sync_doc", zip_bytes, "sync_doc")
+
+    # Async call
+    manifest_async = await storage.async_save_extracted("krs/0000000001/async_doc", zip_bytes, "async_doc")
+
+    # Same structure, different doc IDs
+    assert len(manifest_sync["files"]) == len(manifest_async["files"])
+    assert manifest_sync["files"][0]["name"] == manifest_async["files"][0]["name"]
+    assert manifest_async["document_id"] == "async_doc"
+
+
 def test_document_store_update_metadata(pg_dsn, clean_pg):
     store = RdfDocumentStore(pg_dsn)
     store.insert_documents("0000000001", [_SAMPLE_DOC])

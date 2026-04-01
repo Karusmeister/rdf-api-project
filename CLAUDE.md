@@ -137,9 +137,11 @@ batch/
   rdf_document_store.py - Append-only document store for batch RDF worker
   rdf_progress.py      - RDF document discovery progress store
   worker.py            - Async worker loop with stride partitioning + backoff
-  rdf_worker.py        - RDF document discovery + download worker
+  rdf_worker.py        - RDF document discovery + download worker (supports --skip-metadata)
   runner.py            - Multiprocessing orchestrator + argparse CLI
-  rdf_runner.py        - RDF document batch orchestrator
+  rdf_runner.py        - RDF document batch orchestrator (supports --skip-metadata)
+  metadata_backfill.py - Standalone metadata backfill worker for docs downloaded with --skip-metadata
+  metadata_runner.py   - Multiprocessing orchestrator for metadata backfill
 scripts/
   seed_features.py     - Populate feature_definitions and feature_sets
   seed_admin.py        - Bootstrap admin user (--password or --google)
@@ -284,6 +286,14 @@ python scripts/quick_scan.py --count 10 --start 1
 python -m batch.runner
 python -m batch.runner --start 500000 --workers 3 --vpn
 python -m batch.runner --start 1 --no-vpn --delay 2.0
+
+# RDF document download (fast mode skips metadata, backfill later)
+python -m batch.rdf_runner --skip-metadata --no-vpn
+python -m batch.rdf_runner --workers 5 --concurrency 5
+
+# Metadata backfill (for docs downloaded with --skip-metadata)
+python -m batch.metadata_runner --no-vpn
+python -m batch.metadata_runner --workers 3 --concurrency 10 --delay 0.2
 ```
 
 ## API endpoints

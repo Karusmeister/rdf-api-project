@@ -318,23 +318,27 @@ async def _download_one_document(
     delay: float,
     worker_id: int,
     stats: RdfWorkerStats,
+    skip_metadata: bool = False,
 ) -> bool:
     """Download a single document: metadata → ZIP → extract → mark in DB.
 
     Returns True on success, False on failure.
+    When skip_metadata=True, the metadata fetch is skipped entirely
+    (can be backfilled later with batch.metadata_backfill).
     """
-    # 1. Fetch metadata
-    meta = await _fetch_metadata_with_backoff(client, doc_id, worker_id)
-    await asyncio.sleep(delay)
+    # 1. Fetch metadata (skip when flag is set)
+    if not skip_metadata:
+        meta = await _fetch_metadata_with_backoff(client, doc_id, worker_id)
+        await asyncio.sleep(delay)
 
-    if meta is not None:
-        try:
-            doc_store.update_metadata(doc_id, meta)
-        except Exception as exc:
-            logger.warning(
-                "rdf_worker=%d krs=%s doc=%s metadata_store_error %s",
-                worker_id, krs, doc_id[:20], type(exc).__name__,
-            )
+        if meta is not None:
+            try:
+                doc_store.update_metadata(doc_id, meta)
+            except Exception as exc:
+                logger.warning(
+                    "rdf_worker=%d krs=%s doc=%s metadata_store_error %s",
+                    worker_id, krs, doc_id[:20], type(exc).__name__,
+                )
 
     # 2. Download ZIP
     zip_bytes = await _download_zip_with_backoff(client, doc_id, worker_id)
@@ -345,10 +349,13 @@ async def _download_one_document(
         stats.documents_failed += 1
         return False
 
-    # 3. Extract to disk
+    # 3. Extract to disk (prefer async to avoid blocking the event loop)
     try:
         doc_dir = make_doc_dir(krs, doc_id)
-        manifest = storage.save_extracted(doc_dir, zip_bytes, doc_id)
+        if hasattr(storage, 'async_save_extracted'):
+            manifest = await storage.async_save_extracted(doc_dir, zip_bytes, doc_id)
+        else:
+            manifest = storage.save_extracted(doc_dir, zip_bytes, doc_id)
 
         total_extracted = sum(f["size"] for f in manifest["files"])
         file_types = ",".join(sorted({f["type"] for f in manifest["files"]}))
@@ -390,6 +397,7 @@ async def _worker_loop(
     download_delay: float,
     page_size: int,
     dsn: str,
+    skip_metadata: bool = False,
 ) -> None:
     """Main async loop for a single RDF document discovery + download worker."""
     progress = RdfProgressStore(dsn)
@@ -493,6 +501,7 @@ async def _worker_loop(
                             await _download_one_document(
                                 client, krs, doc_id, doc_store, storage,
                                 download_delay, worker_id, stats,
+                                skip_metadata=skip_metadata,
                             )
 
                     await asyncio.gather(
@@ -545,6 +554,7 @@ def run_rdf_worker(
     download_delay: float,
     page_size: int,
     dsn: str,
+    skip_metadata: bool = False,
 ) -> None:
     """Entrypoint for multiprocessing.Process."""
     logging.basicConfig(
@@ -553,9 +563,9 @@ def run_rdf_worker(
     )
     logger.info(
         "rdf_worker=%d starting total_workers=%d connection=%s concurrency=%d "
-        "delay=%.1f download_delay=%.1f page_size=%d storage_backend=%s",
+        "delay=%.1f download_delay=%.1f page_size=%d storage_backend=%s skip_metadata=%s",
         worker_id, total_workers, connection.name, concurrency, delay,
-        download_delay, page_size, settings.storage_backend,
+        download_delay, page_size, settings.storage_backend, skip_metadata,
     )
     asyncio.run(
         _worker_loop(
@@ -567,5 +577,6 @@ def run_rdf_worker(
             download_delay=download_delay,
             page_size=page_size,
             dsn=dsn,
+            skip_metadata=skip_metadata,
         )
     )

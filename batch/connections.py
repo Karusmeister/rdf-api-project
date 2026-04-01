@@ -39,4 +39,18 @@ def build_pool() -> list[Connection]:
     return pool
 
 
+def validate_vpn_config() -> None:
+    """Fail fast if VPN mode is requested but credentials/servers are missing.
+
+    Shared across all runners (rdf_runner, metadata_runner) so validation
+    is consistent. Call this *before* spawning any worker processes.
+    """
+    if not settings.nordvpn_username:
+        raise RuntimeError("VPN enabled but NORDVPN_USERNAME is empty.")
+    if not settings.nordvpn_password:
+        raise RuntimeError("VPN enabled but NORDVPN_PASSWORD is empty.")
+    if not settings.nordvpn_servers:
+        raise RuntimeError("VPN enabled but NORDVPN_SERVERS is empty.")
+
+
 POOL: list[Connection] = build_pool()

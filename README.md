@@ -22,7 +22,8 @@ graph TB
 
         subgraph VM["GCE VM — rdf-batch-vm"]
             Scanner["KRS Scanner<br/>7 workers + VPN"]
-            Worker["RDF Worker<br/>5 workers, concurrency=5"]
+            Worker["RDF Worker<br/>5 workers, concurrency=5<br/>--skip-metadata for speed"]
+            MetaBackfill["Metadata Backfill<br/>3 workers, concurrency=10"]
         end
 
         Scanner -->|probes| KRS
@@ -30,6 +31,8 @@ graph TB
         Worker -->|discovery + download| RDF
         Worker -->|writes| DB
         Worker -->|uploads| GCS[("GCS Bucket<br/>rdf-project-documents")]
+        MetaBackfill -->|metadata GET| RDF
+        MetaBackfill -->|writes| DB
         Secrets["Secret Manager"] -.->|env vars| API
         Secrets -.->|.env| VM
     end
@@ -459,8 +462,9 @@ gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --project=rdf-api-proje
 cd /opt/rdf-api-project
 sudo -u worker git pull origin main
 sudo -u worker .venv/bin/pip install -r requirements.txt  # only if deps changed
-sudo systemctl restart rdf-worker       # RDF document discovery + download
-sudo systemctl restart krs-scanner      # KRS integer scanner (if changed)
+sudo systemctl restart rdf-worker         # RDF document discovery + download
+sudo systemctl restart krs-scanner        # KRS integer scanner (if changed)
+sudo systemctl restart metadata-backfill  # Metadata backfill (if changed)
 ```
 
 See [`docs/CLOUD_DEPLOYMENT.md`](docs/CLOUD_DEPLOYMENT.md) for full details: architecture, secrets, VM setup, .env config, monitoring, and costs.
