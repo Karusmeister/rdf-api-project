@@ -4,21 +4,40 @@ Production deployment of the RDF API on Google Cloud Platform.
 
 ## Architecture
 
-```
-Internet
-  |
-  v
-Cloud Run (rdf-api)          <-- FastAPI app, 1 CPU / 1 GiB, 0-3 instances
-  |
-  |-- Cloud SQL Auth Proxy    <-- built-in, automatic TLS
-  |     |
-  |     v
-  |   Cloud SQL (rdf-postgres) <-- PostgreSQL 16, db-f1-micro, europe-central2
-  |
-  |-- NordVPN SOCKS5           <-- batch workers route through VPN to ms.gov.pl
-  |
-  v
-Secret Manager                <-- DATABASE_URL, JWT_SECRET, NordVPN credentials
+```text
+                          ┌─────────────────────────────────────────────────────────┐
+                          │                    GCP (europe-central2)                 │
+                          │                                                         │
+  Internet ──────────────>│  Cloud Run (rdf-api)                                    │
+                          │    FastAPI app, 1 CPU / 1 GiB, 0-3 instances            │
+                          │    Serves: proxy, analysis, ETL, auth, predictions API   │
+                          │      │                                                  │
+                          │      │ Cloud SQL Auth Proxy (built-in TLS)              │
+                          │      v                                                  │
+                          │  Cloud SQL (rdf-postgres)                               │
+                          │    PostgreSQL 16, db-f1-micro                           │
+                          │    Public IP: 34.118.73.120                             │
+                          │      ^         ^                                        │
+                          │      │         │                                        │
+                          │  GCE VM (rdf-batch-vm)                                  │
+                          │    e2-standard-2 (preemptible), europe-central2-a       │
+                          │    ┌────────────────────────────────────────┐            │
+                          │    │  KRS Scanner (batch.runner)            │            │
+                          │    │    7 workers via NordVPN SOCKS5        │──> KRS API │
+                          │    │    Probes KRS integers 1..N            │   (ms.gov) │
+                          │    ├────────────────────────────────────────┤            │
+                          │    │  RDF Worker (batch.rdf_runner)         │            │
+                          │    │    5 workers, concurrency=5            │──> RDF API │
+                          │    │    Discovery + download + GCS upload   │   (ms.gov) │
+                          │    └────────────────────────────────────────┘            │
+                          │      │                                                  │
+                          │      v                                                  │
+                          │  GCS Bucket (rdf-project-documents)                     │
+                          │    Extracted ZIPs stored as files + manifest.json        │
+                          │                                                         │
+                          │  Secret Manager                                         │
+                          │    database-url, jwt-secret, nordvpn-*                  │
+                          └─────────────────────────────────────────────────────────┘
 ```
 
 ## Current deployment
@@ -28,13 +47,23 @@ Secret Manager                <-- DATABASE_URL, JWT_SECRET, NordVPN credentials
 | GCP project | `rdf-api-project` |
 | GCP account | `piotr.kraus01@gmail.com` |
 | Region | `europe-central2` (Warsaw) |
+| **Cloud Run** | |
 | Service URL | `https://rdf-api-448201086881.europe-central2.run.app` |
-| Cloud SQL instance | `rdf-postgres` (PostgreSQL 16, db-f1-micro) |
-| Cloud SQL connection name | `rdf-api-project:europe-central2:rdf-postgres` |
-| Cloud SQL public IP | `34.118.73.120` |
-| Database name | `rdf` |
-| Database user | `postgres` |
 | Service account | `448201086881-compute@developer.gserviceaccount.com` |
+| **Cloud SQL** | |
+| Instance | `rdf-postgres` (PostgreSQL 16, db-f1-micro) |
+| Connection name | `rdf-api-project:europe-central2:rdf-postgres` |
+| Public IP | `34.118.73.120` |
+| Database / user | `rdf` / `postgres` |
+| **Batch VM** | |
+| Instance | `rdf-batch-vm` (e2-standard-2, preemptible) |
+| Zone | `europe-central2-a` |
+| External IP | `34.116.141.233` |
+| Code path | `/opt/rdf-api-project/` (git clone of main) |
+| Venv | `/opt/rdf-api-project/.venv/` |
+| Config | `/opt/rdf-api-project/.env` |
+| **GCS** | |
+| Documents bucket | `rdf-project-documents` |
 
 ## Secrets (Secret Manager)
 
@@ -180,6 +209,111 @@ curl https://rdf-api-448201086881.europe-central2.run.app/api/scraper/status
 | Secret Manager | 6 secret versions, well within free tier |
 | Artifact Registry | Minimal storage cost for Docker images |
 | **Total** | **~$7-15/mo for low traffic** |
+
+## Batch VM — Deployment and Operations
+
+The batch VM runs two long-lived services that scrape the Polish KRS/RDF registries.
+Code lives at `/opt/rdf-api-project/` and is deployed via git pull from GitHub.
+
+### Systemd services
+
+| Service | Unit file | What it runs |
+|---------|-----------|--------------|
+| `krs-scanner` | `deploy/krs-scanner.service` | `python -m batch.runner` — probes KRS integers to find valid entities |
+| `rdf-worker` | `deploy/rdf-worker.service` | `python -m batch.rdf_runner` — discovers + downloads documents for found entities |
+
+Both services run as the `worker` user, read config from `/opt/rdf-api-project/.env`,
+and are set to `Restart=on-failure`.
+
+### Deploying new code to the batch VM
+
+```bash
+# 1. SSH into the VM
+gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --project=rdf-api-project
+
+# 2. Pull latest code
+cd /opt/rdf-api-project
+sudo -u worker git pull origin main
+
+# 3. Install any new dependencies
+sudo -u worker .venv/bin/pip install -r requirements.txt
+
+# 4. Restart affected services
+sudo systemctl restart rdf-worker       # RDF document discovery + download
+sudo systemctl restart krs-scanner      # KRS integer scanner
+
+# 5. Verify
+sudo systemctl status rdf-worker --no-pager
+sudo systemctl status krs-scanner --no-pager
+```
+
+For code changes that only affect `batch/rdf_worker.py` or `batch/rdf_runner.py`,
+you only need to restart `rdf-worker`. The KRS scanner can keep running.
+
+### First-time VM setup
+
+If starting from a fresh VM:
+
+```bash
+# Install system dependencies
+sudo apt-get update && sudo apt-get install -y python3.12 python3.12-venv git postgresql-client
+
+# Create worker user
+sudo useradd --create-home --shell /bin/bash worker
+
+# Clone the repo
+sudo mkdir -p /opt/rdf-api-project
+sudo chown worker:worker /opt/rdf-api-project
+sudo -u worker git clone https://github.com/Karusmeister/rdf-api-project.git /opt/rdf-api-project
+
+# Set up Python venv
+cd /opt/rdf-api-project
+sudo -u worker python3.12 -m venv .venv
+sudo -u worker .venv/bin/pip install -r requirements.txt
+
+# Create .env with production values
+sudo -u worker cp .env.example .env
+# Edit .env: set DATABASE_URL, STORAGE_BACKEND=gcs, NORDVPN_*, BATCH_* etc.
+
+# Install systemd services
+sudo cp deploy/krs-scanner.service /etc/systemd/system/
+sudo cp deploy/rdf-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now krs-scanner rdf-worker
+```
+
+### Viewing logs
+
+```bash
+# Real-time logs
+sudo journalctl -u rdf-worker -f
+sudo journalctl -u krs-scanner -f
+
+# Last 100 lines
+sudo journalctl -u rdf-worker -n 100 --no-pager
+
+# Check process tree
+ps aux | grep 'batch\.' | grep -v grep
+```
+
+### Batch VM .env configuration
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `DATABASE_URL` | `postgresql://postgres:<pw>@34.118.73.120:5432/rdf` | Cloud SQL via public IP |
+| `STORAGE_BACKEND` | `gcs` | Store documents in GCS |
+| `STORAGE_GCS_BUCKET` | `rdf-project-documents` | GCS bucket for extracted files |
+| `BATCH_USE_VPN` | `true` | Route through NordVPN SOCKS5 |
+| `BATCH_WORKERS` | `5` | KRS scanner worker count |
+| `BATCH_CONCURRENCY_PER_WORKER` | `3` | Async concurrency for KRS scanner |
+| `BATCH_DELAY_SECONDS` | `1.5` | Delay between KRS probes |
+| `RDF_BATCH_CONCURRENCY` | `5` | Async concurrency per RDF worker |
+| `RDF_BATCH_DELAY_SECONDS` | `1.5` | Delay for discovery (encrypted search) |
+| `RDF_BATCH_DOWNLOAD_DELAY` | `0.3` | Delay for metadata/ZIP downloads |
+| `RDF_BATCH_PAGE_SIZE` | `100` | Documents per search page |
+| `NORDVPN_USERNAME` | _(secret)_ | NordVPN SOCKS5 credentials |
+| `NORDVPN_PASSWORD` | _(secret)_ | NordVPN SOCKS5 credentials |
+| `NORDVPN_SERVERS` | JSON array of hostnames | VPN server pool (Polish servers for low latency) |
 
 ## Scaling
 

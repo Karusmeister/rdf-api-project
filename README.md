@@ -12,42 +12,46 @@ The repository currently contains five connected pieces:
 
 ## Architecture
 
-```text
-Client / CLI
-    |
-    v
-FastAPI app
-  - /api/podmiot        (RDF proxy)
-  - /api/dokumenty      (RDF proxy)
-  - /api/analysis       (statement parsing)
-  - /api/scraper        (scraper status)
-  - /api/etl            (ETL trigger)
-  - /api/auth           (JWT signup/login/verify, Google SSO)
-  - /api/predictions    (per-KRS scores, features, history)
-    |
-    +--> app/rdf_client.py --> RDF upstream API
-    |
-    +--> app/services/xml_parser.py --> parsed financial statements
-    |
-    +--> app/scraper/job.py --> extracted files on disk
-    |
-    +--> app/services/etl.py --> prediction tables in PostgreSQL
-    |
-    +--> app/services/predictions.py --> scoring + response assembly
+```mermaid
+graph TB
+    Client["Client / Frontend"] -->|HTTPS| API
 
-Shared persistence
-  - PostgreSQL: rdf database (see docker-compose.yml)
-  - Files:  data/documents/krs/<krs>/<document_id_safe>/
+    subgraph GCP["GCP — europe-central2"]
+        API["Cloud Run<br/>FastAPI"] -->|Auth Proxy| DB[("Cloud SQL<br/>PostgreSQL 16")]
+        API -->|httpx| RDF
+
+        subgraph VM["GCE VM — rdf-batch-vm"]
+            Scanner["KRS Scanner<br/>7 workers + VPN"]
+            Worker["RDF Worker<br/>5 workers, concurrency=5"]
+        end
+
+        Scanner -->|probes| KRS
+        Scanner -->|writes| DB
+        Worker -->|discovery + download| RDF
+        Worker -->|writes| DB
+        Worker -->|uploads| GCS[("GCS Bucket<br/>rdf-project-documents")]
+        Secrets["Secret Manager"] -.->|env vars| API
+        Secrets -.->|.env| VM
+    end
+
+    subgraph Gov["Polish Government APIs"]
+        KRS["KRS Open API<br/>api-krs.ms.gov.pl"]
+        RDF["RDF Registry<br/>rdf-przegladarka.ms.gov.pl"]
+    end
 ```
+
+See [`docs/ARCHITECTURE_REVIEW.md`](docs/ARCHITECTURE_REVIEW.md) for the full architecture diagram and assessment.
 
 Key design choices:
 
+- **Two deployment targets**: Cloud Run for the API (stateless, scales to zero), GCE VM for batch scrapers (long-running, VPN-routed)
+- **Git-based deploys** to the batch VM — `git pull` + `systemctl restart`
 - Per-request pooled PostgreSQL connections via `ContextVar` middleware, with shared fallback for scripts/tests
 - Scraper tables, prediction/ETL tables, and auth tables live in the same PostgreSQL database
-- Downloaded RDF ZIPs are extracted immediately and stored as raw files plus `manifest.json`
-- KRS encryption is handled internally by [`app/crypto.py`](/Users/piotrkraus/piotr/rdf-api-project/app/crypto.py); clients never need to reproduce it
+- Downloaded RDF ZIPs are extracted immediately and stored in GCS (prod) or local disk (dev)
+- KRS encryption is handled internally by [`app/crypto.py`](app/crypto.py); clients never need to reproduce it
 - JWT-based auth with per-KRS access grants; Google SSO creates auto-verified users
-- Rate limiting on sensitive auth endpoints via slowapi
+- Secrets in GCP Secret Manager, not in env files or code
 
 ## Repository Layout
 
@@ -141,7 +145,7 @@ Most useful settings from [`.env.example`](/Users/piotrkraus/piotr/rdf-api-proje
 | `CORS_ORIGINS` | localhost frontend origins | Allowed CORS origins |
 | `WORKERS` | `4` | Uvicorn worker count in Docker/prod |
 | `DATABASE_URL` | `postgresql://rdf:rdf_dev@localhost:5432/rdf` | PostgreSQL connection string |
-| `STORAGE_BACKEND` | `local` | Storage backend; only `local` works today |
+| `STORAGE_BACKEND` | `local` | `local` (dev) or `gcs` (prod — requires GCP credentials) |
 | `STORAGE_LOCAL_PATH` | `data/documents` | Extracted document root |
 | `SCRAPER_ORDER_STRATEGY` | `priority_then_oldest` | KRS scheduling strategy |
 | `SCRAPER_MAX_KRS_PER_RUN` | `0` | `0` means unlimited |
@@ -426,7 +430,44 @@ Run the dedicated live regression suite for the KRS Open API integration and RDF
 
 Those tests live under `tests/regression/` and are kept separate from the regular unit/integration suite.
 
+## Cloud Deployment
+
+The project runs on GCP (`rdf-api-project`, `europe-central2`). Two components:
+
+| Component | Runs on | Deploy method |
+|-----------|---------|---------------|
+| **FastAPI app** | Cloud Run | `gcloud run deploy rdf-api --source . --region europe-central2` |
+| **Batch scrapers** | GCE VM (`rdf-batch-vm`) | `git pull` + `systemctl restart` |
+
+Shared persistence:
+- **Cloud SQL** (`rdf-postgres`) — PostgreSQL 16, all tables
+- **GCS** (`rdf-project-documents`) — extracted document files
+- **Secret Manager** — `database-url`, `jwt-secret`, `nordvpn-*`
+
+### Deploying the API (Cloud Run)
+
+```bash
+gcloud run deploy rdf-api --source . --region europe-central2
+```
+
+Cloud Build reads the Dockerfile, builds the image, and updates the service. Takes 2-4 minutes.
+
+### Deploying batch workers (GCE VM)
+
+```bash
+gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --project=rdf-api-project
+cd /opt/rdf-api-project
+sudo -u worker git pull origin main
+sudo -u worker .venv/bin/pip install -r requirements.txt  # only if deps changed
+sudo systemctl restart rdf-worker       # RDF document discovery + download
+sudo systemctl restart krs-scanner      # KRS integer scanner (if changed)
+```
+
+See [`docs/CLOUD_DEPLOYMENT.md`](docs/CLOUD_DEPLOYMENT.md) for full details: architecture, secrets, VM setup, .env config, monitoring, and costs.
+
 ## Further Reading
 
-- [`docs/RDF_API_DOCUMENTATION.md`](/Users/piotrkraus/piotr/rdf-api-project/docs/RDF_API_DOCUMENTATION.md) for the upstream RDF API contract
-- [`docs/PREDICTION_SCHEMA_DESIGN.md`](/Users/piotrkraus/piotr/rdf-api-project/docs/PREDICTION_SCHEMA_DESIGN.md) for the detailed prediction schema and lineage model
+- [`docs/CLOUD_DEPLOYMENT.md`](docs/CLOUD_DEPLOYMENT.md) — GCP architecture, deployment, secrets, and operations
+- [`docs/ARCHITECTURE_REVIEW.md`](docs/ARCHITECTURE_REVIEW.md) — Full architecture review with diagrams, assessment, and recommendations
+- [`docs/RDF_API_DOCUMENTATION.md`](docs/RDF_API_DOCUMENTATION.md) — Upstream RDF API contract
+- [`docs/PREDICTION_SCHEMA_DESIGN.md`](docs/PREDICTION_SCHEMA_DESIGN.md) — Prediction schema and lineage model

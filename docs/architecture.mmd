@@ -1,0 +1,78 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#4285F4', 'primaryTextColor': '#fff', 'primaryBorderColor': '#1a73e8', 'lineColor': '#5f6368', 'secondaryColor': '#34A853', 'tertiaryColor': '#f8f9fa', 'fontSize': '14px'}}}%%
+
+graph TB
+    subgraph Internet["Internet"]
+        Client["Client / Frontend<br/>(Lovable app)"]
+    end
+
+    subgraph GCP["GCP &mdash; europe-central2 (Warsaw)"]
+
+        subgraph CloudRun["Cloud Run &mdash; rdf-api"]
+            API["FastAPI<br/>uvicorn, 2 workers<br/>scales 0-3 instances"]
+            subgraph Endpoints["API Endpoints"]
+                EP1["/api/podmiot &mdash; Entity lookup"]
+                EP2["/api/dokumenty &mdash; Document search"]
+                EP3["/api/analysis &mdash; XML parsing"]
+                EP4["/api/etl &mdash; Ingestion trigger"]
+                EP5["/api/auth &mdash; JWT + Google SSO"]
+                EP6["/api/predictions &mdash; Scores"]
+            end
+        end
+
+        subgraph VM["GCE VM &mdash; rdf-batch-vm<br/>e2-standard-2, preemptible"]
+            subgraph Scanner["KRS Scanner<br/>(batch.runner)"]
+                S1["7 workers via NordVPN<br/>~5K KRS probed/hr"]
+            end
+            subgraph RDFWorker["RDF Worker<br/>(batch.rdf_runner)"]
+                R1["5 workers, concurrency=5<br/>Discovery + Download<br/>~1.2K KRS/hr"]
+            end
+        end
+
+        subgraph Storage["Persistence"]
+            DB[("Cloud SQL<br/>PostgreSQL 16<br/>db-f1-micro<br/>25 tables")]
+            GCS[("GCS Bucket<br/>rdf-project-documents<br/>Extracted ZIPs")]
+            Secrets["Secret Manager<br/>database-url<br/>jwt-secret<br/>nordvpn-*"]
+        end
+
+    end
+
+    subgraph Upstream["Polish Government APIs"]
+        KRS["KRS Open API<br/>api-krs.ms.gov.pl"]
+        RDF["RDF Registry<br/>rdf-przegladarka.ms.gov.pl"]
+    end
+
+    %% Client connections
+    Client -->|HTTPS| API
+
+    %% API connections
+    API -->|Cloud SQL Auth Proxy| DB
+    API -->|httpx async| RDF
+    API -.->|reads| Secrets
+
+    %% Scanner connections
+    S1 -->|NordVPN SOCKS5| KRS
+    S1 -->|writes: batch_progress| DB
+
+    %% RDF Worker connections
+    R1 -->|"direct + VPN"| RDF
+    R1 -->|writes: krs_document_versions| DB
+    R1 -->|uploads extracted files| GCS
+
+    %% Secrets
+    Secrets -.->|mounted as env vars| API
+    Secrets -.->|.env on VM| VM
+
+    %% Styling
+    classDef gcp fill:#4285F4,stroke:#1a73e8,color:#fff,stroke-width:2px
+    classDef vm fill:#34A853,stroke:#0d652d,color:#fff,stroke-width:2px
+    classDef storage fill:#FBBC04,stroke:#e8a600,color:#333,stroke-width:2px
+    classDef upstream fill:#EA4335,stroke:#c5221f,color:#fff,stroke-width:2px
+    classDef client fill:#9AA0A6,stroke:#5f6368,color:#fff,stroke-width:2px
+    classDef endpoint fill:#E8F0FE,stroke:#4285F4,color:#333,stroke-width:1px
+
+    class API gcp
+    class S1,R1 vm
+    class DB,GCS,Secrets storage
+    class KRS,RDF upstream
+    class Client client
+    class EP1,EP2,EP3,EP4,EP5,EP6 endpoint
