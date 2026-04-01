@@ -1,0 +1,102 @@
+{
+  "project": "rdf-api-project",
+  "region": "europe-central2",
+  "steps": [
+    {
+      "step": 1,
+      "title": "Authenticate and set GCP project",
+      "commands": [
+        "gcloud auth login",
+        "gcloud config set project rdf-api-project",
+        "gcloud services enable run.googleapis.com cloudbuild.googleapis.com sqladmin.googleapis.com"
+      ]
+    },
+    {
+      "step": 2,
+      "title": "Create Cloud SQL PostgreSQL instance",
+      "commands": [
+        "gcloud sql instances create rdf-postgres --database-version=POSTGRES_16 --tier=db-f1-micro --region=europe-central2 --storage-size=10 --storage-auto-increase",
+        "gcloud sql users set-password postgres --instance=rdf-postgres --password=<GENERATE_SECURE_PASSWORD>",
+        "gcloud sql databases create rdf --instance=rdf-postgres"
+      ],
+      "notes": "db-f1-micro is ~$7-10/mo. Upgrade to db-g1-small if you need more headroom."
+    },
+    {
+      "step": 3,
+      "title": "Get Cloud SQL connection name",
+      "commands": [
+        "gcloud sql instances describe rdf-postgres --format='value(connectionName)'"
+      ],
+      "notes": "Returns something like rdf-api-project:europe-central2:rdf-postgres. You need this for step 5."
+    },
+    {
+      "step": 4,
+      "title": "Generate a JWT secret",
+      "commands": [
+        "python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
+      ],
+      "notes": "Save this value securely. You will use it in the deploy command."
+    },
+    {
+      "step": 5,
+      "title": "Deploy to Cloud Run",
+      "commands": [
+        "gcloud run deploy rdf-api --source . --region europe-central2 --allow-unauthenticated --port 8000 --memory 1Gi --cpu 1 --min-instances 0 --max-instances 3 --add-cloudsql-instances <CONNECTION_NAME_FROM_STEP_3> --set-env-vars DATABASE_URL=postgresql://postgres:<PASSWORD_FROM_STEP_2>@/rdf?host=/cloudsql/<CONNECTION_NAME_FROM_STEP_3> --set-env-vars JWT_SECRET=<SECRET_FROM_STEP_4> --set-env-vars WORKERS=2 --set-env-vars LOG_LEVEL=INFO --set-env-vars CORS_ORIGINS=[\"https://<YOUR_LOVABLE_APP>.lovable.app\"]"
+      ],
+      "notes": "Cloud Run builds the container from your Dockerfile via Cloud Build. First deploy takes 2-3 minutes. The --allow-unauthenticated flag makes the API publicly accessible."
+    },
+    {
+      "step": 6,
+      "title": "Get the Cloud Run service URL",
+      "commands": [
+        "gcloud run services describe rdf-api --region europe-central2 --format='value(status.url)'"
+      ],
+      "notes": "Returns something like https://rdf-api-xxxxx-ew.a.run.app. This is your API base URL for the Lovable app."
+    },
+    {
+      "step": 7,
+      "title": "Verify the deployment",
+      "commands": [
+        "curl https://<SERVICE_URL_FROM_STEP_6>/health"
+      ],
+      "expected_response": "{\"status\":\"ok\"}"
+    },
+    {
+      "step": 8,
+      "title": "Initialize database schema",
+      "notes": "The app auto-creates tables on startup via lifespan hooks (scraper_db.connect, prediction_db.connect, krs_repo.connect). Just hitting /health triggers this. If you need to seed the admin user, run the seed script locally pointing at the Cloud SQL instance.",
+      "commands": [
+        "DATABASE_URL=postgresql://postgres:<PASSWORD>@<CLOUD_SQL_PUBLIC_IP>/rdf python scripts/seed_admin.py"
+      ]
+    },
+    {
+      "step": 9,
+      "title": "Configure your Lovable app",
+      "instructions": [
+        "In your Lovable app, set the API base URL to the Cloud Run service URL from step 6.",
+        "All API calls should use this base, e.g.: POST https://rdf-api-xxxxx-ew.a.run.app/api/podmiot/lookup",
+        "If using auth endpoints, store the JWT token from /api/auth/login and send it as Authorization: Bearer <token>."
+      ]
+    },
+    {
+      "step": 10,
+      "title": "Tighten CORS for production",
+      "commands": [
+        "gcloud run services update rdf-api --region europe-central2 --set-env-vars CORS_ORIGINS=[\"https://<YOUR_LOVABLE_APP>.lovable.app\"]"
+      ],
+      "notes": "Replace with your actual Lovable domain. You can add multiple origins as a JSON array."
+    }
+  ],
+  "cost_estimate": {
+    "cloud_run": "Free tier covers 2M requests/mo. Beyond that ~$0.40/million requests + CPU/memory charges only while handling requests.",
+    "cloud_sql": "$7-10/mo for db-f1-micro",
+    "cloud_build": "120 free build-minutes/day",
+    "total_estimate": "$7-15/mo for low traffic"
+  },
+  "useful_commands": {
+    "view_logs": "gcloud run services logs read rdf-api --region europe-central2 --limit 50",
+    "redeploy": "gcloud run deploy rdf-api --source . --region europe-central2",
+    "update_env_var": "gcloud run services update rdf-api --region europe-central2 --set-env-vars KEY=VALUE",
+    "check_status": "gcloud run services describe rdf-api --region europe-central2"
+  }
+}
