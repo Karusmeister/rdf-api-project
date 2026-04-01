@@ -18,9 +18,10 @@ class Settings(BaseSettings):
         "http://localhost:3000",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:3000",
-        # Lovable preview
+        # Lovable preview + production
         "https://id-preview--aaed77c9-b864-4814-8747-ad97402d1f70.lovable.app",
         "https://joy-forge-express.lovable.app",
+        "https://aaed77c9-b864-4814-8747-ad97402d1f70.lovableproject.com",
     ]
     workers: int = 4
     log_level: str = "INFO"
