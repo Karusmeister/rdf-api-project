@@ -101,19 +101,28 @@ app/
       routes.py        - /jobs/krs-sync/* (status, trigger)
     etl/
       routes.py        - /api/etl/ingest, /api/etl/training/dataset-stats
+    auth/
+      routes.py        - /api/auth/* (signup, login, verify, Google SSO, admin grant)
+      schemas.py       - Auth request/response Pydantic models
+    predictions/
+      routes.py        - /api/predictions/* (per-KRS scores, history, models, cache)
+      schemas.py       - Prediction response Pydantic models
+  auth.py              - JWT create/decode, get_current_user dependency, require_admin, require_krs_access
+  rate_limit.py        - Shared slowapi Limiter instance
   services/
     xml_parser.py      - e-Sprawozdanie XML parser (~1300 TAG_LABELS for Bilans, RZiS, CF)
     etl.py             - XML-to-PostgreSQL ingestion pipeline
     feature_engine.py  - Computes financial ratios from line items (incl. x1_maczynska custom)
     maczynska.py       - Maczynska 1994 discriminant model (baseline bankruptcy predictor)
     training_data.py   - EAV-to-wide pivot, bankruptcy label joining, dataset stats
+    predictions.py     - Predictions service: scoring, caching, response assembly
   monitoring/
     metrics.py         - Per-call metrics ring buffer, record_api_call(), get_stats()
   repositories/
     krs_repo.py        - PostgreSQL CRUD for krs_entities + krs_sync_log tables
   db/
-    connection.py      - Shared PostgreSQL connection manager (single lifecycle)
-    prediction_db.py   - PostgreSQL schema init + CRUD for prediction tables
+    connection.py      - PostgreSQL connection manager (shared conn + ThreadedConnectionPool + ContextVar per-request)
+    prediction_db.py   - PostgreSQL schema init + CRUD for prediction + auth tables
   scraper/
     cli.py             - Scraper CLI (import-krs, import-range, run, status)
     db.py              - PostgreSQL schema + CRUD for scraper tables
@@ -133,8 +142,10 @@ batch/
   rdf_runner.py        - RDF document batch orchestrator
 scripts/
   seed_features.py     - Populate feature_definitions and feature_sets
+  seed_admin.py        - Bootstrap admin user (--password or --google)
+  quick_scan.py        - Find N valid KRS entities, scrape docs, run ETL
 tests/
-  api/                 - FastAPI endpoint tests (endpoints, jobs routes)
+  api/                 - FastAPI endpoint tests (endpoints, jobs, auth, predictions)
   db/                  - DB schema + CRUD tests (prediction_db, krs_repo, scraper_db,
                          append-only versioning, document versions)
   batch/               - Batch processing tests (worker, runner, progress, connections,
@@ -201,17 +212,23 @@ Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
 **Job tracking:**
 - `assessment_jobs` - Tracks async pipeline status for the UI polling pattern.
 
+**Auth tables (app/db/prediction_db.py):**
+- `users` - User accounts. PK = id VARCHAR. UNIQUE(email). auth_method: 'local' or 'google'.
+- `verification_codes` - 6-digit email verification codes with expiry. FK to users.
+- `user_krs_access` - Per-user KRS access grants. PK = (user_id, krs).
+
 ## Key patterns
 
 ### PostgreSQL connection pattern
-One shared PostgreSQL connection managed by `app/db/connection.py`:
-- `app/db/connection.py` owns the connection lifecycle (connect/close/reset) using psycopg2
+Managed by `app/db/connection.py` with two tiers:
+- **Shared connection** (`connect()` / `get_conn()`): single global conn for startup, schema init, CLI scripts, tests
+- **Per-request pooled connections** (`ThreadedConnectionPool` + `ContextVar`): middleware acquires a pooled conn at request start, binds it to `_request_conn` ContextVar, releases it after response. `get_conn()` prefers the request-scoped conn when available.
 - `ConnectionWrapper` wraps psycopg2 with convenient `conn.execute(sql, params).fetchone()` API
-- Connections use `autocommit=True` for per-statement commit behavior
-- `app/scraper/db.py` and `app/db/prediction_db.py` delegate to the shared connection
-- Each module has `connect()` (ensures schema), `get_conn()` (returns shared conn), `close()` (no-op)
-- `app/main.py` lifespan calls `db_conn.connect()` + both schema inits at startup
+- All connections use `autocommit=True` for per-statement commit behavior
+- `app/scraper/db.py` and `app/db/prediction_db.py` delegate to `get_conn()` which routes to the right connection
+- `app/main.py` lifespan calls `db_conn.connect()` + `db_conn.init_pool()` + both schema inits at startup
 - Batch workers use `make_connection(dsn)` for standalone connections (no retry/lock logic needed)
+- `get_db()` context manager is available for explicit pool usage outside middleware
 - Plain SQL with `%s` parameterized queries, no ORM
 - Configuration via `DATABASE_URL` env var (default: `postgresql://rdf:rdf_dev@localhost:5432/rdf`)
 
@@ -255,6 +272,13 @@ pytest tests/e2e/ -v --e2e
 
 # Seed feature definitions
 python scripts/seed_features.py
+
+# Seed admin user
+python scripts/seed_admin.py admin@example.com --password "S3cureP@ss!" "Admin Name"
+python scripts/seed_admin.py admin@example.com --google  # Google SSO admin
+
+# Quick scan: find entities, scrape docs, run ETL
+python scripts/quick_scan.py --count 10 --start 1
 
 # Batch KRS scanner (all flags optional, defaults from .env)
 python -m batch.runner
@@ -305,6 +329,24 @@ python -m batch.runner --start 1 --no-vpn --delay 2.0
 | POST | /jobs/krs-scan/stop | Signal running scan to stop after current probe |
 | POST | /jobs/krs-scan/reset-cursor | Body: `{"next_krs_int": N}`. Rejected 409 if running |
 
+### Auth
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| POST | /api/auth/signup | - | Email+password signup. Rate limited 5/min. Returns user_id for verify step |
+| POST | /api/auth/verify | - | 6-digit code verification. Rate limited 10/min |
+| POST | /api/auth/login | - | Email+password login. Returns JWT + user profile |
+| POST | /api/auth/google | - | Google OAuth2 ID token exchange. Auto-creates verified user |
+| GET | /api/auth/me | Bearer JWT | Current user profile + KRS access list |
+| POST | /api/auth/admin/grant-access | Bearer JWT (admin) | Grant KRS access to a user. Rate limited 20/min |
+
+### Predictions
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| GET | /api/predictions/models | - | List active models with interpretation thresholds |
+| GET | /api/predictions/{krs} | Bearer JWT + KRS access | Full prediction detail: scores, features, source tags, history |
+| GET | /api/predictions/{krs}/history | Bearer JWT + KRS access | Score timeline per model for charting |
+| POST | /api/predictions/cache/invalidate | Bearer JWT (admin) | Flush model + feature definition caches |
+
 ## Gotchas
 
 1. Document IDs are Base64 with `=`, `+`, `/` - must URL-encode in path params
@@ -317,6 +359,9 @@ python -m batch.runner --start 1 --no-vpn --delay 2.0
 8. Feature store uses EAV pattern - pivot to wide format for ML training
 9. `STORAGE_BACKEND=gcs` requires `google-cloud-storage` and valid GCP credentials (ADC or service account)
 10. Generate fresh encryption token for EVERY search request - never cache
+11. JWT_SECRET must be >=32 bytes in staging/production — app refuses to start otherwise
+12. Auth endpoints are rate-limited via slowapi (signup 5/min, verify 10/min, grant-access 20/min)
+13. `get_conn()` returns per-request pooled connection during HTTP requests, shared connection in scripts/tests
 
 ## Keeping docs current
 

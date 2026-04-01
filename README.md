@@ -2,31 +2,13 @@
 
 FastAPI service for working with the Polish Ministry of Justice financial document registry (`rdf-przegladarka.ms.gov.pl`).
 
-The repository currently contains four connected pieces:
+The repository currently contains five connected pieces:
 
 1. An RDF proxy API that hides the upstream KRS encryption and exposes a cleaner HTTP interface.
 2. Analysis endpoints that download and parse Polish GAAP XML statements server-side.
 3. A bulk scraper that keeps a PostgreSQL inventory of KRS entities and downloaded documents.
 4. An ETL and feature-engineering foundation for building a bankruptcy-prediction pipeline.
-
-## Current State
-
-Implemented today:
-
-- RDF lookup, document search, metadata, and ZIP download endpoints
-- Financial statement parsing, period discovery, year-over-year comparison, and time-series analysis
-- Shared PostgreSQL persistence for scraper and prediction tables
-- Local extracted-file storage for downloaded RDF documents
-- Scraper CLI for importing KRS numbers and downloading document corpora
-- ETL ingestion from extracted XML into analytical tables
-- Feature definitions and feature computation services in Python
-
-Not implemented or not exposed yet:
-
-- Authentication or authorization
-- A frontend application in this repository
-- Public HTTP endpoints for feature computation, model training, or model scoring
-- A working GCS storage backend (`STORAGE_BACKEND=gcs` currently raises `NotImplementedError`)
+5. Auth (JWT + Google SSO) and predictions API with per-KRS access control.
 
 ## Architecture
 
@@ -35,11 +17,13 @@ Client / CLI
     |
     v
 FastAPI app
-  - /api/podmiot
-  - /api/dokumenty
-  - /api/analysis
-  - /api/scraper
-  - /api/etl
+  - /api/podmiot        (RDF proxy)
+  - /api/dokumenty      (RDF proxy)
+  - /api/analysis       (statement parsing)
+  - /api/scraper        (scraper status)
+  - /api/etl            (ETL trigger)
+  - /api/auth           (JWT signup/login/verify, Google SSO)
+  - /api/predictions    (per-KRS scores, features, history)
     |
     +--> app/rdf_client.py --> RDF upstream API
     |
@@ -48,6 +32,8 @@ FastAPI app
     +--> app/scraper/job.py --> extracted files on disk
     |
     +--> app/services/etl.py --> prediction tables in PostgreSQL
+    |
+    +--> app/services/predictions.py --> scoring + response assembly
 
 Shared persistence
   - PostgreSQL: rdf database (see docker-compose.yml)
@@ -56,10 +42,12 @@ Shared persistence
 
 Key design choices:
 
-- One shared PostgreSQL connection, managed in [`app/db/connection.py`](/Users/piotrkraus/piotr/rdf-api-project/app/db/connection.py)
-- Scraper tables and prediction/ETL tables live in the same PostgreSQL database
+- Per-request pooled PostgreSQL connections via `ContextVar` middleware, with shared fallback for scripts/tests
+- Scraper tables, prediction/ETL tables, and auth tables live in the same PostgreSQL database
 - Downloaded RDF ZIPs are extracted immediately and stored as raw files plus `manifest.json`
 - KRS encryption is handled internally by [`app/crypto.py`](/Users/piotrkraus/piotr/rdf-api-project/app/crypto.py); clients never need to reproduce it
+- JWT-based auth with per-KRS access grants; Google SSO creates auto-verified users
+- Rate limiting on sensitive auth endpoints via slowapi
 
 ## Repository Layout
 
@@ -72,11 +60,15 @@ app/
   db/
     connection.py         Shared PostgreSQL connection manager
     prediction_db.py      Prediction/ETL schema and CRUD helpers
+  auth.py                 JWT utilities, get_current_user dependency, access control
+  rate_limit.py           Shared slowapi Limiter instance
   routers/
     rdf/                  Proxy endpoints for the upstream RDF API
     analysis/             XML parsing and comparison endpoints
     scraper/              Read-only scraper status endpoint
     etl/                  ETL trigger endpoint
+    auth/                 Signup, login, verify, Google SSO, admin grant endpoints
+    predictions/          Per-KRS prediction scores, history, model catalog
   scraper/
     cli.py                Scraper CLI
     db.py                 Scraper schema and CRUD helpers
@@ -86,8 +78,11 @@ app/
     xml_parser.py         Statement parsing and comparison logic
     etl.py                XML -> PostgreSQL ingestion
     feature_engine.py     Ratio and feature computation
+    predictions.py        Scoring, caching, response assembly for predictions API
 scripts/
   seed_features.py        Seeds feature definitions and feature sets
+  seed_admin.py           Bootstrap admin user (--password or --google)
+  quick_scan.py           Find N valid KRS entities, scrape docs, run ETL
 tests/
   unit/integration tests plus optional networked e2e coverage
 docs/
@@ -280,6 +275,68 @@ curl -X POST http://localhost:8000/api/etl/ingest \
   -d '{}'
 ```
 
+### Auth Endpoints
+
+All auth endpoints are under `/api/auth`. Signup and verify are rate-limited.
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/api/auth/signup` | none | Register with email + password (min 8 chars). Returns `user_id` for verification |
+| `POST` | `/api/auth/verify` | none | Submit 6-digit code to verify email. Returns JWT |
+| `POST` | `/api/auth/login` | none | Email + password login. Returns JWT |
+| `POST` | `/api/auth/google` | none | Exchange Google OAuth2 ID token for JWT. Auto-creates verified user |
+| `GET` | `/api/auth/me` | Bearer JWT | Current user profile and KRS access list |
+| `POST` | `/api/auth/admin/grant-access` | Bearer JWT (admin) | Grant a user access to a specific KRS number |
+
+Examples:
+
+```bash
+# Sign up
+curl -X POST http://localhost:8000/api/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"user@example.com","password":"securepass123"}'
+
+# Verify (code is logged in dev mode)
+curl -X POST http://localhost:8000/api/auth/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"<uuid>","code":"123456"}'
+
+# Login
+curl -X POST http://localhost:8000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"user@example.com","password":"securepass123"}'
+
+# Get profile
+curl http://localhost:8000/api/auth/me \
+  -H 'Authorization: Bearer <token>'
+```
+
+### Predictions Endpoints
+
+Predictions require authentication. Access to individual KRS numbers is gated by `user_krs_access` grants (or `has_full_access` for admins).
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/api/predictions/models` | none | List active models with interpretation thresholds |
+| `GET` | `/api/predictions/{krs}` | Bearer JWT + KRS access | Full prediction detail: scores, features with source tags, history |
+| `GET` | `/api/predictions/{krs}/history` | Bearer JWT + KRS access | Score timeline per model (optional `?model_id=` filter) |
+| `POST` | `/api/predictions/cache/invalidate` | Bearer JWT (admin) | Flush model and feature definition caches |
+
+Examples:
+
+```bash
+# List models (no auth required)
+curl http://localhost:8000/api/predictions/models
+
+# Get predictions for a KRS (requires auth + access)
+curl http://localhost:8000/api/predictions/0000694720 \
+  -H 'Authorization: Bearer <token>'
+
+# Get prediction history
+curl 'http://localhost:8000/api/predictions/0000694720/history?model_id=maczynska_1994_v1' \
+  -H 'Authorization: Bearer <token>'
+```
+
 ## Bulk Scraping Workflow
 
 The scraper is CLI-driven. Typical flow:
@@ -311,6 +368,18 @@ Supported scraper modes:
 - `retry_errors`
 - `specific_krs` when `--krs` is passed
 
+## Admin Setup
+
+Bootstrap an admin user to access predictions and grant KRS access to others:
+
+```bash
+# With password (for local auth)
+python scripts/seed_admin.py admin@example.com --password "S3cureP@ss!" "Admin Name"
+
+# For Google SSO admin (no password needed)
+python scripts/seed_admin.py admin@example.com --google "Admin Name"
+```
+
 ## ETL and Feature Pipeline
 
 Current pipeline after documents are on disk:
@@ -322,7 +391,7 @@ Current pipeline after documents are on disk:
 2. [`scripts/seed_features.py`](/Users/piotrkraus/piotr/rdf-api-project/scripts/seed_features.py) seeds feature metadata
 3. [`app/services/feature_engine.py`](/Users/piotrkraus/piotr/rdf-api-project/app/services/feature_engine.py) computes ratios and derived features
 
-There is currently no public API endpoint for feature computation or prediction scoring. Those steps are available as Python services inside the repository.
+Prediction scores are exposed via `/api/predictions/{krs}` (see Auth and Predictions sections above). Scores are pre-computed by `app/services/maczynska.py` and stored in the `predictions` table.
 
 ## Testing
 
