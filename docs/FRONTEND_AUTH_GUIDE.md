@@ -413,9 +413,19 @@ For validation errors (422):
 
 | Variable | Purpose | Required |
 |----------|---------|----------|
-| `RECAPTCHA_SECRET_KEY` | Google reCAPTCHA v3 secret key | Production only |
-| `FRONTEND_URL` | Base URL for password reset links (default: `http://localhost:5173`) | Production |
+| `RECAPTCHA_SECRET_KEY` | Google reCAPTCHA v3 secret key | **Required** in staging/production |
+| `AUTH_REQUIRE_CAPTCHA_IN_NONLOCAL` | Enforce captcha requirement (default: `true`) | No |
+| `FRONTEND_URL` | Base URL for password reset links. **Must be `https://`** in staging/production | **Required** in staging/production |
 | `JWT_SECRET` | JWT signing secret (>=32 bytes in production) | Always |
-| `VERIFICATION_EMAIL_MODE` | `log` (dev, prints to console) or `smtp` (sends real email) | Always |
+| `VERIFICATION_EMAIL_MODE` | `log` (dev, prints to console) or `smtp` (sends real email). **Must be `smtp`** in staging/production | Always |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | Email delivery | When `VERIFICATION_EMAIL_MODE=smtp` |
 | `GOOGLE_CLIENT_ID` | Google OAuth2 client ID | For Google SSO |
+
+### Non-local enforcement
+
+The backend **refuses to start** in staging/production if:
+- `RECAPTCHA_SECRET_KEY` is empty (unless `AUTH_REQUIRE_CAPTCHA_IN_NONLOCAL=false`)
+- `VERIFICATION_EMAIL_MODE` is `log`
+- `FRONTEND_URL` does not use `https://` or points to localhost
+
+These checks do not apply in `ENVIRONMENT=local`.

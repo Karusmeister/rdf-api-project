@@ -42,6 +42,7 @@ async def lifespan(app: FastAPI):
     configure_logging()
     logger.info("app_startup", extra={"event": "startup"})
     settings.validate_jwt_secret()
+    settings.validate_auth_security()
     db_conn.connect()
     db_conn.init_pool(settings.database_url, settings.db_pool_min, settings.db_pool_max)
     scraper_db.connect()

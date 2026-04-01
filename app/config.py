@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from: str = "noreply@example.com"
     recaptcha_secret_key: str = ""  # Google reCAPTCHA v3 secret; empty = skip verification (dev)
+    auth_require_captcha_in_nonlocal: bool = True  # enforce reCAPTCHA in staging/production
     frontend_url: str = "http://localhost:5173"  # base URL for password-reset links
     environment: str = "local"  # 'local', 'staging', 'production'
 
@@ -94,6 +95,37 @@ class Settings(BaseSettings):
             )
         if len(self.jwt_secret.encode()) < 32 and self.environment != "local":
             raise ValueError("JWT_SECRET must be at least 32 bytes for HMAC-SHA256")
+
+    def validate_auth_security(self) -> None:
+        """Enforce auth security invariants in non-local environments. Fail fast."""
+        if self.environment == "local":
+            return
+
+        if self.auth_require_captcha_in_nonlocal and not self.recaptcha_secret_key:
+            raise ValueError(
+                "RECAPTCHA_SECRET_KEY must be set in staging/production. "
+                "Get one at https://www.google.com/recaptcha/admin. "
+                "Set AUTH_REQUIRE_CAPTCHA_IN_NONLOCAL=false only if you accept the risk."
+            )
+
+        if self.verification_email_mode == "log":
+            raise ValueError(
+                "VERIFICATION_EMAIL_MODE must not be 'log' in staging/production — "
+                "verification codes would only appear in server logs, not reach users. "
+                "Set VERIFICATION_EMAIL_MODE=smtp and configure SMTP_* variables."
+            )
+
+        if not self.frontend_url.startswith("https://"):
+            raise ValueError(
+                f"FRONTEND_URL must use https:// in staging/production (got: {self.frontend_url}). "
+                "Password reset links are sent over email and must use a secure URL."
+            )
+
+        _lower = self.frontend_url.lower()
+        if "localhost" in _lower or "127.0.0.1" in _lower:
+            raise ValueError(
+                f"FRONTEND_URL must not point to localhost in staging/production (got: {self.frontend_url})."
+            )
 
     # --- Scraper ---
 

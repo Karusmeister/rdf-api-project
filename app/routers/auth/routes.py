@@ -70,9 +70,11 @@ def _send_verification_email(email: str, code: str) -> None:
 def _send_password_reset_email(email: str, token: str) -> None:
     reset_url = f"{settings.frontend_url}/reset-password?token={token}"
     if settings.verification_email_mode == "log":
+        # Log a safe fingerprint — never the raw token or full URL
+        token_fingerprint = _hash_token(token)[:12]
         logger.info(
-            "password_reset_link",
-            extra={"event": "password_reset_link", "email": email, "url": reset_url},
+            "password_reset_requested",
+            extra={"event": "password_reset_requested", "email": email, "token_fingerprint": token_fingerprint},
         )
     else:
         import smtplib
@@ -101,7 +103,9 @@ async def verify_captcha(token: str | None, action: str) -> None:
     """Verify a reCAPTCHA v3 token with Google's API.
 
     Skips verification when RECAPTCHA_SECRET_KEY is not set (dev mode).
-    Raises HTTPException(400) on failure.
+    Raises HTTPException(400) for captcha failures, HTTPException(503) for
+    provider errors (timeout, network, bad response). Fail-closed: if
+    verification cannot complete, the request is denied.
     """
     if not settings.recaptcha_secret_key:
         return  # dev mode — skip
@@ -109,16 +113,28 @@ async def verify_captcha(token: str | None, action: str) -> None:
     if not token:
         raise HTTPException(400, "reCAPTCHA token is required")
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://www.google.com/recaptcha/api/siteverify",
-            data={
-                "secret": settings.recaptcha_secret_key,
-                "response": token,
-            },
-        )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.post(
+                "https://www.google.com/recaptcha/api/siteverify",
+                data={
+                    "secret": settings.recaptcha_secret_key,
+                    "response": token,
+                },
+            )
+            resp.raise_for_status()
+    except httpx.TimeoutException:
+        logger.warning("captcha_timeout action=%s", action)
+        raise HTTPException(503, "Temporary authentication provider failure. Please retry.")
+    except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+        logger.warning("captcha_request_error action=%s error=%s", action, type(exc).__name__)
+        raise HTTPException(503, "Temporary authentication provider failure. Please retry.")
 
-    result = resp.json()
+    try:
+        result = resp.json()
+    except ValueError:
+        logger.warning("captcha_invalid_json action=%s", action)
+        raise HTTPException(503, "Temporary authentication provider failure. Please retry.")
 
     if not result.get("success"):
         logger.warning("captcha_failed action=%s errors=%s", action, result.get("error-codes"))
@@ -306,14 +322,14 @@ async def forgot_password(request: Request, body: ForgotPasswordRequest):
 @limiter.limit("10/minute")
 def reset_password(request: Request, body: ResetPasswordRequest):
     """Validate a password reset token and set a new password.
-    The token is single-use and expires after 1 hour."""
+    The token is single-use and expires after 1 hour.
+    All other outstanding reset tokens for the same user are revoked atomically."""
     token_hash = _hash_token(body.token)
-    user_id = prediction_db.consume_password_reset_token(token_hash)
+    hashed = _hash_password(body.new_password)
+    user_id = prediction_db.reset_password_atomic(token_hash, hashed)
     if user_id is None:
         raise HTTPException(400, "Invalid or expired reset token")
 
-    hashed = _hash_password(body.new_password)
-    prediction_db.update_password(user_id, hashed)
     return {"message": "Password updated successfully"}
 
 

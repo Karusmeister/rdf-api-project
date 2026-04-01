@@ -2,12 +2,14 @@
 
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import jwt
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.auth import create_token
-from app.config import settings
+from app.config import Settings, settings
 from app.main import app
 from app.rate_limit import limiter
 
@@ -293,7 +295,6 @@ class TestCaptcha:
         """When RECAPTCHA_SECRET_KEY is empty, captcha is skipped."""
         import asyncio
         from app.routers.auth.routes import verify_captcha
-        # settings.recaptcha_secret_key defaults to "" — should not raise
         asyncio.run(verify_captcha("any-token", "register"))
 
     def test_captcha_required_when_secret_set_but_no_token(self):
@@ -304,6 +305,74 @@ class TestCaptcha:
             with pytest.raises(Exception) as exc_info:
                 asyncio.run(verify_captcha(None, "register"))
             assert "required" in str(exc_info.value).lower()
+
+    def test_captcha_timeout_returns_503(self):
+        """AUTH-002: Google timeout produces 503, not 500."""
+        import asyncio
+        from app.routers.auth.routes import verify_captcha
+        with patch.object(settings, "recaptcha_secret_key", "test-secret"):
+            with patch("app.routers.auth.routes.httpx.AsyncClient") as mock_cls:
+                mock_client = AsyncMock()
+                mock_client.post.side_effect = httpx.TimeoutException("read timed out")
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=False)
+                mock_cls.return_value = mock_client
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(verify_captcha("tok", "login"))
+                assert exc_info.value.status_code == 503
+
+    def test_captcha_request_error_returns_503(self):
+        """AUTH-002: Network error produces 503."""
+        import asyncio
+        from app.routers.auth.routes import verify_captcha
+        with patch.object(settings, "recaptcha_secret_key", "test-secret"):
+            with patch("app.routers.auth.routes.httpx.AsyncClient") as mock_cls:
+                mock_client = AsyncMock()
+                mock_client.post.side_effect = httpx.ConnectError("refused")
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=False)
+                mock_cls.return_value = mock_client
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(verify_captcha("tok", "login"))
+                assert exc_info.value.status_code == 503
+
+    def test_captcha_low_score_returns_400(self):
+        """AUTH-002: Low score produces 400."""
+        import asyncio
+        from unittest.mock import MagicMock
+        from app.routers.auth.routes import verify_captcha
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"success": True, "score": 0.1, "action": "login"}
+        with patch.object(settings, "recaptcha_secret_key", "test-secret"):
+            with patch("app.routers.auth.routes.httpx.AsyncClient") as mock_cls:
+                mock_client = AsyncMock()
+                mock_client.post.return_value = mock_resp
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=False)
+                mock_cls.return_value = mock_client
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(verify_captcha("tok", "login"))
+                assert exc_info.value.status_code == 400
+
+    def test_captcha_action_mismatch_returns_400(self):
+        """AUTH-002: Action mismatch produces 400."""
+        import asyncio
+        from unittest.mock import MagicMock
+        from app.routers.auth.routes import verify_captcha
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"success": True, "score": 0.9, "action": "wrong_action"}
+        with patch.object(settings, "recaptcha_secret_key", "test-secret"):
+            with patch("app.routers.auth.routes.httpx.AsyncClient") as mock_cls:
+                mock_client = AsyncMock()
+                mock_client.post.return_value = mock_resp
+                mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_client.__aexit__ = AsyncMock(return_value=False)
+                mock_cls.return_value = mock_client
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(verify_captcha("tok", "login"))
+                assert exc_info.value.status_code == 400
 
 
 # ---------------------------------------------------------------------------
@@ -354,10 +423,9 @@ class TestForgotPassword:
 # ---------------------------------------------------------------------------
 
 class TestResetPassword:
-    @patch("app.db.prediction_db.update_password")
-    @patch("app.db.prediction_db.consume_password_reset_token", return_value="user-1")
+    @patch("app.db.prediction_db.reset_password_atomic", return_value="user-1")
     @patch("app.routers.auth.routes._hash_password", return_value="new-hashed")
-    def test_reset_password_success(self, mock_hash, mock_consume, mock_update):
+    def test_reset_password_success(self, mock_hash, mock_atomic):
         limiter.reset()
         resp = client.post("/api/auth/reset-password", json={
             "token": "valid-reset-token",
@@ -365,16 +433,34 @@ class TestResetPassword:
         })
         assert resp.status_code == 200
         assert "updated" in resp.json()["message"].lower()
-        mock_update.assert_called_once_with("user-1", "new-hashed")
+        mock_atomic.assert_called_once()
 
-    @patch("app.db.prediction_db.consume_password_reset_token", return_value=None)
-    def test_reset_password_invalid_token(self, mock_consume):
+    @patch("app.db.prediction_db.reset_password_atomic", return_value=None)
+    def test_reset_password_invalid_token(self, mock_atomic):
         limiter.reset()
         resp = client.post("/api/auth/reset-password", json={
             "token": "expired-or-used-token",
             "new_password": "newSecurePass!",
         })
         assert resp.status_code == 400
+
+    @patch("app.db.prediction_db.reset_password_atomic")
+    @patch("app.routers.auth.routes._hash_password", return_value="hashed")
+    def test_second_token_fails_after_first_reset(self, mock_hash, mock_atomic):
+        """AUTH-003: After one successful reset, all other tokens for the same user are revoked."""
+        mock_atomic.side_effect = ["user-1", None]  # first succeeds, second fails
+        limiter.reset()
+        resp1 = client.post("/api/auth/reset-password", json={
+            "token": "first-token",
+            "new_password": "newPass123!",
+        })
+        assert resp1.status_code == 200
+
+        resp2 = client.post("/api/auth/reset-password", json={
+            "token": "second-token",
+            "new_password": "anotherPass!",
+        })
+        assert resp2.status_code == 400
 
     def test_reset_password_short_password(self):
         resp = client.post("/api/auth/reset-password", json={
@@ -509,3 +595,111 @@ class TestRateLimiting:
         )
         assert resp.status_code == 429
         limiter.reset()
+
+
+# ---------------------------------------------------------------------------
+# AUTH-001: Fail-closed config validation
+# ---------------------------------------------------------------------------
+
+class TestAuthConfigValidation:
+    def test_production_rejects_empty_captcha_secret(self):
+        """AUTH-001: production + empty RECAPTCHA_SECRET_KEY fails at startup."""
+        s = Settings(
+            environment="production",
+            jwt_secret="a" * 32,
+            recaptcha_secret_key="",
+            auth_require_captcha_in_nonlocal=True,
+            verification_email_mode="smtp",
+            frontend_url="https://app.example.com",
+        )
+        with pytest.raises(ValueError, match="RECAPTCHA_SECRET_KEY"):
+            s.validate_auth_security()
+
+    def test_production_rejects_log_email_mode(self):
+        """AUTH-001: production + verification_email_mode=log fails."""
+        s = Settings(
+            environment="production",
+            jwt_secret="a" * 32,
+            recaptcha_secret_key="secret",
+            verification_email_mode="log",
+            frontend_url="https://app.example.com",
+        )
+        with pytest.raises(ValueError, match="VERIFICATION_EMAIL_MODE"):
+            s.validate_auth_security()
+
+    def test_production_rejects_http_frontend_url(self):
+        """AUTH-001: production + http:// frontend_url fails."""
+        s = Settings(
+            environment="production",
+            jwt_secret="a" * 32,
+            recaptcha_secret_key="secret",
+            verification_email_mode="smtp",
+            frontend_url="http://app.example.com",
+        )
+        with pytest.raises(ValueError, match="https://"):
+            s.validate_auth_security()
+
+    def test_production_rejects_localhost_frontend_url(self):
+        """AUTH-001: production + localhost frontend_url fails."""
+        s = Settings(
+            environment="production",
+            jwt_secret="a" * 32,
+            recaptcha_secret_key="secret",
+            verification_email_mode="smtp",
+            frontend_url="https://localhost:5173",
+        )
+        with pytest.raises(ValueError, match="localhost"):
+            s.validate_auth_security()
+
+    def test_local_allows_all_defaults(self):
+        """AUTH-001: local env allows empty captcha, log mode, http URL."""
+        s = Settings(
+            environment="local",
+            recaptcha_secret_key="",
+            verification_email_mode="log",
+            frontend_url="http://localhost:5173",
+        )
+        s.validate_auth_security()  # should not raise
+
+    def test_production_passes_with_valid_config(self):
+        """AUTH-001: properly configured production passes."""
+        s = Settings(
+            environment="production",
+            jwt_secret="a" * 32,
+            recaptcha_secret_key="6Le...",
+            verification_email_mode="smtp",
+            frontend_url="https://app.example.com",
+        )
+        s.validate_auth_security()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# AUTH-004: No raw reset token in logs
+# ---------------------------------------------------------------------------
+
+class TestResetTokenLogSafety:
+    def test_log_mode_does_not_emit_raw_token(self, caplog):
+        """AUTH-004: log-mode password reset must not contain raw token or ?token= in logs."""
+        import logging
+        from app.routers.auth.routes import _send_password_reset_email
+        raw_token = "super-secret-reset-token-value-that-should-not-appear"
+        with caplog.at_level(logging.INFO, logger="app.routers.auth.routes"):
+            _send_password_reset_email("user@example.com", raw_token)
+
+        # Raw token and full URL must not appear anywhere in logs
+        full_log = caplog.text
+        for record in caplog.records:
+            full_log += str(getattr(record, "url", ""))
+            full_log += str(getattr(record, "token_fingerprint", ""))
+        assert raw_token not in full_log
+        assert "?token=" not in full_log
+
+        # But the event should still be observable
+        assert "password_reset_requested" in caplog.text
+        # Email is in the record extras, not in the formatted text
+        reset_records = [r for r in caplog.records if r.getMessage() == "password_reset_requested"]
+        assert len(reset_records) == 1
+        assert getattr(reset_records[0], "email", None) == "user@example.com"
+        # Fingerprint should be present and short (12 hex chars)
+        fingerprint = getattr(reset_records[0], "token_fingerprint", "")
+        assert len(fingerprint) == 12

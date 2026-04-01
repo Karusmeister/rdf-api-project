@@ -360,6 +360,8 @@ def _init_schema() -> None:
         ("idx_activity_krs",        "CREATE INDEX idx_activity_krs ON activity_log(krs_number, created_at DESC)"),
         ("idx_activity_user",       "CREATE INDEX idx_activity_user ON activity_log(user_id, created_at DESC)"),
         ("idx_activity_time",       "CREATE INDEX idx_activity_time ON activity_log(created_at DESC)"),
+        ("idx_reset_token_hash",    "CREATE UNIQUE INDEX idx_reset_token_hash ON password_reset_tokens(token_hash)"),
+        ("idx_reset_token_user",    "CREATE INDEX idx_reset_token_user ON password_reset_tokens(user_id, used_at, expires_at)"),
     ]
 
     for name, sql in index_defs:
@@ -1398,6 +1400,49 @@ def consume_password_reset_token(token_hash: str) -> Optional[str]:
         )
         RETURNING user_id
     """, [now, token_hash, now]).fetchone()
+    return row[0] if row else None
+
+
+def reset_password_atomic(token_hash: str, new_password_hash: str) -> Optional[str]:
+    """Atomically consume a reset token, update password, and revoke all other tokens for the user.
+
+    Returns user_id on success, None if token is invalid/expired/used.
+    Uses a CTE to ensure all three operations happen in a single statement:
+    1. Consume the matching token (set used_at)
+    2. Update the user's password hash
+    3. Revoke all other unused tokens for the same user
+    """
+    conn = get_conn()
+    row = conn.execute("""
+        WITH consume AS (
+            UPDATE password_reset_tokens
+            SET used_at = current_timestamp
+            WHERE id = (
+                SELECT id FROM password_reset_tokens
+                WHERE token_hash = %s
+                  AND used_at IS NULL
+                  AND expires_at > current_timestamp
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, user_id
+        ),
+        update_pw AS (
+            UPDATE users
+            SET password_hash = %s
+            WHERE id = (SELECT user_id FROM consume)
+            RETURNING id
+        ),
+        revoke_others AS (
+            UPDATE password_reset_tokens
+            SET used_at = current_timestamp
+            WHERE user_id = (SELECT user_id FROM consume)
+              AND used_at IS NULL
+              AND id != (SELECT id FROM consume)
+        )
+        SELECT user_id FROM consume
+    """, [token_hash, new_password_hash]).fetchone()
     return row[0] if row else None
 
 
