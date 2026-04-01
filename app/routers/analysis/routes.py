@@ -7,11 +7,13 @@ import asyncio
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from app import rdf_client
+from app.auth import OptionalUser
 from app.routers.analysis.schemas import CompareRequest, StatementRequest, TimeSeriesRequest
 from app.services import xml_parser
+from app.services.activity import activity_logger
 
 logger = logging.getLogger(__name__)
 
@@ -156,15 +158,33 @@ def _ratio_with_change(current: Optional[float], previous: Optional[float]) -> d
 # ---------------------------------------------------------------------------
 
 @router.post("/statement", summary="Parse a financial statement")
-async def get_statement(body: StatementRequest):
+async def get_statement(
+    body: StatementRequest,
+    request: Request,
+    background: BackgroundTasks,
+    user: OptionalUser = None,
+):
     """Parse a single financial statement and return the full hierarchical tree."""
     logger.info("statement_parse", extra={"event": "statement_parse", "krs": body.krs, "period_end": body.period_end})
     stmt = await _fetch_and_parse(body.krs, body.period_end)
+    background.add_task(
+        activity_logger.log,
+        user["id"] if user else None,
+        "analysis_statement",
+        body.krs,
+        {"period_end": body.period_end},
+        request.client.host if request.client else None,
+    )
     return stmt
 
 
 @router.post("/compare", summary="Compare two periods")
-async def compare(body: CompareRequest):
+async def compare(
+    body: CompareRequest,
+    request: Request,
+    background: BackgroundTasks,
+    user: OptionalUser = None,
+):
     """
     Compare two financial statements year-over-year.
     Returns a merged tree with change calculations and financial ratios.
@@ -220,7 +240,7 @@ async def compare(body: CompareRequest):
     c_company = current_stmt["company"]
     p_company = previous_stmt["company"]
 
-    return {
+    result = {
         "company": {
             "name": c_company.get("name"),
             "krs": c_company.get("krs"),
@@ -239,10 +259,24 @@ async def compare(body: CompareRequest):
         "cash_flow": comparison["cash_flow"],
         "ratios": ratios,
     }
+    background.add_task(
+        activity_logger.log,
+        user["id"] if user else None,
+        "analysis_compare",
+        body.krs,
+        {"periods": [body.period_end_current, body.period_end_previous]},
+        request.client.host if request.client else None,
+    )
+    return result
 
 
 @router.post("/time-series", summary="Track fields across years")
-async def time_series(body: TimeSeriesRequest):
+async def time_series(
+    body: TimeSeriesRequest,
+    request: Request,
+    background: BackgroundTasks,
+    user: OptionalUser = None,
+):
     """Track selected financial fields across multiple years."""
     logger.info(
         "time_series",
@@ -358,11 +392,20 @@ async def time_series(body: TimeSeriesRequest):
         })
 
     company = valid_stmts[-1]["company"]  # most recent for company name
-    return {
+    result = {
         "company": {"name": company.get("name"), "krs": company.get("krs")},
         "periods": all_periods,
         "series": series,
     }
+    background.add_task(
+        activity_logger.log,
+        user["id"] if user else None,
+        "analysis_timeseries",
+        body.krs,
+        {"fields": body.fields},
+        request.client.host if request.client else None,
+    )
+    return result
 
 
 @router.get("/available-periods/{krs}", summary="List available statement periods")

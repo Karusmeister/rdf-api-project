@@ -1,4 +1,12 @@
+import os
+
 import pytest
+
+# Set a >=32-byte JWT secret for tests before any app imports.
+# This prevents InsecureKeyLengthWarning from PyJWT/HMAC-SHA256.
+os.environ.setdefault(
+    "JWT_SECRET", "test-jwt-secret-that-is-at-least-32-bytes-long!"
+)
 
 
 def pytest_addoption(parser):

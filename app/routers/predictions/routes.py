@@ -1,9 +1,10 @@
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Path, Query, Request
 
 from app.auth import CurrentUser, require_krs_access, require_admin
 from app.services import predictions as predictions_service
+from app.services.activity import activity_logger
 
 from .schemas import HistoryResponse, ModelsResponse, PredictionResponse
 
@@ -20,6 +21,8 @@ def list_models() -> ModelsResponse:
 def get_predictions(
     krs: Annotated[str, Path(pattern=r"^\d{1,10}$")],
     user: CurrentUser,
+    request: Request,
+    background: BackgroundTasks,
 ) -> PredictionResponse:
     """Full prediction detail for a KRS number: scores, features with source financial data,
     interpretation thresholds, and score history. Requires JWT auth and KRS access."""
@@ -29,6 +32,14 @@ def get_predictions(
     has_company_data = any(company.get(k) is not None for k in ("nip", "pkd_code"))
     if not has_company_data and not result["predictions"] and not result["history"]:
         raise HTTPException(status_code=404, detail=f"No data found for KRS {krs}")
+    background.add_task(
+        activity_logger.log,
+        user["id"],
+        "prediction_view",
+        krs,
+        None,
+        request.client.host if request.client else None,
+    )
     return result
 
 

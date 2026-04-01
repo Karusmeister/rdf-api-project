@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     smtp_from: str = "noreply@example.com"
     environment: str = "local"  # 'local', 'staging', 'production'
 
+    # --- Activity Logging ---
+    activity_logging_enabled: bool = True
+
     def validate_jwt_secret(self) -> None:
         if self.environment != "local" and self.jwt_secret == "change-me-in-production":
             raise ValueError(

@@ -306,6 +306,20 @@ def _init_schema() -> None:
         )
     """)
 
+    # ----- Activity Log -----
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id          BIGSERIAL PRIMARY KEY,
+            user_id     VARCHAR REFERENCES users(id),
+            action      VARCHAR(50) NOT NULL,
+            krs_number  VARCHAR(10),
+            detail      JSONB,
+            ip_address  INET,
+            created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp
+        )
+    """)
+
     # Indexes (check existing first to stay idempotent)
     existing = {
         row[0]
@@ -330,6 +344,9 @@ def _init_schema() -> None:
         ("idx_etl_attempts_status", "CREATE INDEX idx_etl_attempts_status ON etl_attempts(status)"),
         ("idx_verification_user",   "CREATE INDEX idx_verification_user ON verification_codes(user_id, purpose)"),
         ("idx_user_krs",            "CREATE INDEX idx_user_krs ON user_krs_access(user_id)"),
+        ("idx_activity_krs",        "CREATE INDEX idx_activity_krs ON activity_log(krs_number, created_at DESC)"),
+        ("idx_activity_user",       "CREATE INDEX idx_activity_user ON activity_log(user_id, created_at DESC)"),
+        ("idx_activity_time",       "CREATE INDEX idx_activity_time ON activity_log(created_at DESC)"),
     ]
 
     for name, sql in index_defs:

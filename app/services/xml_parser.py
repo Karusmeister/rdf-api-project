@@ -485,7 +485,7 @@ def parse_statement(xml_string: str) -> dict:
     if rzis_el is not None:
         rzis_por = rzis_el.find("RZiSPor")
         rzis_kal = rzis_el.find("RZiSKal")
-        rzis_content = rzis_por or rzis_kal
+        rzis_content = rzis_por if rzis_por is not None else rzis_kal
         rzis_variant = (
             "porownawczy" if rzis_por is not None
             else "kalkulacyjny" if rzis_kal is not None
@@ -504,7 +504,7 @@ def parse_statement(xml_string: str) -> dict:
     if rach_el is not None:
         cf_posr = rach_el.find("PrzeplywyPosr")
         cf_bezp = rach_el.find("PrzeplywyBezp")
-        cf_content = cf_posr or cf_bezp
+        cf_content = cf_posr if cf_posr is not None else cf_bezp
         cf_method = (
             "posrednia" if cf_posr is not None
             else "bezposrednia" if cf_bezp is not None

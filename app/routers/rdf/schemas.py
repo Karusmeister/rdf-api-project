@@ -49,7 +49,7 @@ class PodmiotInfo(BaseModel):
     numer_krs: str = Field(description="10-digit KRS number")
     nazwa_podmiotu: str = Field(description="Entity name")
     forma_prawna: str = Field(description="Legal form")
-    wykreslenie: str = Field(description="Deregistration status")
+    wykreslenie: bool | str | None = Field(default=None, description="Deregistration status")
 
 
 class LookupResponse(BaseModel):

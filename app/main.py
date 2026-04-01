@@ -30,6 +30,7 @@ from app.routers.etl.routes import router as etl_router
 from app.routers.jobs.routes import router as jobs_router
 from app.routers.predictions import router as predictions_router
 from app.routers.auth import router as auth_router
+from app.routers.admin import router as admin_router
 from app.rate_limit import limiter
 from app.services import predictions as predictions_service
 
@@ -95,6 +96,7 @@ tags_metadata = [
     {"name": "auth", "description": "User authentication: signup, login, email verification, Google SSO."},
     {"name": "predictions", "description": "Bankruptcy prediction scores, feature detail, and model catalog."},
     {"name": "admin", "description": "Admin-only operations (cache flush, access grants)."},
+    {"name": "admin-dashboard", "description": "Admin dashboard: pipeline stats, KRS management, user activity."},
 ]
 
 app = FastAPI(
@@ -169,6 +171,7 @@ app.include_router(etl_router)
 app.include_router(jobs_router)
 app.include_router(predictions_router)
 app.include_router(auth_router)
+app.include_router(admin_router)
 
 
 @app.exception_handler(httpx.HTTPStatusError)
