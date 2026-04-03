@@ -141,9 +141,12 @@ def _tag_section(tag: str) -> str:
     return "bilans"
 
 
-def _tag_label(tag: str) -> str:
+def _tag_label(tag: str, schema_code: str = "SFJINZ") -> str:
+    from app.services.schema_labels import SCHEMA_REGISTRY
+    schema = SCHEMA_REGISTRY.get(schema_code)
+    labels = schema["tag_labels"] if schema else xml_parser.TAG_LABELS
     raw = tag.split(".")[-1] if "." in tag else tag
-    return xml_parser.TAG_LABELS.get(tag) or xml_parser.TAG_LABELS.get(raw) or tag
+    return labels.get(tag) or labels.get(raw) or tag
 
 
 def _ratio_with_change(current: Optional[float], previous: Optional[float]) -> dict:
@@ -210,9 +213,16 @@ async def compare(
     current_ratios = xml_parser.compute_ratios(current_stmt)
     previous_ratios = xml_parser.compute_ratios(previous_stmt)
 
-    def pct_chg(tag: str, kwota_curr: str = "kwota_a", kwota_prev: str = "kwota_a") -> Optional[float]:
-        a = xml_parser.find_value(current_stmt, tag, kwota_curr)
-        b = xml_parser.find_value(previous_stmt, tag, kwota_prev)
+    current_schema = current_stmt["company"].get("schema_code", "SFJINZ")
+    previous_schema = previous_stmt["company"].get("schema_code", "SFJINZ")
+
+    def pct_chg(concept: str, kwota_curr: str = "kwota_a", kwota_prev: str = "kwota_a") -> Optional[float]:
+        tag_curr = xml_parser.resolve_tag(concept, current_schema)
+        tag_prev = xml_parser.resolve_tag(concept, previous_schema)
+        if tag_curr is None or tag_prev is None:
+            return None
+        a = xml_parser.find_value(current_stmt, tag_curr, kwota_curr)
+        b = xml_parser.find_value(previous_stmt, tag_prev, kwota_prev)
         if a is None or b is None or b == 0:
             return None
         return round((a - b) / abs(b) * 100, 2)
@@ -233,8 +243,8 @@ async def compare(
         "net_margin": _ratio_with_change(
             current_ratios["net_margin"], previous_ratios["net_margin"]
         ),
-        "revenue_change_pct": pct_chg("RZiS.A"),
-        "net_profit_change_pct": pct_chg("RZiS.L"),
+        "revenue_change_pct": pct_chg("revenue"),
+        "net_profit_change_pct": pct_chg("net_profit"),
     }
 
     c_company = current_stmt["company"]
@@ -356,7 +366,8 @@ async def time_series(
     # Extract flat values for each statement (kwota_a = that year's value)
     stmt_values = [xml_parser.extract_flat_values(s) for s in valid_stmts]
 
-    # Build series
+    # Build series — use the most recent statement's schema for labels
+    latest_schema = valid_stmts[-1]["company"].get("schema_code", "SFJINZ") if valid_stmts else "SFJINZ"
     series = []
     for field_tag in body.fields:
         values: list[Optional[float]] = []
@@ -384,7 +395,7 @@ async def time_series(
 
         series.append({
             "tag": field_tag,
-            "label": _tag_label(field_tag),
+            "label": _tag_label(field_tag, latest_schema),
             "section": _tag_section(field_tag),
             "values": values,
             "changes_absolute": changes_abs,

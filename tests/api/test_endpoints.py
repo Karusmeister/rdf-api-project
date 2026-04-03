@@ -354,6 +354,174 @@ async def test_metadata_failure_not_cached(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Cross-schema compare (FS-001 regression)
+# ---------------------------------------------------------------------------
+
+# Minimal parsed statements with actual bilans/rzis nodes so ratios compute.
+def _make_parsed_stmt(schema_code, period_end, revenue_tag, revenue_val, net_tag, net_val):
+    """Build a minimal parsed statement with one revenue and one net-profit RZiS node."""
+    return {
+        "company": {
+            "name": "TEST SP. Z O.O.", "krs": "0000694720", "nip": "1234567890",
+            "pkd": "62.01.Z", "period_start": f"{period_end[:4]}-01-01",
+            "period_end": period_end, "date_prepared": "2025-03-01",
+            "schema_type": "test", "schema_code": schema_code,
+            "rzis_variant": None, "cf_method": None,
+        },
+        "bilans": {
+            "aktywa": {"tag": "Aktywa", "label": "AKTYWA", "kwota_a": 1000.0, "kwota_b": 900.0, "kwota_b1": None, "depth": 0, "is_w_tym": False, "children": []},
+            "pasywa": {"tag": "Pasywa", "label": "PASYWA", "kwota_a": 1000.0, "kwota_b": 900.0, "kwota_b1": None, "depth": 0, "is_w_tym": False, "children": [
+                {"tag": "Pasywa_A", "label": "A", "kwota_a": 500.0, "kwota_b": 450.0, "kwota_b1": None, "depth": 1, "is_w_tym": False, "children": []},
+                {"tag": "Pasywa_B", "label": "B", "kwota_a": 500.0, "kwota_b": 450.0, "kwota_b1": None, "depth": 1, "is_w_tym": False, "children": []},
+            ]},
+        },
+        "rzis": [
+            {"tag": f"RZiS.{revenue_tag}", "label": "Revenue", "kwota_a": revenue_val, "kwota_b": 0, "kwota_b1": None, "depth": 0, "is_w_tym": False, "children": []},
+            {"tag": f"RZiS.{net_tag}", "label": "Net", "kwota_a": net_val, "kwota_b": 0, "kwota_b1": None, "depth": 0, "is_w_tym": False, "children": []},
+        ],
+        "cash_flow": [],
+        "extras": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_compare_cross_schema_yoy_deltas(client, monkeypatch):
+    """revenue_change_pct / net_profit_change_pct must work across different schemas."""
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    # Current: SFJMIZ (revenue=A, net_profit=F)
+    stmt_curr = _make_parsed_stmt("SFJMIZ", "2024-12-31", "A", 200.0, "F", 20.0)
+    # Previous: SFJINZ (revenue=A, net_profit=L)
+    stmt_prev = _make_parsed_stmt("SFJINZ", "2023-12-31", "A", 180.0, "L", 15.0)
+
+    search_two = {
+        "content": [
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2024", "okresSprawozdawczyKoniec": "2024-12-31"},
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2023", "okresSprawozdawczyKoniec": "2023-12-31",
+             "okresSprawozdawczyPoczatek": "2023-01-01"},
+        ],
+        "metadaneWynikow": {**_SEARCH_PAGE["metadaneWynikow"], "calkowitaLiczbaObiektow": 2},
+    }
+
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(search_two))
+    monkeypatch.setattr(rdf_client, "metadata", lambda doc_id: _async(_META))
+    monkeypatch.setattr(rdf_client, "download", lambda doc_ids: _async(b"fake"))
+    monkeypatch.setattr(xml_parser, "extract_xml_from_zip", lambda b: "<fake/>")
+
+    call_count = {"n": 0}
+    def fake_parse(s):
+        call_count["n"] += 1
+        return stmt_curr if call_count["n"] % 2 == 1 else stmt_prev
+    monkeypatch.setattr(xml_parser, "parse_statement", fake_parse)
+
+    resp = await client.post(
+        "/api/analysis/compare",
+        json={"krs": "694720", "period_end_current": "2024-12-31", "period_end_previous": "2023-12-31"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    ratios = body["ratios"]
+
+    # Revenue: both schemas use RZiS.A → (200-180)/180 * 100 = 11.11%
+    assert ratios["revenue_change_pct"] == pytest.approx(11.11, abs=0.01)
+    # Net profit: SFJMIZ uses RZiS.F (20), SFJINZ uses RZiS.L (15) → (20-15)/15 * 100 = 33.33%
+    assert ratios["net_profit_change_pct"] == pytest.approx(33.33, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_compare_sfzurt_net_profit_delta_is_null(client, monkeypatch):
+    """SFZURT has no net_profit mapping → net_profit_change_pct must be null."""
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    # Current: SFZURT (revenue=I, no net_profit)
+    stmt_curr = _make_parsed_stmt("SFZURT", "2024-12-31", "I", 5000.0, "XIV", 300.0)
+    stmt_prev = _make_parsed_stmt("SFJINZ", "2023-12-31", "A", 4000.0, "L", 200.0)
+
+    search_two = {
+        "content": [
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2024", "okresSprawozdawczyKoniec": "2024-12-31"},
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2023", "okresSprawozdawczyKoniec": "2023-12-31",
+             "okresSprawozdawczyPoczatek": "2023-01-01"},
+        ],
+        "metadaneWynikow": {**_SEARCH_PAGE["metadaneWynikow"], "calkowitaLiczbaObiektow": 2},
+    }
+
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(search_two))
+    monkeypatch.setattr(rdf_client, "metadata", lambda doc_id: _async(_META))
+    monkeypatch.setattr(rdf_client, "download", lambda doc_ids: _async(b"fake"))
+    monkeypatch.setattr(xml_parser, "extract_xml_from_zip", lambda b: "<fake/>")
+
+    call_count = {"n": 0}
+    def fake_parse(s):
+        call_count["n"] += 1
+        return stmt_curr if call_count["n"] % 2 == 1 else stmt_prev
+    monkeypatch.setattr(xml_parser, "parse_statement", fake_parse)
+
+    resp = await client.post(
+        "/api/analysis/compare",
+        json={"krs": "694720", "period_end_current": "2024-12-31", "period_end_previous": "2023-12-31"},
+    )
+    assert resp.status_code == 200
+    ratios = resp.json()["ratios"]
+
+    # SFZURT revenue at RZiS.I(5000), SFJINZ revenue at RZiS.A(4000) → delta = 25%
+    assert ratios["revenue_change_pct"] == pytest.approx(25.0, abs=0.01)
+    # SFZURT has no net_profit → null
+    assert ratios["net_profit_change_pct"] is None
+
+
+# ---------------------------------------------------------------------------
+# Time-series with extras tags (FS-003 regression)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_time_series_extras_tags(client, monkeypatch):
+    """Time-series must return non-null values for extras tags (EQ.*)."""
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    eq_node = {"tag": "EQ.A_I", "label": "EQ I", "kwota_a": 100.0, "kwota_b": 90.0, "kwota_b1": None, "depth": 0, "is_w_tym": False, "children": []}
+    stmt = {
+        "company": {
+            "name": "TEST SP. Z O.O.", "krs": "0000694720", "nip": "1234567890",
+            "pkd": "62.01.Z", "period_start": "2024-01-01", "period_end": "2024-12-31",
+            "date_prepared": "2025-03-01", "schema_type": "JednostkaInna",
+            "schema_code": "SFJINZ", "rzis_variant": "porownawczy", "cf_method": None,
+        },
+        "bilans": {"aktywa": None, "pasywa": None},
+        "rzis": [],
+        "cash_flow": [],
+        "extras": {"equity_changes": [eq_node]},
+    }
+
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(_SEARCH_PAGE))
+    monkeypatch.setattr(rdf_client, "metadata", lambda doc_id: _async(_META))
+    monkeypatch.setattr(rdf_client, "download", lambda doc_ids: _async(b"fake"))
+    monkeypatch.setattr(xml_parser, "extract_xml_from_zip", lambda b: "<fake/>")
+    monkeypatch.setattr(xml_parser, "parse_statement", lambda s: stmt)
+
+    resp = await client.post(
+        "/api/analysis/time-series",
+        json={"krs": "694720", "fields": ["EQ.A_I"]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    series = body["series"]
+    assert len(series) == 1
+    assert series[0]["tag"] == "EQ.A_I"
+    # Should have values from kwota_a (current) and kwota_b (extra period)
+    assert any(v == 100.0 for v in series[0]["values"] if v is not None)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

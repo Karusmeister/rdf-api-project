@@ -129,7 +129,12 @@ app.add_middleware(
 
 @app.middleware("http")
 async def db_connection_middleware(request: Request, call_next):
-    """Acquire a per-request pooled DB connection and release it after the response."""
+    """Acquire a per-request pooled DB connection and release it after the response.
+
+    Skip for OPTIONS (CORS preflight) and /health — these don't need DB access.
+    """
+    if request.method == "OPTIONS" or request.url.path == "/health":
+        return await call_next(request)
     db_conn.acquire_request_conn()
     try:
         response = await call_next(request)

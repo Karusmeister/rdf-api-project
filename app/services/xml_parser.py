@@ -1,7 +1,12 @@
 """
-XML parser for Polish GAAP financial statements (JednostkaInna schema).
+XML parser for Polish GAAP financial statements.
 
-Flow: ZIP bytes → extract XML → strip namespaces → parse tree → structured dict
+Supports multiple XML schema types: SFJINZ (JednostkaInna), SFJMAZ
+(JednostkaMala), SFJMIZ (JednostkaMikro), SFJOPZ (JednostkaOp), and
+SFZURT (ZakladUbezpieczen).  Schema type is auto-detected from the root
+element and dispatched to the matching config in the schema_labels registry.
+
+Flow: ZIP bytes → extract XML → strip namespaces → detect schema → parse tree → structured dict
 """
 
 import io
@@ -11,273 +16,18 @@ import zipfile
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
 
+from app.services.schema_labels import SCHEMA_REGISTRY, SchemaConfig, SectionConfig, detect_schema
+
 # ---------------------------------------------------------------------------
-# Tag-to-label dictionary (JednostkaInna schema, Zalacznik nr 1)
-# Keys are stored tag names (Bilans use raw XML tags; RZiS stored as "RZiS.X";
-# CF stored as "CF.X"). Label lookup falls back to raw tag name.
+# Backward-compatible alias: TAG_LABELS points to SFJINZ labels.
+# External code (analysis routes, tests) may import this directly.
 # ---------------------------------------------------------------------------
 
-TAG_LABELS: dict[str, str] = {
-    # === BILANS - AKTYWA ===
-    "Aktywa": "AKTYWA",
-    "Aktywa_A": "A. Aktywa trwale",
-    "Aktywa_A_I": "I. Wartosci niematerialne i prawne",
-    "Aktywa_A_I_1": "1. Koszty zakonczonych prac rozwojowych",
-    "Aktywa_A_I_2": "2. Wartosc firmy",
-    "Aktywa_A_I_3": "3. Inne wartosci niematerialne i prawne",
-    "Aktywa_A_I_4": "4. Zaliczki na wartosci niematerialne i prawne",
-    "Aktywa_A_II": "II. Rzeczowe aktywa trwale",
-    "Aktywa_A_II_1": "1. Srodki trwale",
-    "Aktywa_A_II_1_A": "a) grunty (w tym prawo uzytkowania wieczystego gruntu)",
-    "Aktywa_A_II_1_B": "b) budynki, lokale, prawa do lokali i obiekty inzynierii ladowej i wodnej",
-    "Aktywa_A_II_1_C": "c) urzadzenia techniczne i maszyny",
-    "Aktywa_A_II_1_D": "d) srodki transportu",
-    "Aktywa_A_II_1_E": "e) inne srodki trwale",
-    "Aktywa_A_II_2": "2. Srodki trwale w budowie",
-    "Aktywa_A_II_3": "3. Zaliczki na srodki trwale w budowie",
-    "Aktywa_A_III": "III. Naleznosci dlugoterminowe",
-    "Aktywa_A_III_1": "1. Od jednostek powiazanych",
-    "Aktywa_A_III_2": "2. Od pozostalych jednostek, w ktorych jednostka posiada zaangazowanie w kapitale",
-    "Aktywa_A_III_3": "3. Od pozostalych jednostek",
-    "Aktywa_A_IV": "IV. Inwestycje dlugoterminowe",
-    "Aktywa_A_IV_1": "1. Nieruchomosci",
-    "Aktywa_A_IV_2": "2. Wartosci niematerialne i prawne",
-    "Aktywa_A_IV_3": "3. Dlugoterminowe aktywa finansowe",
-    "Aktywa_A_IV_3_A": "a) w jednostkach powiazanych",
-    "Aktywa_A_IV_3_A_1": "- udzialy lub akcje",
-    "Aktywa_A_IV_3_A_2": "- inne papiery wartosciowe",
-    "Aktywa_A_IV_3_A_3": "- udzielone pozyczki",
-    "Aktywa_A_IV_3_A_4": "- inne dlugoterminowe aktywa finansowe",
-    "Aktywa_A_IV_3_B": "b) w pozostalych jednostkach, w ktorych jednostka posiada zaangazowanie w kapitale",
-    "Aktywa_A_IV_3_B_1": "- udzialy lub akcje",
-    "Aktywa_A_IV_3_B_2": "- inne papiery wartosciowe",
-    "Aktywa_A_IV_3_B_3": "- udzielone pozyczki",
-    "Aktywa_A_IV_3_B_4": "- inne dlugoterminowe aktywa finansowe",
-    "Aktywa_A_IV_3_C": "c) w pozostalych jednostkach",
-    "Aktywa_A_IV_3_C_1": "- udzialy lub akcje",
-    "Aktywa_A_IV_3_C_2": "- inne papiery wartosciowe",
-    "Aktywa_A_IV_3_C_3": "- udzielone pozyczki",
-    "Aktywa_A_IV_3_C_4": "- inne dlugoterminowe aktywa finansowe",
-    "Aktywa_A_IV_4": "4. Inne inwestycje dlugoterminowe",
-    "Aktywa_A_V": "V. Dlugoterminowe rozliczenia miedzyokresowe",
-    "Aktywa_A_V_1": "1. Aktywa z tytulu odroczonego podatku dochodowego",
-    "Aktywa_A_V_2": "2. Inne rozliczenia miedzyokresowe",
-    "Aktywa_B": "B. Aktywa obrotowe",
-    "Aktywa_B_I": "I. Zapasy",
-    "Aktywa_B_I_1": "1. Materialy",
-    "Aktywa_B_I_2": "2. Polprodukty i produkty w toku",
-    "Aktywa_B_I_3": "3. Produkty gotowe",
-    "Aktywa_B_I_4": "4. Towary",
-    "Aktywa_B_I_5": "5. Zaliczki na dostawy i uslugi",
-    "Aktywa_B_II": "II. Naleznosci krotkoterminowe",
-    "Aktywa_B_II_1": "1. Naleznosci od jednostek powiazanych",
-    "Aktywa_B_II_1_A": "a) z tytulu dostaw i uslug",
-    "Aktywa_B_II_1_A_1": "- o okresie splaty do 12 miesiecy",
-    "Aktywa_B_II_1_A_2": "- o okresie splaty powyzej 12 miesiecy",
-    "Aktywa_B_II_1_B": "b) inne",
-    "Aktywa_B_II_2": "2. Naleznosci od pozostalych jednostek, w ktorych jednostka posiada zaangazowanie w kapitale",
-    "Aktywa_B_II_2_A": "a) z tytulu dostaw i uslug",
-    "Aktywa_B_II_2_A_1": "- o okresie splaty do 12 miesiecy",
-    "Aktywa_B_II_2_A_2": "- o okresie splaty powyzej 12 miesiecy",
-    "Aktywa_B_II_2_B": "b) inne",
-    "Aktywa_B_II_3": "3. Naleznosci od pozostalych jednostek",
-    "Aktywa_B_II_3_A": "a) z tytulu dostaw i uslug",
-    "Aktywa_B_II_3_A_1": "- o okresie splaty do 12 miesiecy",
-    "Aktywa_B_II_3_A_2": "- o okresie splaty powyzej 12 miesiecy",
-    "Aktywa_B_II_3_B": "b) z tytulu podatkow, dotacji, cel, ubezpieczen spolecznych i zdrowotnych oraz innych tyt. publicznoprawnych",
-    "Aktywa_B_II_3_C": "c) inne",
-    "Aktywa_B_II_3_D": "d) dochodzone na drodze sadowej",
-    "Aktywa_B_III": "III. Inwestycje krotkoterminowe",
-    "Aktywa_B_III_1": "1. Krotkoterminowe aktywa finansowe",
-    "Aktywa_B_III_1_A": "a) w jednostkach powiazanych",
-    "Aktywa_B_III_1_A_1": "- udzialy lub akcje",
-    "Aktywa_B_III_1_A_2": "- inne papiery wartosciowe",
-    "Aktywa_B_III_1_A_3": "- udzielone pozyczki",
-    "Aktywa_B_III_1_A_4": "- inne krotkoterminowe aktywa finansowe",
-    "Aktywa_B_III_1_B": "b) w pozostalych jednostkach",
-    "Aktywa_B_III_1_B_1": "- udzialy lub akcje",
-    "Aktywa_B_III_1_B_2": "- inne papiery wartosciowe",
-    "Aktywa_B_III_1_B_3": "- udzielone pozyczki",
-    "Aktywa_B_III_1_B_4": "- inne krotkoterminowe aktywa finansowe",
-    "Aktywa_B_III_1_C": "c) srodki pieniezne i inne aktywa pieniezne",
-    "Aktywa_B_III_1_C_1": "- srodki pieniezne w kasie i na rachunkach",
-    "Aktywa_B_III_1_C_2": "- inne srodki pieniezne",
-    "Aktywa_B_III_1_C_3": "- inne aktywa pieniezne",
-    "Aktywa_B_III_2": "2. Inne inwestycje krotkoterminowe",
-    "Aktywa_B_IV": "IV. Krotkoterminowe rozliczenia miedzyokresowe",
-    "Aktywa_C": "C. Nalezne wplaty na kapital (fundusz) podstawowy",
-    "Aktywa_D": "D. Udzialy (akcje) wlasne",
+TAG_LABELS: dict[str, str] = SCHEMA_REGISTRY["SFJINZ"]["tag_labels"]
 
-    # === BILANS - PASYWA ===
-    "Pasywa": "PASYWA",
-    "Pasywa_A": "A. Kapital (fundusz) wlasny",
-    "Pasywa_A_I": "I. Kapital (fundusz) podstawowy",
-    "Pasywa_A_II": "II. Kapital (fundusz) zapasowy, w tym nadwyzka wartosci sprzedazy nad wartoscia nominalna udzialow (akcji)",
-    "Pasywa_A_II_1": "(w tym: nadwyzka wartosci sprzedazy nad nominalna)",
-    "Pasywa_A_III": "III. Kapital (fundusz) z aktualizacji wyceny, w tym z tytulu trwalej utraty wartosci",
-    "Pasywa_A_III_1": "(w tym: z tytulu trwalej utraty wartosci)",
-    "Pasywa_A_IV": "IV. Pozostale kapitaly (fundusze) rezerwowe, w tym tworzone zgodnie z umowa (statutem) spolki",
-    "Pasywa_A_IV_1": "(w tym: tworzone zgodnie z umowa spolki)",
-    "Pasywa_A_IV_2": "(w tym: na udzialy (akcje) wlasne)",
-    "Pasywa_A_V": "V. Zysk (strata) z lat ubieglych",
-    "Pasywa_A_VI": "VI. Zysk (strata) netto",
-    "Pasywa_A_VII": "VII. Odpisy z zysku netto w ciagu roku obrotowego (wartosc ujemna)",
-    "Pasywa_B": "B. Zobowiazania i rezerwy na zobowiazania",
-    "Pasywa_B_I": "I. Rezerwy na zobowiazania",
-    "Pasywa_B_I_1": "1. Rezerwa z tytulu odroczonego podatku dochodowego",
-    "Pasywa_B_I_2": "2. Rezerwa na swiadczenia emerytalne i podobne",
-    "Pasywa_B_I_2_1": "a) dlugoterminowa",
-    "Pasywa_B_I_2_2": "b) krotkoterminowa",
-    "Pasywa_B_I_3": "3. Pozostale rezerwy",
-    "Pasywa_B_I_3_1": "a) dlugoterminowe",
-    "Pasywa_B_I_3_2": "b) krotkoterminowe",
-    "Pasywa_B_II": "II. Zobowiazania dlugoterminowe",
-    "Pasywa_B_II_1": "1. Wobec jednostek powiazanych",
-    "Pasywa_B_II_2": "2. Wobec pozostalych jednostek, w ktorych jednostka posiada zaangazowanie w kapitale",
-    "Pasywa_B_II_3": "3. Wobec pozostalych jednostek",
-    "Pasywa_B_II_3_A": "a) kredyty i pozyczki",
-    "Pasywa_B_II_3_B": "b) z tytulu emisji dluznych papierow wartosciowych",
-    "Pasywa_B_II_3_C": "c) inne zobowiazania finansowe",
-    "Pasywa_B_II_3_D": "d) zobowiazania wekslowe",
-    "Pasywa_B_II_3_E": "e) inne",
-    "Pasywa_B_III": "III. Zobowiazania krotkoterminowe",
-    "Pasywa_B_III_1": "1. Zobowiazania wobec jednostek powiazanych",
-    "Pasywa_B_III_1_A": "a) z tytulu dostaw i uslug",
-    "Pasywa_B_III_1_A_1": "- o okresie wymagalnosci do 12 miesiecy",
-    "Pasywa_B_III_1_A_2": "- o okresie wymagalnosci powyzej 12 miesiecy",
-    "Pasywa_B_III_1_B": "b) inne",
-    "Pasywa_B_III_2": "2. Zobowiazania wobec pozostalych jednostek, w ktorych jednostka posiada zaangazowanie w kapitale",
-    "Pasywa_B_III_2_A": "a) z tytulu dostaw i uslug",
-    "Pasywa_B_III_2_A_1": "- o okresie wymagalnosci do 12 miesiecy",
-    "Pasywa_B_III_2_A_2": "- o okresie wymagalnosci powyzej 12 miesiecy",
-    "Pasywa_B_III_2_B": "b) inne",
-    "Pasywa_B_III_3": "3. Zobowiazania wobec pozostalych jednostek",
-    "Pasywa_B_III_3_A": "a) kredyty i pozyczki",
-    "Pasywa_B_III_3_B": "b) z tytulu emisji dluznych papierow wartosciowych",
-    "Pasywa_B_III_3_C": "c) inne zobowiazania finansowe",
-    "Pasywa_B_III_3_D": "d) z tytulu dostaw i uslug",
-    "Pasywa_B_III_3_D_1": "- o okresie wymagalnosci do 12 miesiecy",
-    "Pasywa_B_III_3_D_2": "- o okresie wymagalnosci powyzej 12 miesiecy",
-    "Pasywa_B_III_3_E": "e) zaliczki otrzymane na dostawy i uslugi",
-    "Pasywa_B_III_3_F": "f) zobowiazania wekslowe",
-    "Pasywa_B_III_3_G": "g) z tytulu podatkow, cel, ubezpieczen spolecznych i zdrowotnych oraz innych tytul. publicznoprawnych",
-    "Pasywa_B_III_3_H": "h) z tytulu wynagrodzen",
-    "Pasywa_B_III_3_I": "i) inne",
-    "Pasywa_B_III_4": "4. Fundusze specjalne",
-    "Pasywa_B_IV": "IV. Rozliczenia miedzyokresowe",
-    "Pasywa_B_IV_1": "1. Ujemna wartosc firmy",
-    "Pasywa_B_IV_2": "2. Inne rozliczenia miedzyokresowe",
-    "Pasywa_B_IV_2_1": "a) dlugoterminowe",
-    "Pasywa_B_IV_2_2": "b) krotkoterminowe",
-
-    # === RZiS POROWNAWCZY (raw XML tag names — stored with "RZiS." prefix in trees) ===
-    "A": "A. Przychody netto ze sprzedazy i zrownane z nimi",
-    "A_J": "(w tym: od jednostek powiazanych)",
-    "A_I": "I. Przychody netto ze sprzedazy produktow",
-    "A_II": "II. Zmiana stanu produktow (zwiekszenie - wartosc dodatnia, zmniejszenie - wartosc ujemna)",
-    "A_III": "III. Koszt wytworzenia produktow na wlasne potrzeby jednostki",
-    "A_IV": "IV. Przychody netto ze sprzedazy towarow i materialow",
-    "B": "B. Koszty dzialalnosci operacyjnej",
-    "B_I": "I. Amortyzacja",
-    "B_II": "II. Zuzycie materialow i energii",
-    "B_III": "III. Uslugi obce",
-    "B_IV": "IV. Podatki i oplaty, w tym podatek akcyzowy",
-    "B_IV_1": "(w tym: podatek akcyzowy)",
-    "B_V": "V. Wynagrodzenia",
-    "B_VI": "VI. Ubezpieczenia spoleczne i inne swiadczenia, w tym emerytalne",
-    "B_VI_1": "(w tym: emerytalne)",
-    "B_VII": "VII. Pozostale koszty rodzajowe",
-    "B_VIII": "VIII. Wartosc sprzedanych towarow i materialow",
-    "C": "C. Zysk (strata) ze sprzedazy (A-B)",
-    "D": "D. Pozostale przychody operacyjne",
-    "D_I": "I. Zysk z tytulu rozchodu niefinansowych aktywow trwalych",
-    "D_II": "II. Dotacje",
-    "D_III": "III. Aktualizacja wartosci aktywow niefinansowych",
-    "D_IV": "IV. Inne przychody operacyjne",
-    "E": "E. Pozostale koszty operacyjne",
-    "E_I": "I. Strata z tytulu rozchodu niefinansowych aktywow trwalych",
-    "E_II": "II. Aktualizacja wartosci aktywow niefinansowych",
-    "E_III": "III. Inne koszty operacyjne",
-    "F": "F. Zysk (strata) z dzialalnosci operacyjnej (C+D-E)",
-    "G": "G. Przychody finansowe",
-    "G_I": "I. Dywidendy i udzialy w zyskach, w tym od jednostek powiazanych",
-    "G_I_A": "a) od jednostek powiazanych",
-    "G_I_A_1": "(w tym: w ktorych jednostka posiada zaangazowanie w kapitale)",
-    "G_I_B": "b) od pozostalych jednostek",
-    "G_I_B_1": "(w tym: w ktorych jednostka posiada zaangazowanie w kapitale)",
-    "G_II": "II. Odsetki, w tym od jednostek powiazanych",
-    "G_II_J": "(w tym: od jednostek powiazanych)",
-    "G_III": "III. Zysk z tytulu rozchodu aktywow finansowych, w tym w jednostkach powiazanych",
-    "G_III_J": "(w tym: w jednostkach powiazanych)",
-    "G_IV": "IV. Aktualizacja wartosci aktywow finansowych",
-    "G_V": "V. Inne",
-    "H": "H. Koszty finansowe",
-    "H_I": "I. Odsetki, w tym dla jednostek powiazanych",
-    "H_I_J": "(w tym: dla jednostek powiazanych)",
-    "H_II": "II. Strata z tytulu rozchodu aktywow finansowych, w tym w jednostkach powiazanych",
-    "H_II_J": "(w tym: w jednostkach powiazanych)",
-    "H_III": "III. Aktualizacja wartosci aktywow finansowych",
-    "H_IV": "IV. Inne",
-    "I": "I. Zysk (strata) brutto (F+G-H)",
-    "J": "J. Podatek dochodowy",
-    "K": "K. Pozostale obowiazkowe zmniejszenia zysku (zwiekszenia straty)",
-    "L": "L. Zysk (strata) netto (I-J-K)",
-
-    # === RACHUNEK PRZEPLYWOW PIENIEZNYCH (metoda posrednia) ===
-    "CF.A_I": "I. Zysk (strata) netto",
-    "CF.A_II": "II. Korekty razem",
-    "CF.A_II_1": "1. Amortyzacja",
-    "CF.A_II_2": "2. Zyski (straty) z tytulu roznic kursowych",
-    "CF.A_II_3": "3. Odsetki i udzialy w zyskach (dywidendy)",
-    "CF.A_II_4": "4. Zysk (strata) z dzialalnosci inwestycyjnej",
-    "CF.A_II_5": "5. Zmiana stanu rezerw",
-    "CF.A_II_6": "6. Zmiana stanu zapasow",
-    "CF.A_II_7": "7. Zmiana stanu naleznosci",
-    "CF.A_II_8": "8. Zmiana stanu zobowiazan krotkoterminowych (z wyjatkiem pozyczek i kredytow)",
-    "CF.A_II_9": "9. Zmiana stanu rozliczen miedzyokresowych",
-    "CF.A_II_10": "10. Inne korekty",
-    "CF.A_III": "III. Przeplyw pieniezny netto z dzialalnosci operacyjnej (I +/- II)",
-    "CF.B_I": "I. Wplywy",
-    "CF.B_I_1": "1. Zbycie wartosci niematerialnych i prawnych oraz rzeczowych aktywow trwalych",
-    "CF.B_I_2": "2. Zbycie inwestycji w nieruchomosci oraz wartosci niematerialne i prawne",
-    "CF.B_I_3": "3. Z aktywow finansowych",
-    "CF.B_I_3_A": "a) w jednostkach powiazanych",
-    "CF.B_I_3_B": "b) w pozostalych jednostkach",
-    "CF.B_I_3_B_1": "- zbycie aktywow finansowych",
-    "CF.B_I_3_B_2": "- dywidendy i udzialy w zyskach",
-    "CF.B_I_3_B_3": "- splata udzielonych pozyczek dlugoterminowych",
-    "CF.B_I_3_B_4": "- odsetki",
-    "CF.B_I_3_B_5": "- inne wplywy z aktywow finansowych",
-    "CF.B_I_4": "4. Inne wplywy inwestycyjne",
-    "CF.B_II": "II. Wydatki",
-    "CF.B_II_1": "1. Nabycie wartosci niematerialnych i prawnych oraz rzeczowych aktywow trwalych",
-    "CF.B_II_2": "2. Inwestycje w nieruchomosci oraz wartosci niematerialne i prawne",
-    "CF.B_II_3": "3. Na aktywa finansowe",
-    "CF.B_II_4": "4. Inne wydatki inwestycyjne",
-    "CF.B_III": "III. Przeplyw pieniezny netto z dzialalnosci inwestycyjnej (I-II)",
-    "CF.C_I": "I. Wplywy",
-    "CF.C_I_1": "1. Wplywy netto z wydania udzialow i innych instrumentow kapitalowych oraz doplat do kapitalu",
-    "CF.C_I_2": "2. Kredyty i pozyczki",
-    "CF.C_I_3": "3. Emisja dluznych papierow wartosciowych",
-    "CF.C_I_4": "4. Inne wplywy finansowe",
-    "CF.C_II": "II. Wydatki",
-    "CF.C_II_1": "1. Nabycie udzialow (akcji) wlasnych",
-    "CF.C_II_2": "2. Dywidendy i inne wyplaty na rzecz wlascicieli",
-    "CF.C_II_3": "3. Inne niz wyplaty na rzecz wlascicieli wydatki z tytulu podzialu zysku",
-    "CF.C_II_4": "4. Splaty kredytow i pozyczek",
-    "CF.C_II_5": "5. Wykup dluznych papierow wartosciowych",
-    "CF.C_II_6": "6. Z tytulu innych zobowiazan finansowych",
-    "CF.C_II_7": "7. Platnosci zobowiazan z tytulu umow leasingu finansowego",
-    "CF.C_II_8": "8. Odsetki",
-    "CF.C_II_9": "9. Inne wydatki finansowe",
-    "CF.C_III": "III. Przeplyw pieniezny netto z dzialalnosci finansowej (I-II)",
-    "CF.D": "D. Przeplyw pieniezny netto razem (A.III +/- B.III +/- C.III)",
-    "CF.E": "E. Bilansowa zmiana stanu srodkow pienieznych, w tym",
-    "CF.E_1": "(w tym: zmiana stanu srodkow pienieznych z tytulu roznic kursowych)",
-    "CF.F": "F. Srodki pieniezne na poczatek okresu",
-    "CF.G": "G. Srodki pieniezne na koniec okresu (F +/- D), w tym",
-    "CF.G_1": "(w tym: o ograniczonej mozliwosci dysponowania)",
-}
+# NOTE: The ~260-entry SFJINZ label dict formerly inlined here has been moved
+# to app/services/schema_labels/sfjinz.py.  TAG_LABELS above is the
+# backward-compatible alias pointing to the canonical dict.
 
 # ---------------------------------------------------------------------------
 # Simple in-memory cache
@@ -316,7 +66,12 @@ def cache_set(key: str, value: Any) -> None:
 # ZIP / XML helpers
 # ---------------------------------------------------------------------------
 
-_STATEMENT_MARKERS = frozenset({"Bilans", "RZiS", "RachPrzeplywow"})
+_STATEMENT_MARKER_PREFIXES = ("Bilans", "RZiS", "RachPrzeplywow", "Przeplyw")
+
+
+def _is_statement_marker(tag: str) -> bool:
+    """Return True if *tag* looks like a financial-statement section element."""
+    return any(tag.startswith(p) for p in _STATEMENT_MARKER_PREFIXES)
 
 
 def extract_xml_from_zip(zip_bytes: bytes) -> str:
@@ -341,7 +96,7 @@ def extract_xml_from_zip(zip_bytes: bytes) -> str:
                 def _local(tag: str) -> str:
                     return tag.split("}", 1)[1] if "}" in tag else tag
                 if any(
-                    _local(el.tag) in _STATEMENT_MARKERS
+                    _is_statement_marker(_local(el.tag))
                     for el in root.iter()
                 ):
                     return content
@@ -374,12 +129,13 @@ def parse_xml_no_ns(xml_string: str) -> ET.Element:
 # Tree extraction
 # ---------------------------------------------------------------------------
 
-def _get_label(tag: str, raw_tag: str) -> str:
-    return TAG_LABELS.get(tag) or TAG_LABELS.get(raw_tag) or tag
+def _get_label(tag: str, raw_tag: str, labels: dict[str, str] | None = None) -> str:
+    d = labels if labels is not None else TAG_LABELS
+    return d.get(tag) or d.get(raw_tag) or tag
 
 
-def _is_w_tym(tag: str, raw_tag: str) -> bool:
-    label = _get_label(tag, raw_tag)
+def _is_w_tym(tag: str, raw_tag: str, labels: dict[str, str] | None = None) -> bool:
+    label = _get_label(tag, raw_tag, labels)
     return label.startswith("(")
 
 
@@ -393,11 +149,20 @@ def _parse_float(element: ET.Element, child_tag: str) -> float:
     return 0.0
 
 
-def extract_tree(element: ET.Element, depth: int = 0, tag_prefix: str = "") -> Optional[dict]:
+def extract_tree(
+    element: ET.Element,
+    depth: int = 0,
+    tag_prefix: str = "",
+    labels: dict[str, str] | None = None,
+    multiplier: int = 1,
+) -> Optional[dict]:
     """
     Recursively build a FinancialNode dict from an XML element.
     Only nodes with a KwotaA child are included.
+
     tag_prefix: "RZiS." for income statement nodes, "CF." for cash flow nodes.
+    labels:     Schema-specific tag→label mapping.  Falls back to TAG_LABELS.
+    multiplier: Factor applied to all kwota values (1000 for WTys schemas).
     """
     if element.find("KwotaA") is None:
         return None
@@ -405,13 +170,13 @@ def extract_tree(element: ET.Element, depth: int = 0, tag_prefix: str = "") -> O
     raw_tag = element.tag
     tag = f"{tag_prefix}{raw_tag}" if tag_prefix else raw_tag
 
-    kwota_a = _parse_float(element, "KwotaA")
-    kwota_b = _parse_float(element, "KwotaB")
+    kwota_a = _parse_float(element, "KwotaA") * multiplier
+    kwota_b = _parse_float(element, "KwotaB") * multiplier
     kwota_b1_el = element.find("KwotaB1")
     kwota_b1: Optional[float] = None
     if kwota_b1_el is not None and kwota_b1_el.text:
         try:
-            kwota_b1 = float(kwota_b1_el.text.strip().replace(",", "."))
+            kwota_b1 = float(kwota_b1_el.text.strip().replace(",", ".")) * multiplier
         except ValueError:
             pass
 
@@ -419,18 +184,18 @@ def extract_tree(element: ET.Element, depth: int = 0, tag_prefix: str = "") -> O
     for child in element:
         if child.tag in ("KwotaA", "KwotaB", "KwotaB1"):
             continue
-        child_node = extract_tree(child, depth + 1, tag_prefix)
+        child_node = extract_tree(child, depth + 1, tag_prefix, labels, multiplier)
         if child_node is not None:
             children.append(child_node)
 
     return {
         "tag": tag,
-        "label": _get_label(tag, raw_tag),
+        "label": _get_label(tag, raw_tag, labels),
         "kwota_a": kwota_a,
         "kwota_b": kwota_b,
         "kwota_b1": kwota_b1,
         "depth": depth,
-        "is_w_tym": _is_w_tym(tag, raw_tag),
+        "is_w_tym": _is_w_tym(tag, raw_tag, labels),
         "children": children,
     }
 
@@ -440,17 +205,20 @@ def extract_tree(element: ET.Element, depth: int = 0, tag_prefix: str = "") -> O
 # ---------------------------------------------------------------------------
 
 def _extract_company_info(root: ET.Element) -> dict:
-    def text(path: str) -> Optional[str]:
-        el = root.find(path)
-        return el.text.strip() if el is not None and el.text else None
+    def text(*paths: str) -> Optional[str]:
+        for path in paths:
+            el = root.find(path)
+            if el is not None and el.text:
+                return el.text.strip()
+        return None
 
     return {
         "name": text(".//NazwaFirmy"),
-        "krs": text(".//P_1E"),
-        "nip": text(".//P_1D"),
+        "krs": text(".//P_1E", ".//P_1C"),
+        "nip": text(".//P_1D", ".//P_1B"),
         "pkd": text(".//KodPKD"),
-        "period_start": text(".//P_3/DataOd") or text(".//OkresOd"),
-        "period_end": text(".//P_3/DataDo") or text(".//OkresDo"),
+        "period_start": text(".//P_3/DataOd", ".//P_2A/DataOd", ".//OkresOd"),
+        "period_end": text(".//P_3/DataDo", ".//P_2A/DataDo", ".//OkresDo"),
         "date_prepared": text(".//DataSporzadzenia"),
     }
 
@@ -459,49 +227,71 @@ def _extract_company_info(root: ET.Element) -> dict:
 # Full statement parsing
 # ---------------------------------------------------------------------------
 
-def parse_statement(xml_string: str) -> dict:
-    """Parse a financial statement XML string into a structured dict."""
-    root = parse_xml_no_ns(xml_string)
+def _extract_rzis(
+    root: ET.Element,
+    sections: SectionConfig,
+    labels: dict[str, str],
+    multiplier: int,
+) -> tuple[list[dict], Optional[str]]:
+    """Extract RZiS nodes; return (nodes, variant_name)."""
+    rzis_el = root.find(f".//{sections['rzis_element']}")
+    if rzis_el is None:
+        return [], None
 
-    company = _extract_company_info(root)
-    company["schema_type"] = root.tag
-
-    # Bilans
-    aktywa_node: Optional[dict] = None
-    pasywa_node: Optional[dict] = None
-    bilans_el = root.find(".//Bilans")
-    if bilans_el is not None:
-        a_el = bilans_el.find("Aktywa")
-        p_el = bilans_el.find("Pasywa")
-        if a_el is not None:
-            aktywa_node = extract_tree(a_el, depth=0)
-        if p_el is not None:
-            pasywa_node = extract_tree(p_el, depth=0)
-
-    # RZiS
-    rzis_nodes: list[dict] = []
     rzis_variant: Optional[str] = None
-    rzis_el = root.find(".//RZiS")
-    if rzis_el is not None:
+    rzis_content: Optional[ET.Element] = None
+
+    if sections["rzis_has_variants"]:
         rzis_por = rzis_el.find("RZiSPor")
+        # Some statements use the canonical "RZiSKalk" element, while older or
+        # non-conforming files may still emit "RZiSKal".
+        rzis_kalk = rzis_el.find("RZiSKalk")
         rzis_kal = rzis_el.find("RZiSKal")
-        rzis_content = rzis_por if rzis_por is not None else rzis_kal
+        rzis_content = (
+            rzis_por
+            if rzis_por is not None
+            else rzis_kalk
+            if rzis_kalk is not None
+            else rzis_kal
+        )
         rzis_variant = (
             "porownawczy" if rzis_por is not None
-            else "kalkulacyjny" if rzis_kal is not None
+            else "kalkulacyjny" if (rzis_kalk is not None or rzis_kal is not None)
             else None
         )
-        if rzis_content is not None:
-            for child in rzis_content:
-                node = extract_tree(child, depth=0, tag_prefix="RZiS.")
-                if node is not None:
-                    rzis_nodes.append(node)
+    else:
+        # Schemas without variant wrapper — children are directly on the element
+        rzis_content = rzis_el
+        rzis_variant = None
 
-    # Cash flow
-    cf_nodes: list[dict] = []
+    nodes: list[dict] = []
+    if rzis_content is not None:
+        for child in rzis_content:
+            node = extract_tree(child, depth=0, tag_prefix="RZiS.", labels=labels, multiplier=multiplier)
+            if node is not None:
+                nodes.append(node)
+    return nodes, rzis_variant
+
+
+def _extract_cf(
+    root: ET.Element,
+    sections: SectionConfig,
+    labels: dict[str, str],
+    multiplier: int,
+) -> tuple[list[dict], Optional[str]]:
+    """Extract cash-flow nodes; return (nodes, method_name)."""
+    cf_element_name = sections.get("cf_element")
+    if not cf_element_name:
+        return [], None
+
+    rach_el = root.find(f".//{cf_element_name}")
+    if rach_el is None:
+        return [], None
+
     cf_method: Optional[str] = None
-    rach_el = root.find(".//RachPrzeplywow")
-    if rach_el is not None:
+    cf_content: Optional[ET.Element] = None
+
+    if sections["cf_has_variants"]:
         cf_posr = rach_el.find("PrzeplywyPosr")
         cf_bezp = rach_el.find("PrzeplywyBezp")
         cf_content = cf_posr if cf_posr is not None else cf_bezp
@@ -510,11 +300,137 @@ def parse_statement(xml_string: str) -> dict:
             else "bezposrednia" if cf_bezp is not None
             else None
         )
-        if cf_content is not None:
-            for child in cf_content:
-                node = extract_tree(child, depth=0, tag_prefix="CF.")
+    else:
+        cf_content = rach_el
+        cf_method = None
+
+    nodes: list[dict] = []
+    if cf_content is not None:
+        for child in cf_content:
+            node = extract_tree(child, depth=0, tag_prefix="CF.", labels=labels, multiplier=multiplier)
+            if node is not None:
+                nodes.append(node)
+    return nodes, cf_method
+
+
+_KOD_TO_SCHEMA_CODE: dict[str, str] = {
+    "SFJINZ": "SFJINZ",
+    "SFJINT": "SFJINZ",  # 2026 thousands variant
+    "SFJMAZ": "SFJMAZ",
+    "SFJMAT": "SFJMAZ",
+    "SFJMIZ": "SFJMIZ",
+    "SFJMIT": "SFJMIZ",  # 2026 thousands variant
+    "SFJOPZ": "SFJOPZ",
+    "SFJOPT": "SFJOPZ",  # 2026 thousands variant
+    "SFZURT": "SFZURT",
+    "SFZURZ": "SFZURT",
+}
+
+
+def _extract_kod_systemowy(root: ET.Element) -> Optional[str]:
+    """Extract normalized `kodSystemowy` (e.g., SFJINZ) from XML header."""
+    kod_el = root.find(".//KodSprawozdania")
+    if kod_el is None:
+        return None
+
+    raw = (kod_el.attrib.get("kodSystemowy") or kod_el.text or "").strip().upper()
+    if not raw:
+        return None
+
+    # Handles forms like "SFJINZ (1)" and "SFJINZ(2)".
+    match = re.match(r"([A-Z0-9]+)", raw)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _detect_schema_with_header(root: ET.Element) -> tuple[SchemaConfig, Optional[str]]:
+    """
+    Detect schema preferring Naglowek/KodSprawozdania@kodSystemowy, then root tag.
+    Falls back to SFJINZ for backward compatibility.
+    """
+    kod_systemowy = _extract_kod_systemowy(root)
+    if kod_systemowy:
+        mapped_code = _KOD_TO_SCHEMA_CODE.get(kod_systemowy)
+        if mapped_code and mapped_code in SCHEMA_REGISTRY:
+            return SCHEMA_REGISTRY[mapped_code], kod_systemowy
+
+    schema = detect_schema(root.tag) or SCHEMA_REGISTRY["SFJINZ"]
+    return schema, kod_systemowy
+
+
+def _resolve_unit_multiplier(
+    root_tag: str,
+    schema: SchemaConfig,
+    kod_systemowy: Optional[str],
+) -> int:
+    """
+    Resolve amount multiplier using schema defaults plus currency hints.
+    - `...T` kodSystemowy or `...WTys...` root => amounts are in thousands.
+    - `...Z` kodSystemowy or `...WZlot...` root => amounts are in PLN.
+    """
+    if kod_systemowy:
+        if kod_systemowy.endswith("T"):
+            return 1000
+        if kod_systemowy.endswith("Z"):
+            return 1
+
+    upper_tag = root_tag.upper()
+    if "WTYS" in upper_tag:
+        return 1000
+    if "WZLOT" in upper_tag:
+        return 1
+    return schema["sections"]["unit_multiplier"]
+
+
+def parse_statement(xml_string: str) -> dict:
+    """Parse a financial statement XML string into a structured dict.
+
+    Auto-detects the schema type (SFJINZ, SFJMAZ, SFJMIZ, SFJOPZ, SFZURT)
+    from the root element and dispatches to the matching config.
+    """
+    root = parse_xml_no_ns(xml_string)
+
+    schema, kod_systemowy = _detect_schema_with_header(root)
+    sections = schema["sections"]
+    labels = schema["tag_labels"]
+    multiplier = _resolve_unit_multiplier(root.tag, schema, kod_systemowy)
+
+    company = _extract_company_info(root)
+    company["schema_type"] = root.tag
+    company["schema_code"] = schema["code"]
+    company["kod_systemowy"] = kod_systemowy
+
+    # Bilans
+    aktywa_node: Optional[dict] = None
+    pasywa_node: Optional[dict] = None
+    bilans_el = root.find(f".//{sections['bilans_element']}")
+    if bilans_el is not None:
+        a_el = bilans_el.find(sections["aktywa_element"])
+        p_el = bilans_el.find(sections["pasywa_element"])
+        if a_el is not None:
+            aktywa_node = extract_tree(a_el, depth=0, labels=labels, multiplier=multiplier)
+        if p_el is not None:
+            pasywa_node = extract_tree(p_el, depth=0, labels=labels, multiplier=multiplier)
+
+    # RZiS
+    rzis_nodes, rzis_variant = _extract_rzis(root, sections, labels, multiplier)
+
+    # Cash flow
+    cf_nodes, cf_method = _extract_cf(root, sections, labels, multiplier)
+
+    # Extra sections (equity changes, off-balance-sheet, etc.)
+    extras: dict[str, list[dict]] = {}
+    for extra_def in sections.get("extra_sections", []):
+        el = root.find(f".//{extra_def['element']}")
+        if el is not None:
+            nodes: list[dict] = []
+            for child in el:
+                node = extract_tree(child, depth=0, tag_prefix=extra_def["tag_prefix"], labels=labels, multiplier=multiplier)
                 if node is not None:
-                    cf_nodes.append(node)
+                    nodes.append(node)
+            if nodes:
+                extras[extra_def["store_as"]] = nodes
 
     company["rzis_variant"] = rzis_variant
     company["cf_method"] = cf_method
@@ -524,6 +440,7 @@ def parse_statement(xml_string: str) -> dict:
         "bilans": {"aktywa": aktywa_node, "pasywa": pasywa_node},
         "rzis": rzis_nodes,
         "cash_flow": cf_nodes,
+        "extras": extras,
     }
 
 
@@ -555,7 +472,7 @@ def find_node_value(
 
 
 def find_value(stmt: dict, tag: str, kwota: str = "kwota_a") -> Optional[float]:
-    """Search across bilans + rzis + cash_flow."""
+    """Search across bilans + rzis + cash_flow + extras."""
     bilans = stmt.get("bilans") or {}
     for section in (bilans.get("aktywa"), bilans.get("pasywa")):
         if section is None:
@@ -570,7 +487,13 @@ def find_value(stmt: dict, tag: str, kwota: str = "kwota_a") -> Optional[float]:
             return v
     cash_flow = stmt.get("cash_flow")
     if cash_flow is not None:
-        return find_node_value(cash_flow, tag, kwota)
+        v = find_node_value(cash_flow, tag, kwota)
+        if v is not None:
+            return v
+    for section_nodes in stmt.get("extras", {}).values():
+        v = find_node_value(section_nodes, tag, kwota)
+        if v is not None:
+            return v
     return None
 
 
@@ -596,6 +519,8 @@ def extract_flat_values(stmt: dict, use_kwota_b: bool = False) -> dict[str, Opti
     _traverse(stmt["bilans"]["pasywa"])
     _traverse(stmt["rzis"])
     _traverse(stmt["cash_flow"])
+    for section_nodes in stmt.get("extras", {}).values():
+        _traverse(section_nodes)
     return result
 
 
@@ -741,14 +666,53 @@ def build_comparison(
 
 
 # ---------------------------------------------------------------------------
+# Semantic tag aliases — maps schema-neutral concepts to schema-specific tags
+# ---------------------------------------------------------------------------
+
+_SEMANTIC_TAGS: dict[str, dict[str, str]] = {
+    "total_assets":            {"SFJINZ": "Aktywa", "SFJMAZ": "Aktywa", "SFJMIZ": "Aktywa", "SFJOPZ": "Aktywa", "SFZURT": "Aktywa"},
+    "equity":                  {"SFJINZ": "Pasywa_A", "SFJMAZ": "Pasywa_A", "SFJMIZ": "Pasywa_A", "SFJOPZ": "Pasywa_A", "SFZURT": "Pasywa_A"},
+    "current_assets":          {"SFJINZ": "Aktywa_B", "SFJMAZ": "Aktywa_B", "SFJMIZ": "Aktywa_B", "SFJOPZ": "Aktywa_B"},
+    "total_liabilities":       {"SFJINZ": "Pasywa_B", "SFJMAZ": "Pasywa_B", "SFJMIZ": "Pasywa_B", "SFJOPZ": "Pasywa_B"},
+    "short_term_liabilities":  {"SFJINZ": "Pasywa_B_III", "SFJMAZ": "Pasywa_B_III", "SFJOPZ": "Pasywa_B_III"},
+    "revenue":                 {"SFJINZ": "RZiS.A", "SFJMAZ": "RZiS.A", "SFJMIZ": "RZiS.A", "SFJOPZ": "RZiS.A", "SFZURT": "RZiS.I"},
+    "operating_profit":        {"SFJINZ": "RZiS.F", "SFJMAZ": "RZiS.C", "SFJOPZ": "RZiS.H", "SFZURT": "RZiS.XI"},
+    # SFZURT: XIV = "Zysk (strata) brutto" (gross profit, before tax).
+    # The Annex 3 RZiS has no single net-profit summary line (net = XIV - XV - XVI);
+    # omitting SFZURT here so net_profit resolves to None and net_margin is null.
+    "gross_profit":            {"SFZURT": "RZiS.XIV"},
+    "net_profit":              {"SFJINZ": "RZiS.L", "SFJMAZ": "RZiS.J", "SFJMIZ": "RZiS.F", "SFJOPZ": "RZiS.O"},
+}
+
+
+def resolve_tag(concept: str, schema_code: str) -> Optional[str]:
+    """Resolve a semantic concept to the tag_path for the given schema.
+
+    Public API — used by both ``compute_ratios`` and analysis route endpoints.
+    """
+    mapping = _SEMANTIC_TAGS.get(concept)
+    if mapping is None:
+        return None
+    return mapping.get(schema_code)
+
+
+# ---------------------------------------------------------------------------
 # Financial ratios
 # ---------------------------------------------------------------------------
 
 def compute_ratios(stmt: dict, use_kwota_b: bool = False) -> dict:
-    """Compute key financial ratios from a parsed statement."""
-    kwota = "kwota_b" if use_kwota_b else "kwota_a"
+    """Compute key financial ratios from a parsed statement.
 
-    def v(tag: str) -> Optional[float]:
+    Schema-aware: resolves tag paths using the statement's schema_code so
+    that ratios work correctly for all five supported schemas.
+    """
+    kwota = "kwota_b" if use_kwota_b else "kwota_a"
+    schema_code = stmt.get("company", {}).get("schema_code", "SFJINZ")
+
+    def v(concept: str) -> Optional[float]:
+        tag = resolve_tag(concept, schema_code)
+        if tag is None:
+            return None
         return find_value(stmt, tag, kwota)
 
     def ratio(num: Optional[float], den: Optional[float]) -> Optional[float]:
@@ -756,24 +720,19 @@ def compute_ratios(stmt: dict, use_kwota_b: bool = False) -> dict:
             return None
         return round(num / den, 4)
 
-    def pct_change(a: Optional[float], b: Optional[float]) -> Optional[float]:
-        if a is None or b is None or abs(b) < 1e-6:
-            return None
-        return round((a - b) / abs(b) * 100, 2)
-
-    aktywa = v("Aktywa")
-    pasywa_a = v("Pasywa_A")
-    aktywa_b = v("Aktywa_B")
-    pasywa_b = v("Pasywa_B")
-    pasywa_b_iii = v("Pasywa_B_III")
-    rzis_a = v("RZiS.A")
-    rzis_f = v("RZiS.F")
-    rzis_l = v("RZiS.L")
+    aktywa = v("total_assets")
+    equity = v("equity")
+    current_assets = v("current_assets")
+    total_liab = v("total_liabilities")
+    short_term_liab = v("short_term_liabilities")
+    revenue = v("revenue")
+    op_profit = v("operating_profit")
+    net_profit = v("net_profit")
 
     return {
-        "equity_ratio": ratio(pasywa_a, aktywa),
-        "current_ratio": ratio(aktywa_b, pasywa_b_iii),
-        "debt_ratio": ratio(pasywa_b, aktywa),
-        "operating_margin": ratio(rzis_f, rzis_a),
-        "net_margin": ratio(rzis_l, rzis_a),
+        "equity_ratio": ratio(equity, aktywa),
+        "current_ratio": ratio(current_assets, short_term_liab),
+        "debt_ratio": ratio(total_liab, aktywa),
+        "operating_margin": ratio(op_profit, revenue),
+        "net_margin": ratio(net_profit, revenue),
     }

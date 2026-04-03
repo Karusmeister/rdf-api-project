@@ -284,6 +284,25 @@ class TestIngestDocument:
         with pytest.raises(ValueError, match="not found"):
             etl.ingest_document("nonexistent-doc")
 
+    def test_ingest_stores_schema_code_on_report(self, storage_with_xml):
+        """Ingesting a JednostkaInna XML must persist schema_code='SFJINZ' on the report."""
+        ctx = storage_with_xml
+        etl.ingest_document(ctx["document_id"], storage=ctx["storage"])
+
+        report = prediction_db.get_financial_report(ctx["document_id"])
+        assert report is not None
+        assert report["schema_code"] == "SFJINZ"
+
+    def test_ingest_stores_schema_code_on_line_items(self, storage_with_xml):
+        """All line items must carry the detected schema_code."""
+        ctx = storage_with_xml
+        etl.ingest_document(ctx["document_id"], storage=ctx["storage"])
+
+        items = prediction_db.get_line_items(ctx["document_id"])
+        assert len(items) > 0
+        for item in items:
+            assert item["schema_code"] == "SFJINZ", f"Missing schema_code on tag_path={item['tag_path']}"
+
     def test_ingest_not_downloaded(self, isolated_db):
         scraper_db.upsert_krs("0000099999", None, None, True)
         now = datetime.now(timezone.utc)

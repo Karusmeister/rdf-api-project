@@ -420,6 +420,21 @@ def _init_schema() -> None:
         if name not in existing:
             conn.execute(sql)
 
+    # --- schema_code column migration (multi-schema parser support) ---
+    for tbl in ("financial_reports", "financial_line_items"):
+        try:
+            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN schema_code VARCHAR(10)")
+        except Exception:
+            pass  # column already exists
+    conn.execute("UPDATE financial_reports SET schema_code = 'SFJINZ' WHERE schema_code IS NULL")
+    conn.execute("UPDATE financial_line_items SET schema_code = 'SFJINZ' WHERE schema_code IS NULL")
+    for idx_name, idx_sql in [
+        ("idx_reports_schema", "CREATE INDEX idx_reports_schema ON financial_reports(schema_code)"),
+        ("idx_line_items_schema", "CREATE INDEX idx_line_items_schema ON financial_line_items(schema_code)"),
+    ]:
+        if idx_name not in existing:
+            conn.execute(idx_sql)
+
     conn.execute("""
         CREATE OR REPLACE VIEW latest_financial_reports AS
         SELECT
@@ -438,7 +453,8 @@ def _init_schema() -> None:
             source_file_path,
             ingestion_status,
             ingestion_error,
-            created_at
+            created_at,
+            schema_code
         FROM (
             SELECT
                 fr.*,
@@ -482,7 +498,8 @@ def _init_schema() -> None:
             label_pl,
             value_current,
             value_previous,
-            currency
+            currency,
+            schema_code
         FROM (
             SELECT
                 fli.*,
@@ -526,7 +543,7 @@ def _init_schema() -> None:
             id, logical_key, report_version, supersedes_report_id, krs,
             data_source_id, report_type, fiscal_year, period_start, period_end,
             taxonomy_version, source_document_id, source_file_path,
-            ingestion_status, ingestion_error, created_at
+            ingestion_status, ingestion_error, created_at, schema_code
         FROM (
             SELECT
                 fr.*,
@@ -615,7 +632,8 @@ def create_financial_report(report_id: str, krs: str, fiscal_year: int, period_s
                              data_source_id: str = "KRS",
                              taxonomy_version: Optional[str] = None,
                              source_document_id: Optional[str] = None,
-                             source_file_path: Optional[str] = None) -> Optional[str]:
+                             source_file_path: Optional[str] = None,
+                             schema_code: Optional[str] = None) -> Optional[str]:
     """Create a financial report and preserve correction history.
 
     Handles three cases:
@@ -643,9 +661,10 @@ def create_financial_report(report_id: str, krs: str, fiscal_year: int, period_s
                 ingestion_error = NULL,
                 source_file_path = %s,
                 taxonomy_version = %s,
-                source_document_id = coalesce(%s, source_document_id)
+                source_document_id = coalesce(%s, source_document_id),
+                schema_code = coalesce(%s, schema_code)
             WHERE id = %s
-        """, [source_file_path, taxonomy_version, source_document_id, report_id])
+        """, [source_file_path, taxonomy_version, source_document_id, schema_code, report_id])
         return existing_by_id[3]
 
     previous_latest = conn.execute("""
@@ -661,12 +680,12 @@ def create_financial_report(report_id: str, krs: str, fiscal_year: int, period_s
         INSERT INTO financial_reports
             (id, logical_key, report_version, supersedes_report_id, krs, data_source_id,
              report_type, fiscal_year, period_start, period_end, taxonomy_version,
-             source_document_id, source_file_path, ingestion_status, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s)
+             source_document_id, source_file_path, ingestion_status, created_at, schema_code)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s)
         ON CONFLICT (id) DO NOTHING
     """, [report_id, logical_key, report_version, superseded_id, krs, data_source_id,
           report_type, fiscal_year, period_start, period_end, taxonomy_version,
-          source_document_id, source_file_path, now])
+          source_document_id, source_file_path, now, schema_code])
 
     return superseded_id
 
@@ -683,7 +702,7 @@ def get_financial_report(report_id: str) -> Optional[dict]:
     row = conn.execute("""
         SELECT id, logical_key, report_version, supersedes_report_id, krs, data_source_id,
                report_type, fiscal_year, period_start, period_end,
-               ingestion_status, ingestion_error, source_document_id
+               ingestion_status, ingestion_error, source_document_id, schema_code
         FROM financial_reports WHERE id = %s
     """, [report_id]).fetchone()
     if row is None:
@@ -702,6 +721,7 @@ def get_financial_report(report_id: str) -> Optional[dict]:
         "ingestion_status",
         "ingestion_error",
         "source_document_id",
+        "schema_code",
     ]
     return dict(zip(cols, row))
 
@@ -765,14 +785,14 @@ def batch_insert_line_items(items: list[dict], extraction_version: Optional[int]
     for item in items:
         conn.execute("""
             INSERT INTO financial_line_items
-                (report_id, section, tag_path, extraction_version, label_pl, value_current, value_previous, currency)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (report_id, section, tag_path, extraction_version, label_pl, value_current, value_previous, currency, schema_code)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (report_id, section, tag_path, extraction_version) DO NOTHING
         """, [
             item["report_id"], item["section"], item["tag_path"],
             extraction_version,
             item.get("label_pl"), item.get("value_current"), item.get("value_previous"),
-            item.get("currency", "PLN"),
+            item.get("currency", "PLN"), item.get("schema_code"),
         ])
 
 
@@ -781,18 +801,18 @@ def get_line_items(report_id: str, section: Optional[str] = None) -> list[dict]:
     if section:
         rows = conn.execute("""
             SELECT report_id, section, tag_path, extraction_version,
-                   label_pl, value_current, value_previous, currency
+                   label_pl, value_current, value_previous, currency, schema_code
             FROM latest_financial_line_items
             WHERE report_id = %s AND section = %s
         """, [report_id, section]).fetchall()
     else:
         rows = conn.execute("""
             SELECT report_id, section, tag_path, extraction_version,
-                   label_pl, value_current, value_previous, currency
+                   label_pl, value_current, value_previous, currency, schema_code
             FROM latest_financial_line_items
             WHERE report_id = %s
         """, [report_id]).fetchall()
-    cols = ["report_id", "section", "tag_path", "extraction_version", "label_pl", "value_current", "value_previous", "currency"]
+    cols = ["report_id", "section", "tag_path", "extraction_version", "label_pl", "value_current", "value_previous", "currency", "schema_code"]
     return [dict(zip(cols, row)) for row in rows]
 
 

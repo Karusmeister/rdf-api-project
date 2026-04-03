@@ -77,7 +77,7 @@ def _find_xml_in_dir(storage: LocalStorage, doc_dir: str) -> Optional[str]:
             root = xml_parser.ET.fromstring(content)
             for el in root.iter():
                 tag = el.tag.split("}", 1)[1] if "}" in el.tag else el.tag
-                if tag in ("Bilans", "RZiS", "RachPrzeplywow"):
+                if xml_parser._is_statement_marker(tag):
                     return f"{doc_dir}/{name}"
         except xml_parser.ET.ParseError:
             continue
@@ -88,7 +88,7 @@ def _find_xml_in_dir(storage: LocalStorage, doc_dir: str) -> Optional[str]:
     return f"{doc_dir}/{xml_files[0]}" if xml_files else None
 
 
-def _flatten_tree(node: dict | None, section: str, report_id: str) -> list[dict]:
+def _flatten_tree(node: dict | None, section: str, report_id: str, schema_code: str = "SFJINZ") -> list[dict]:
     """Recursively flatten a parsed tree node into line item dicts."""
     if node is None:
         return []
@@ -102,6 +102,7 @@ def _flatten_tree(node: dict | None, section: str, report_id: str) -> list[dict]
             "report_id": report_id,
             "section": section,
             "tag_path": tag,
+            "schema_code": schema_code,
             "label_pl": node.get("label"),
             "value_current": kwota_a,
             "value_previous": kwota_b,
@@ -109,7 +110,7 @@ def _flatten_tree(node: dict | None, section: str, report_id: str) -> list[dict]
         })
 
     for child in node.get("children", []):
-        items.extend(_flatten_tree(child, section, report_id))
+        items.extend(_flatten_tree(child, section, report_id, schema_code))
 
     return items
 
@@ -217,6 +218,7 @@ def ingest_document(document_id: str, storage: Optional[LocalStorage] = None) ->
             period_end=period_end,
             source_document_id=document_id,
             source_file_path=xml_path,
+            schema_code=parsed["company"].get("schema_code", "SFJINZ"),
         )
         prediction_db.update_report_status(report_id, "processing")
         extraction_version = prediction_db.get_next_extraction_version(report_id)
@@ -247,19 +249,35 @@ def ingest_document(document_id: str, storage: Optional[LocalStorage] = None) ->
                 extraction_version=extraction_version,
             )
 
+        # 6b. Store extra sections (equity changes, off-balance-sheet, etc.)
+        for section_name, section_nodes in parsed.get("extras", {}).items():
+            if section_nodes:
+                prediction_db.upsert_raw_financial_data(
+                    report_id,
+                    section_name,
+                    section_nodes,
+                    extraction_version=extraction_version,
+                )
+
         # 7. Flatten into line_items
+        schema_code = parsed["company"].get("schema_code", "SFJINZ")
         line_items = []
 
         if bilans.get("aktywa"):
-            line_items.extend(_flatten_tree(bilans["aktywa"], "Bilans", report_id))
+            line_items.extend(_flatten_tree(bilans["aktywa"], "Bilans", report_id, schema_code))
         if bilans.get("pasywa"):
-            line_items.extend(_flatten_tree(bilans["pasywa"], "Bilans", report_id))
+            line_items.extend(_flatten_tree(bilans["pasywa"], "Bilans", report_id, schema_code))
 
         for node in parsed.get("rzis", []):
-            line_items.extend(_flatten_tree(node, "RZiS", report_id))
+            line_items.extend(_flatten_tree(node, "RZiS", report_id, schema_code))
 
         for node in parsed.get("cash_flow", []):
-            line_items.extend(_flatten_tree(node, "CF", report_id))
+            line_items.extend(_flatten_tree(node, "CF", report_id, schema_code))
+
+        # Flatten extra sections into line_items too
+        for section_name, section_nodes in parsed.get("extras", {}).items():
+            for node in section_nodes:
+                line_items.extend(_flatten_tree(node, section_name, report_id, schema_code))
 
         if line_items:
             prediction_db.batch_insert_line_items(line_items, extraction_version=extraction_version)
