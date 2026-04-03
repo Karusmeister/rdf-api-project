@@ -13,7 +13,9 @@ from app.db.connection import make_connection
 from batch.connections import Connection
 from batch.rdf_document_store import RdfDocumentStore
 from batch.rdf_worker import (
+    AdaptiveSemaphore,
     ConnectionHealth,
+    RateLimitTracker,
     RdfWorkerStats,
     _download_one_document,
     _download_zip_with_backoff,
@@ -107,6 +109,172 @@ def test_connection_health_cooldown_after_sustained_failures():
         cooldown = h.record_failure()
     assert cooldown is not None
     assert cooldown == 60.0
+
+
+# ---------------------------------------------------------------------------
+# AdaptiveSemaphore
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_adaptive_semaphore_basic_acquire_release():
+    sem = AdaptiveSemaphore(3)
+    assert sem.capacity == 3
+    async with sem:
+        pass  # acquire + release
+    assert sem.capacity == 3
+
+
+@pytest.mark.asyncio
+async def test_adaptive_semaphore_reduce_absorbs_release():
+    sem = AdaptiveSemaphore(3, min_value=1)
+    assert sem.capacity == 3
+
+    # Reduce by 1 — next release will be absorbed
+    assert sem.reduce() == 2
+
+    async with sem:
+        pass  # this release is absorbed
+
+    assert sem.capacity == 2
+    # Subsequent releases are normal
+    async with sem:
+        pass
+    assert sem.capacity == 2
+
+
+@pytest.mark.asyncio
+async def test_adaptive_semaphore_respects_min():
+    sem = AdaptiveSemaphore(3, min_value=2)
+    assert sem.reduce() == 2
+    assert sem.reduce() == 2  # already at min
+    assert sem.capacity == 2
+
+
+# ---------------------------------------------------------------------------
+# RateLimitTracker
+# ---------------------------------------------------------------------------
+
+def test_rate_limit_tracker_below_threshold():
+    t = RateLimitTracker(threshold=5, window_secs=60.0)
+    for _ in range(4):
+        assert t.record() is False
+
+
+def test_rate_limit_tracker_at_threshold():
+    t = RateLimitTracker(threshold=5, window_secs=60.0)
+    for _ in range(4):
+        t.record()
+    assert t.record() is True  # 5th hit
+
+
+def test_rate_limit_tracker_fires_once_per_burst():
+    """Reaching threshold fires True once, then resets — next burst needs another 5."""
+    t = RateLimitTracker(threshold=5, window_secs=60.0)
+    fires = []
+    for i in range(15):
+        fires.append(t.record())
+    # Should fire exactly at hit 5, 10, 15
+    assert fires == [
+        False, False, False, False, True,   # burst 1
+        False, False, False, False, True,   # burst 2
+        False, False, False, False, True,   # burst 3
+    ]
+
+
+def test_rate_limit_tracker_burst_reductions_with_semaphore():
+    """Integration: 10 429s with threshold=5 should reduce capacity exactly twice."""
+    sem = AdaptiveSemaphore(8, min_value=2)
+    tracker = RateLimitTracker(threshold=5, window_secs=60.0)
+    reductions = 0
+    for _ in range(10):
+        if tracker.record():
+            old = sem.capacity
+            new = sem.reduce()
+            if new < old:
+                reductions += 1
+    assert reductions == 2
+    assert sem.capacity == 6  # 8 -> 7 -> 6
+
+
+def test_rate_limit_tracker_resets_after_window(monkeypatch):
+    import time as _time
+    current = [_time.monotonic()]
+    monkeypatch.setattr("batch.rdf_worker.time.monotonic", lambda: current[0])
+
+    t = RateLimitTracker(threshold=3, window_secs=10.0)
+    t.record()
+    t.record()
+
+    # Advance past window
+    current[0] += 15.0
+    assert t.record() is False  # reset, only 1 in new window
+
+
+# ---------------------------------------------------------------------------
+# on_429 callback integration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_sleep")
+async def test_fetch_page_429_fires_on_429_callback(rdf_base):
+    calls = []
+
+    def side_effect(request):
+        if len(calls) == 0:
+            calls.append(1)
+            return httpx.Response(429)
+        return httpx.Response(200, json={
+            "content": [_SAMPLE_DOC],
+            "metadaneWynikow": {
+                "numerStrony": 0, "rozmiarStrony": 10,
+                "liczbaStron": 1, "calkowitaLiczbaObiektow": 1,
+            },
+        })
+
+    callback_count = [0]
+
+    def on_429():
+        callback_count[0] += 1
+
+    with respx.mock:
+        respx.post(f"{rdf_base}/dokumenty/wyszukiwanie").mock(
+            side_effect=side_effect
+        )
+        async with httpx.AsyncClient(base_url=rdf_base) as client:
+            status, docs, _ = await _fetch_documents_page(
+                client, "0000000001", page=0, page_size=10, worker_id=0,
+                on_429=on_429,
+            )
+    assert status == "ok"
+    assert callback_count[0] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_sleep")
+async def test_download_zip_429_fires_on_429_callback(rdf_base):
+    calls = []
+
+    def side_effect(request):
+        if len(calls) == 0:
+            calls.append(1)
+            return httpx.Response(429)
+        return httpx.Response(200, content=b"fake-zip")
+
+    callback_count = [0]
+
+    def on_429():
+        callback_count[0] += 1
+
+    with respx.mock:
+        respx.post(f"{rdf_base}/dokumenty/tresc").mock(
+            side_effect=side_effect
+        )
+        async with httpx.AsyncClient(base_url=rdf_base) as client:
+            result = await _download_zip_with_backoff(
+                client, "doc1==", worker_id=0, on_429=on_429,
+            )
+    assert result == b"fake-zip"
+    assert callback_count[0] == 1
 
 
 # ---------------------------------------------------------------------------

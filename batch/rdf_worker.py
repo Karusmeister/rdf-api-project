@@ -100,6 +100,67 @@ class ConnectionHealth:
         return None
 
 
+class AdaptiveSemaphore:
+    """Semaphore whose effective capacity can be reduced at runtime.
+
+    When ``reduce()`` is called, the next release is silently absorbed
+    instead of making the slot available again, permanently shrinking
+    the pool by one.
+    """
+
+    def __init__(self, value: int, min_value: int = 2):
+        self._sem = asyncio.Semaphore(value)
+        self._effective = value
+        self._min = min_value
+        self._pending_reductions = 0
+
+    @property
+    def capacity(self) -> int:
+        return self._effective
+
+    def reduce(self) -> int:
+        """Reduce effective capacity by 1. Returns new capacity."""
+        if self._effective <= self._min:
+            return self._effective
+        self._effective -= 1
+        self._pending_reductions += 1
+        return self._effective
+
+    async def __aenter__(self):
+        await self._sem.acquire()
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._pending_reductions > 0:
+            self._pending_reductions -= 1
+            # Slot permanently consumed — don't release.
+        else:
+            self._sem.release()
+
+
+@dataclass
+class RateLimitTracker:
+    """Counts 429 responses per rolling window and signals when to back off."""
+
+    threshold: int = 5
+    window_secs: float = 60.0
+    _count: int = field(default=0, init=False, repr=False)
+    _window_start: float = field(default_factory=time.monotonic, init=False, repr=False)
+
+    def record(self) -> bool:
+        """Record a 429. Returns True exactly once per burst of *threshold* hits."""
+        now = time.monotonic()
+        if now - self._window_start > self.window_secs:
+            self._count = 0
+            self._window_start = now
+        self._count += 1
+        if self._count >= self.threshold:
+            self._count = 0
+            self._window_start = now
+            return True
+        return False
+
+
 def _make_client(connection: Connection) -> httpx.AsyncClient:
     kwargs: dict = {
         "base_url": _RDF_BASE,
@@ -122,6 +183,7 @@ async def _fetch_documents_page(
     page: int,
     page_size: int,
     worker_id: int,
+    on_429=None,
 ) -> tuple[str, list[dict], int]:
     """Fetch one page of documents for a KRS number.
 
@@ -144,6 +206,8 @@ async def _fetch_documents_page(
             resp = await client.post("/dokumenty/wyszukiwanie", json=payload)
 
             if resp.status_code in (429, 503):
+                if resp.status_code == 429 and on_429:
+                    on_429()
                 if attempt < _MAX_RETRIES_RATE_LIMIT:
                     delay = min(1.0 * (2 ** attempt), _BACKOFF_CAP_SECONDS)
                     logger.warning(
@@ -169,6 +233,8 @@ async def _fetch_documents_page(
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
             if status_code in (429, 503) and attempt < _MAX_RETRIES_RATE_LIMIT:
+                if status_code == 429 and on_429:
+                    on_429()
                 delay = min(1.0 * (2 ** attempt), _BACKOFF_CAP_SECONDS)
                 await asyncio.sleep(delay)
                 continue
@@ -202,6 +268,7 @@ async def _fetch_all_documents(
     page_size: int,
     delay: float,
     worker_id: int,
+    on_429=None,
 ) -> tuple[str, list[dict]]:
     """Fetch ALL pages of documents for a KRS number.
 
@@ -211,6 +278,7 @@ async def _fetch_all_documents(
 
     status, docs, total_pages = await _fetch_documents_page(
         client, krs, page=0, page_size=page_size, worker_id=worker_id,
+        on_429=on_429,
     )
 
     if status == "error":
@@ -224,6 +292,7 @@ async def _fetch_all_documents(
         await asyncio.sleep(delay)
         status, docs, _ = await _fetch_documents_page(
             client, krs, page=page, page_size=page_size, worker_id=worker_id,
+            on_429=on_429,
         )
         if status == "error":
             logger.warning(
@@ -245,6 +314,7 @@ async def _fetch_metadata_with_backoff(
     client: httpx.AsyncClient,
     doc_id: str,
     worker_id: int,
+    on_429=None,
 ) -> dict | None:
     """Fetch document metadata. Returns metadata dict or None on failure."""
     encoded_id = urllib.parse.quote(doc_id, safe="")
@@ -253,6 +323,8 @@ async def _fetch_metadata_with_backoff(
             resp = await client.get(f"/dokumenty/{encoded_id}")
 
             if resp.status_code in (429, 503):
+                if resp.status_code == 429 and on_429:
+                    on_429()
                 if attempt < _MAX_RETRIES_RATE_LIMIT:
                     delay = min(1.0 * (2 ** attempt), _BACKOFF_CAP_SECONDS)
                     await asyncio.sleep(delay)
@@ -277,6 +349,7 @@ async def _download_zip_with_backoff(
     client: httpx.AsyncClient,
     doc_id: str,
     worker_id: int,
+    on_429=None,
 ) -> bytes | None:
     """Download document ZIP. Returns raw bytes or None on failure."""
     for attempt in range(_MAX_RETRIES_RATE_LIMIT + 1):
@@ -289,6 +362,8 @@ async def _download_zip_with_backoff(
             )
 
             if resp.status_code in (429, 503):
+                if resp.status_code == 429 and on_429:
+                    on_429()
                 if attempt < _MAX_RETRIES_RATE_LIMIT:
                     delay = min(1.0 * (2 ** attempt), _BACKOFF_CAP_SECONDS)
                     await asyncio.sleep(delay)
@@ -319,6 +394,7 @@ async def _download_one_document(
     worker_id: int,
     stats: RdfWorkerStats,
     skip_metadata: bool = False,
+    on_429=None,
 ) -> bool:
     """Download a single document: metadata → ZIP → extract → mark in DB.
 
@@ -328,7 +404,7 @@ async def _download_one_document(
     """
     # 1. Fetch metadata (skip when flag is set)
     if not skip_metadata:
-        meta = await _fetch_metadata_with_backoff(client, doc_id, worker_id)
+        meta = await _fetch_metadata_with_backoff(client, doc_id, worker_id, on_429=on_429)
         await asyncio.sleep(delay)
 
         if meta is not None:
@@ -341,7 +417,7 @@ async def _download_one_document(
                 )
 
     # 2. Download ZIP
-    zip_bytes = await _download_zip_with_backoff(client, doc_id, worker_id)
+    zip_bytes = await _download_zip_with_backoff(client, doc_id, worker_id, on_429=on_429)
     await asyncio.sleep(delay)
 
     if zip_bytes is None:
@@ -405,7 +481,18 @@ async def _worker_loop(
     storage = create_storage()
     stats = RdfWorkerStats()
     health = ConnectionHealth()
-    sem = asyncio.Semaphore(concurrency)
+    adaptive_sem = AdaptiveSemaphore(concurrency)
+    rate_tracker = RateLimitTracker()
+
+    def _on_429():
+        if rate_tracker.record():
+            old_cap = adaptive_sem.capacity
+            new_cap = adaptive_sem.reduce()
+            if new_cap < old_cap:
+                logger.warning(
+                    "rdf_worker=%d adaptive_concurrency_reduced to=%d",
+                    worker_id, new_cap,
+                )
 
     # Pre-fetch our partition: new KRS numbers + already-discovered but undownloaded
     new_krs = progress.get_pending_krs(worker_id, total_workers)
@@ -438,9 +525,10 @@ async def _worker_loop(
                 all_docs: list[dict] = []
                 result = "error"
                 try:
-                    async with sem:
+                    async with adaptive_sem:
                         result, all_docs = await _fetch_all_documents(
                             client, krs, page_size, delay, worker_id,
+                            on_429=_on_429,
                         )
                         effective_delay = delay + health.extra_delay
                         await asyncio.sleep(effective_delay)
@@ -497,11 +585,12 @@ async def _worker_loop(
                 undownloaded = doc_store.get_undownloaded(krs)
                 if undownloaded:
                     async def _dl_one(doc_id: str) -> None:
-                        async with sem:
+                        async with adaptive_sem:
                             await _download_one_document(
                                 client, krs, doc_id, doc_store, storage,
                                 download_delay, worker_id, stats,
                                 skip_metadata=skip_metadata,
+                                on_429=_on_429,
                             )
 
                     await asyncio.gather(
@@ -524,7 +613,7 @@ async def _worker_loop(
         idx = 0
 
         while idx < len(pending_krs) or pending:
-            while len(pending) < concurrency and idx < len(pending_krs):
+            while len(pending) < adaptive_sem.capacity and idx < len(pending_krs):
                 krs = pending_krs[idx]
                 idx += 1
                 task = asyncio.create_task(_handle_one(krs))

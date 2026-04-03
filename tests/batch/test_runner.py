@@ -26,12 +26,15 @@ def test_pick_connection_vpn_round_robin(monkeypatch):
     monkeypatch.setattr(settings, "nordvpn_username", "u")
     monkeypatch.setattr(settings, "nordvpn_password", "p")
     monkeypatch.setattr(settings, "nordvpn_servers", ["pl1", "pl2"])
+    # Pool = [direct, pl1, pl2] — round-robin across all 3
     c0 = _pick_connection(0, use_vpn=True)
     c1 = _pick_connection(1, use_vpn=True)
-    c2 = _pick_connection(2, use_vpn=True)  # wraps around
-    assert c0.name == "pl1"
-    assert c1.name == "pl2"
-    assert c2.name == "pl1"
+    c2 = _pick_connection(2, use_vpn=True)
+    c3 = _pick_connection(3, use_vpn=True)  # wraps around
+    assert c0.name == "direct"
+    assert c1.name == "pl1"
+    assert c2.name == "pl2"
+    assert c3.name == "direct"  # extra worker falls back to direct
 
 
 def test_pick_connection_vpn_no_servers_raises(monkeypatch):

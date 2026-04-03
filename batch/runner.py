@@ -26,17 +26,20 @@ logger = logging.getLogger(__name__)
 
 
 def _pick_connection(worker_id: int, use_vpn: bool) -> Connection:
-    """Assign a connection to a worker. Direct if VPN disabled; round-robin VPN otherwise."""
+    """Assign a connection to a worker.
+
+    Round-robins across the full pool (direct + VPN proxies).  When there
+    are more workers than proxies, extra workers use the direct connection.
+    """
     pool = build_pool()
     if not use_vpn:
         return pool[0]  # direct
-    vpn_conns = [c for c in pool if c.proxy_url is not None]
-    if not vpn_conns:
+    if len(pool) < 2:
         raise RuntimeError(
             "BATCH_USE_VPN=true but NORDVPN_SERVERS is empty. "
             "Set NORDVPN_SERVERS in .env."
         )
-    return vpn_conns[worker_id % len(vpn_conns)]
+    return pool[worker_id % len(pool)]
 
 
 def _validate_vpn_config() -> None:
