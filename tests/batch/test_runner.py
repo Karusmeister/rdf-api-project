@@ -149,12 +149,14 @@ def test_run_batch_spawns_correct_workers(mock_process_cls, _mock_ps, _mock_es, 
 @patch("batch.runner.EntityStore")
 @patch("batch.runner.ProgressStore")
 @patch("batch.runner.multiprocessing.Process")
-def test_run_batch_defaults_from_settings(mock_process_cls, _mock_ps, _mock_es, monkeypatch):
+def test_run_batch_defaults_from_settings(mock_process_cls, mock_ps, _mock_es, monkeypatch):
     """run_batch with no args uses settings defaults."""
     monkeypatch.setattr(settings, "nordvpn_servers", [])
     monkeypatch.setattr(settings, "batch_start_krs", 42)
     monkeypatch.setattr(settings, "batch_workers", 2)
     monkeypatch.setattr(settings, "batch_use_vpn", False)
+    # Cursor returns None — no saved position, uses settings default
+    mock_ps.return_value.load_cursor.return_value = None
     mock_proc = MagicMock()
     mock_proc.pid = 1
     mock_proc.exitcode = 0

@@ -65,3 +65,22 @@ class ProgressStore:
             ).fetchall()
             return {row[0]: row[1] for row in rows}
         return self._with_conn(_do)
+
+    def save_cursor(self, next_krs: int) -> None:
+        """Persist the next KRS number to probe so future runs can resume."""
+        def _do(conn):
+            conn.execute("""
+                INSERT INTO krs_scan_cursor (id, next_krs_int)
+                VALUES (TRUE, %s)
+                ON CONFLICT (id) DO UPDATE SET next_krs_int = %s
+            """, [next_krs, next_krs])
+        self._with_conn(_do)
+
+    def load_cursor(self) -> int | None:
+        """Load the saved cursor position. Returns None if no cursor exists."""
+        def _do(conn):
+            row = conn.execute(
+                "SELECT next_krs_int FROM krs_scan_cursor WHERE id = TRUE"
+            ).fetchone()
+            return row[0] if row else None
+        return self._with_conn(_do)

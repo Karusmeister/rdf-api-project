@@ -253,6 +253,8 @@ async def _worker_loop(
 
     krs = start_krs
     retry_after_rotation: list[int] = []
+    _CURSOR_SAVE_INTERVAL = 300.0  # save cursor every 5 minutes
+    _last_cursor_save = time.monotonic()
 
     # Outer loop: reconnects with a new proxy when the rotator signals rotation
     while krs <= _MAX_KRS or retry_after_rotation:
@@ -341,6 +343,12 @@ async def _worker_loop(
                 if stats.found > 0 and stats.found % 100 == 0:
                     stats.log(worker_id)
 
+                # Periodically save cursor so restarts resume from here
+                if (worker_id == 0
+                        and time.monotonic() - _last_cursor_save >= _CURSOR_SAVE_INTERVAL):
+                    store.save_cursor(krs_num)
+                    _last_cursor_save = time.monotonic()
+
             pending: set[asyncio.Task] = set()
 
             # Retry items from previous rotation first
@@ -406,6 +414,11 @@ async def _worker_loop(
             )
         elif not needs_reconnect:
             break  # Normal exit (finished range or max errors)
+
+    # Final cursor save so next run resumes from here
+    if worker_id == 0:
+        store.save_cursor(krs)
+        logger.info("worker=%d saved cursor krs=%d", worker_id, krs)
 
     stats.log(worker_id)
     logger.info("worker=%d finished krs_reached=%d", worker_id, krs)

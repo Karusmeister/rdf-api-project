@@ -75,12 +75,23 @@ def run_batch(
 
     All arguments are optional — defaults come from settings.
     """
-    _start = start_krs if start_krs is not None else settings.batch_start_krs
     _workers = workers if workers is not None else settings.batch_workers
     _vpn = use_vpn if use_vpn is not None else settings.batch_use_vpn
     _concurrency = concurrency if concurrency is not None else settings.batch_concurrency_per_worker
     _delay = delay if delay is not None else settings.batch_delay_seconds
     _db = dsn if dsn is not None else settings.database_url
+
+    # Auto-resume: use saved cursor if no explicit start_krs
+    if start_krs is not None:
+        _start = start_krs
+    else:
+        _store = ProgressStore(_db)
+        saved = _store.load_cursor()
+        if saved and saved > settings.batch_start_krs:
+            _start = saved
+            logger.info("resuming from saved cursor krs=%d", _start)
+        else:
+            _start = settings.batch_start_krs
 
     if _workers <= 0:
         raise ValueError("workers must be > 0")
