@@ -267,7 +267,7 @@ async def _worker_loop(
         async with _make_client(connection) as client:
 
             async def _handle_one(krs_num: int) -> None:
-                nonlocal consecutive_task_errors, needs_reconnect
+                nonlocal consecutive_task_errors, needs_reconnect, _last_cursor_save
                 krs_str = str(krs_num).zfill(10)
 
                 if store.is_done(krs_num):
