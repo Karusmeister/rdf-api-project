@@ -8,8 +8,11 @@ Banned countries (ZZ/unknown, RU, BY, KP, AF) are excluded.
 Priority countries: PL, DE, CZ, SK, SE, NL, FR, AT, ES — then everything else.
 """
 
+import asyncio
 import json
 import logging
+import socket
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from batch.connections import Connection, _socks5_url
@@ -99,10 +102,86 @@ def _load_public_proxies(path: Path | None = None) -> list[Connection]:
     return connections
 
 
+_PREFLIGHT_TIMEOUT = 3.0  # seconds per proxy TCP connect check
+_PREFLIGHT_WORKERS = 50   # concurrent health checks
+
+
+def _check_proxy_reachable(conn: Connection) -> tuple[Connection, bool]:
+    """TCP connect to proxy host:port. Returns (connection, reachable)."""
+    if conn.proxy_url is None:
+        return conn, True  # direct always reachable
+    try:
+        # Extract host:port from socks5://[user:pass@]host:port
+        url = conn.proxy_url
+        # Strip scheme
+        hostport = url.split("://", 1)[1]
+        # Strip credentials if present
+        if "@" in hostport:
+            hostport = hostport.split("@", 1)[1]
+        host, port_str = hostport.rsplit(":", 1)
+        port = int(port_str)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(_PREFLIGHT_TIMEOUT)
+        sock.connect((host, port))
+        sock.close()
+        return conn, True
+    except (OSError, ValueError):
+        return conn, False
+
+
+def preflight_check(pool: list[Connection], dsn: str | None = None) -> list[Connection]:
+    """Run TCP connect checks on all proxied connections in parallel.
+
+    Unreachable proxies are removed from the pool and marked dead in
+    the global registry (if dsn is provided).
+    """
+    # Separate direct (skip check) from proxied
+    direct = [c for c in pool if c.proxy_url is None]
+    proxied = [c for c in pool if c.proxy_url is not None]
+
+    if not proxied:
+        return pool
+
+    logger.info("preflight_check starting for %d proxies...", len(proxied))
+
+    alive: list[Connection] = []
+    dead_names: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=_PREFLIGHT_WORKERS) as executor:
+        results = executor.map(_check_proxy_reachable, proxied)
+        for conn, reachable in results:
+            if reachable:
+                alive.append(conn)
+            else:
+                dead_names.append(conn.name)
+
+    if dead_names:
+        logger.info(
+            "preflight_check removed %d unreachable proxies (%d alive)",
+            len(dead_names), len(alive),
+        )
+        # Persist to global registry
+        if dsn:
+            from batch.connections import DeadProxyRegistry
+            try:
+                registry = DeadProxyRegistry(dsn)
+                for name in dead_names:
+                    registry.mark_dead(name, worker_id=-1)
+            except Exception as exc:
+                logger.warning("preflight_check could not persist dead proxies: %s", exc)
+    else:
+        logger.info("preflight_check all %d proxies reachable", len(alive))
+
+    # Preserve original order: alive proxied + direct
+    return alive + direct
+
+
 def build_full_pool(
     proxies_path: Path | None = None,
     include_public: bool | None = None,
     dsn: str | None = None,
+    run_preflight: bool = True,
 ) -> list[Connection]:
     """Build the complete priority-ordered proxy pool.
 
@@ -115,8 +194,11 @@ def build_full_pool(
     routing traffic through untrusted intermediaries.
 
     If ``dsn`` is provided, proxies previously marked dead in the
-    ``dead_proxies`` table (within TTL) are excluded up front so workers
-    don't waste time retrying known-bad endpoints.
+    ``dead_proxies`` table (within TTL) are excluded up front.
+
+    If ``run_preflight`` is True (default), a TCP connect check is run
+    against all proxied connections in parallel. Unreachable proxies are
+    removed from the pool and marked dead in the global registry.
     """
     pool: list[Connection] = []
 
@@ -149,5 +231,9 @@ def build_full_pool(
                     )
         except Exception as exc:
             logger.warning("could not check dead_proxies table: %s", exc)
+
+    # Pre-flight: TCP-ping all proxies, remove unreachable
+    if run_preflight:
+        pool = preflight_check(pool, dsn=dsn)
 
     return pool

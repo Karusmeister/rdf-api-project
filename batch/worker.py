@@ -208,7 +208,7 @@ async def _process_krs_with_backoff(
     return "error", None
 
 
-_MAX_KRS = 99_999_999  # upper bound for KRS numbers
+_MAX_KRS = 3_000_000  # upper bound for KRS numbers
 _MAX_CONSECUTIVE_TASK_ERRORS = 50  # abort if too many consecutive task errors
 
 

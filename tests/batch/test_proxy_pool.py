@@ -159,7 +159,7 @@ def test_build_full_pool_nordvpn_first_then_public_then_direct(tmp_path, monkeyp
     monkeypatch.setattr("batch.proxy_pool.settings.nordvpn_password", "p")
     entries = [_proxy_entry("1.1.1.1", 1000, "PL")]
     path = _make_proxies_json(entries, tmp_path)
-    pool = build_full_pool(path, include_public=True)
+    pool = build_full_pool(path, include_public=True, run_preflight=False)
     assert "nordvpn" in pool[0].name  # NordVPN first
     assert "PL" in pool[1].name       # public second
     assert pool[-1].name == "direct"   # direct last
@@ -170,7 +170,7 @@ def test_build_full_pool_public_proxies_off_by_default(tmp_path, monkeypatch):
     monkeypatch.setattr("batch.proxy_pool.settings.batch_use_public_proxies", False)
     entries = [_proxy_entry("1.1.1.1", 1000, "PL")]
     path = _make_proxies_json(entries, tmp_path)
-    pool = build_full_pool(path)
+    pool = build_full_pool(path, run_preflight=False)
     # Only direct, no public proxies
     assert len(pool) == 1
     assert pool[0].name == "direct"
@@ -180,7 +180,7 @@ def test_build_full_pool_public_proxies_opt_in(tmp_path, monkeypatch):
     monkeypatch.setattr("batch.proxy_pool.settings.nordvpn_servers", [])
     entries = [_proxy_entry("1.1.1.1", 1000, "PL")]
     path = _make_proxies_json(entries, tmp_path)
-    pool = build_full_pool(path, include_public=True)
+    pool = build_full_pool(path, include_public=True, run_preflight=False)
     assert len(pool) == 2
     assert "PL" in pool[0].name
     assert pool[-1].name == "direct"
