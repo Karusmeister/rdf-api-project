@@ -102,6 +102,7 @@ def _load_public_proxies(path: Path | None = None) -> list[Connection]:
 def build_full_pool(
     proxies_path: Path | None = None,
     include_public: bool | None = None,
+    dsn: str | None = None,
 ) -> list[Connection]:
     """Build the complete priority-ordered proxy pool.
 
@@ -112,6 +113,10 @@ def build_full_pool(
     Public proxies are only included when ``include_public`` is True (or
     ``settings.batch_use_public_proxies`` is True). Default is off to avoid
     routing traffic through untrusted intermediaries.
+
+    If ``dsn`` is provided, proxies previously marked dead in the
+    ``dead_proxies`` table (within TTL) are excluded up front so workers
+    don't waste time retrying known-bad endpoints.
     """
     pool: list[Connection] = []
 
@@ -126,5 +131,23 @@ def build_full_pool(
 
     # Direct connection as last-resort fallback
     pool.append(Connection(name="direct"))
+
+    # Filter out proxies already known dead from previous runs
+    if dsn:
+        from batch.connections import DeadProxyRegistry
+        try:
+            registry = DeadProxyRegistry(dsn)
+            dead = registry.get_all_dead()
+            if dead:
+                before = len(pool)
+                pool = [c for c in pool if c.name not in dead or c.proxy_url is None]
+                removed = before - len(pool)
+                if removed:
+                    logger.info(
+                        "excluded %d known-dead proxies from pool (%d remaining)",
+                        removed, len(pool),
+                    )
+        except Exception as exc:
+            logger.warning("could not check dead_proxies table: %s", exc)
 
     return pool

@@ -67,7 +67,7 @@ def run_rdf_batch(
         _validate_vpn_config()
 
     # Build proxy pool only when VPN mode is enabled
-    full_pool = build_full_pool() if _vpn else None
+    full_pool = build_full_pool(dsn=_db) if _vpn else None
 
     logger.info(
         "rdf_batch_start workers=%d vpn=%s concurrency=%d delay=%.1f "

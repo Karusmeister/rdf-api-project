@@ -98,7 +98,7 @@ def run_batch(
     EntityStore(_db)
 
     # Build proxy pool only when VPN mode is enabled
-    full_pool = build_full_pool() if _vpn else None
+    full_pool = build_full_pool(dsn=_db) if _vpn else None
 
     logger.info(
         "batch_start workers=%d start_krs=%d vpn=%s concurrency=%d delay=%.1f "
