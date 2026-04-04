@@ -161,13 +161,12 @@ def preflight_check(pool: list[Connection], dsn: str | None = None) -> list[Conn
             "preflight_check removed %d unreachable proxies (%d alive)",
             len(dead_names), len(alive),
         )
-        # Persist to global registry
+        # Persist to global registry (batch insert for speed)
         if dsn:
             from batch.connections import DeadProxyRegistry
             try:
                 registry = DeadProxyRegistry(dsn)
-                for name in dead_names:
-                    registry.mark_dead(name, worker_id=-1)
+                registry.mark_dead_batch(dead_names, worker_id=-1)
             except Exception as exc:
                 logger.warning("preflight_check could not persist dead proxies: %s", exc)
     else:

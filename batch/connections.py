@@ -135,6 +135,26 @@ class DeadProxyRegistry:
         finally:
             conn.close()
 
+    def mark_dead_batch(self, proxy_names: list[str], worker_id: int) -> None:
+        """Mark multiple proxies dead in a single transaction."""
+        if not proxy_names:
+            return
+        from app.db.connection import make_connection
+        conn = make_connection(self._dsn)
+        try:
+            # Build a single INSERT with VALUES list
+            values = ", ".join(
+                conn._conn.cursor().mogrify("(%s, %s)", (name, worker_id)).decode()
+                for name in proxy_names
+            )
+            conn.execute(f"""
+                INSERT INTO dead_proxies (proxy_name, killed_by, killed_at)
+                VALUES {values}
+                ON CONFLICT (proxy_name) DO UPDATE SET killed_at = NOW(), killed_by = EXCLUDED.killed_by
+            """)
+        finally:
+            conn.close()
+
 
 class ProxyRotator:
     """Manages a list of proxy connections with auto-rotation on failure.
