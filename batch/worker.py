@@ -267,7 +267,7 @@ async def _worker_loop(
         async with _make_client(connection) as client:
 
             async def _handle_one(krs_num: int) -> None:
-                nonlocal consecutive_task_errors, needs_reconnect, _last_cursor_save
+                nonlocal consecutive_task_errors, needs_reconnect
                 krs_str = str(krs_num).zfill(10)
 
                 if store.is_done(krs_num):
@@ -343,12 +343,6 @@ async def _worker_loop(
                 if stats.found > 0 and stats.found % 100 == 0:
                     stats.log(worker_id)
 
-                # Periodically save cursor so restarts resume from here
-                if (worker_id == 0
-                        and time.monotonic() - _last_cursor_save >= _CURSOR_SAVE_INTERVAL):
-                    store.save_cursor(krs_num)
-                    _last_cursor_save = time.monotonic()
-
             pending: set[asyncio.Task] = set()
 
             # Retry items from previous rotation first
@@ -375,6 +369,13 @@ async def _worker_loop(
                     pending.add(task)
                     task.add_done_callback(pending.discard)
                     krs += stride
+
+                # Periodically save cursor (in scheduler, not in task)
+                if (worker_id == 0
+                        and time.monotonic() - _last_cursor_save >= _CURSOR_SAVE_INTERVAL):
+                    store.save_cursor(krs)
+                    _last_cursor_save = time.monotonic()
+                    logger.info("worker=0 saved cursor krs=%d", krs)
 
                 # Wait for at least one task to finish before scheduling more
                 if pending:
