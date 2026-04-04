@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     nordvpn_password: str = ""
     nordvpn_servers: list[str] = []
 
+    # Public proxy pool (opt-in, default off)
+    batch_use_public_proxies: bool = False  # load proxies.json into the proxy pool
+
     # --- Auth ---
     jwt_secret: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"

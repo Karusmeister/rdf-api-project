@@ -18,6 +18,7 @@ import sys
 
 from app.config import settings
 from batch.connections import Connection, build_pool, validate_vpn_config
+from batch.proxy_pool import build_full_pool
 from batch.rdf_worker import run_rdf_worker
 
 logger = logging.getLogger(__name__)
@@ -65,16 +66,21 @@ def run_rdf_batch(
     if _vpn:
         _validate_vpn_config()
 
+    # Build proxy pool only when VPN mode is enabled
+    full_pool = build_full_pool() if _vpn else None
+
     logger.info(
         "rdf_batch_start workers=%d vpn=%s concurrency=%d delay=%.1f "
-        "download_delay=%.1f page_size=%d db=%s storage_backend=%s skip_metadata=%s",
+        "download_delay=%.1f page_size=%d db=%s storage_backend=%s "
+        "skip_metadata=%s proxy_pool_size=%d",
         _workers, _vpn, _concurrency, _delay, _dl_delay, _page_size, _db,
         settings.storage_backend, _skip_meta,
+        len(full_pool) if full_pool else 0,
     )
 
     processes: list[multiprocessing.Process] = []
     for worker_id in range(_workers):
-        conn = _pick_connection(worker_id, _vpn)
+        conn = Connection(name="pool-managed") if full_pool else _pick_connection(worker_id, _vpn)
         p = multiprocessing.Process(
             target=run_rdf_worker,
             name=f"rdf-worker-{worker_id}",
@@ -88,6 +94,7 @@ def run_rdf_batch(
                 page_size=_page_size,
                 dsn=_db,
                 skip_metadata=_skip_meta,
+                proxy_pool=full_pool,
             ),
         )
         processes.append(p)

@@ -16,7 +16,7 @@ import httpx
 
 from app.config import settings
 from app.crypto import encrypt_nrkrs
-from batch.connections import Connection
+from batch.connections import Connection, DeadProxyRegistry, ProxyRotator
 from batch.entity_store import EntityStore
 from batch.progress import ProgressStore
 
@@ -220,6 +220,7 @@ async def _worker_loop(
     concurrency: int,
     delay: float,
     dsn: str,
+    proxy_pool: list[Connection] | None = None,
 ) -> None:
     """Main async loop for a single worker process.
 
@@ -240,117 +241,174 @@ async def _worker_loop(
     sem = asyncio.Semaphore(concurrency)
     consecutive_task_errors = 0
 
-    async with _make_client(connection) as client:
+    # Set up proxy rotation if a pool was provided
+    rotator: ProxyRotator | None = None
+    if proxy_pool and len(proxy_pool) > 1:
+        registry = DeadProxyRegistry(dsn)
+        rotator = ProxyRotator(
+            proxy_pool, start_index=worker_id,
+            registry=registry, worker_id=worker_id,
+        )
+        connection = rotator.current
 
-        async def _handle_one(krs_num: int) -> None:
-            nonlocal consecutive_task_errors
-            krs_str = str(krs_num).zfill(10)
+    krs = start_krs
+    retry_after_rotation: list[int] = []
 
-            if store.is_done(krs_num):
-                return
+    # Outer loop: reconnects with a new proxy when the rotator signals rotation
+    while krs <= _MAX_KRS or retry_after_rotation:
+        if rotator and rotator.exhausted:
+            logger.error("worker=%d all proxies exhausted — aborting", worker_id)
+            break
 
-            entity_data = None
-            try:
-                async with sem:
-                    result, entity_data = await _process_krs_with_backoff(client, krs_str, worker_id)
-                    effective_delay = delay + health.extra_delay
-                    await asyncio.sleep(effective_delay)
-            except Exception as exc:
-                logger.error(
-                    "worker=%d krs=%s unexpected_error %s: %s",
-                    worker_id, krs_str, type(exc).__name__, exc,
-                )
-                result = "error"
+        needs_reconnect = False
 
-            # Track connection health
-            if result == "error":
-                cooldown = health.record_failure()
-                if cooldown:
-                    logger.warning(
-                        "worker=%d connection=%s cooldown=%.0fs after %d consecutive failures",
-                        worker_id, connection.name, cooldown,
-                        _CONSECUTIVE_FAILURES_THRESHOLD * 2,
-                    )
-                    await asyncio.sleep(cooldown)
-                elif health.extra_delay > 0:
-                    logger.info(
-                        "worker=%d connection=%s extra_delay=+%.1fs consecutive_failures=%d",
-                        worker_id, connection.name, health.extra_delay,
-                        health.consecutive_failures,
-                    )
-            else:
-                health.record_success()
+        async with _make_client(connection) as client:
 
-            # Store entity in krs_entities + krs_registry
-            if result == "found" and entity_data:
+            async def _handle_one(krs_num: int) -> None:
+                nonlocal consecutive_task_errors, needs_reconnect
+                krs_str = str(krs_num).zfill(10)
+
+                if store.is_done(krs_num):
+                    return
+
+                entity_data = None
                 try:
-                    podmiot = entity_data.get("podmiot") or {}
-                    name = podmiot.get("nazwaPodmiotu", "")
-                    legal_form = podmiot.get("formaPrawna")
-                    entities.upsert_entity(krs_str, name, legal_form=legal_form, raw=entity_data)
+                    async with sem:
+                        result, entity_data = await _process_krs_with_backoff(client, krs_str, worker_id)
+                        effective_delay = delay + health.extra_delay
+                        await asyncio.sleep(effective_delay)
                 except Exception as exc:
-                    logger.warning(
-                        "worker=%d krs=%s entity_store_error %s: %s",
+                    logger.error(
+                        "worker=%d krs=%s unexpected_error %s: %s",
                         worker_id, krs_str, type(exc).__name__, exc,
                     )
+                    result = "error"
 
-            store.mark(krs_num, result, worker_id)
-            stats.processed += 1
+                # Track connection health + proxy rotation
+                if result == "error":
+                    cooldown = health.record_failure()
+                    if rotator:
+                        new_conn = rotator.record_failure()
+                        if new_conn is not None:
+                            # Don't persist — retry this item on the new proxy
+                            retry_after_rotation.append(krs_num)
+                            needs_reconnect = True
+                            return
+                    if cooldown:
+                        logger.warning(
+                            "worker=%d connection=%s cooldown=%.0fs after %d consecutive failures",
+                            worker_id, connection.name, cooldown,
+                            _CONSECUTIVE_FAILURES_THRESHOLD * 2,
+                        )
+                        await asyncio.sleep(cooldown)
+                    elif health.extra_delay > 0:
+                        logger.info(
+                            "worker=%d connection=%s extra_delay=+%.1fs consecutive_failures=%d",
+                            worker_id, connection.name, health.extra_delay,
+                            health.consecutive_failures,
+                        )
+                else:
+                    health.record_success()
+                    if rotator:
+                        rotator.record_success()
 
-            if result == "found":
-                stats.found += 1
-                consecutive_task_errors = 0
-            elif result == "not_found":
-                stats.not_found += 1
-                consecutive_task_errors = 0
-            else:
-                stats.errors += 1
-                consecutive_task_errors += 1
+                # Store entity in krs_entities + krs_registry
+                if result == "found" and entity_data:
+                    try:
+                        podmiot = entity_data.get("podmiot") or {}
+                        name = podmiot.get("nazwaPodmiotu", "")
+                        legal_form = podmiot.get("formaPrawna")
+                        entities.upsert_entity(krs_str, name, legal_form=legal_form, raw=entity_data)
+                    except Exception as exc:
+                        logger.warning(
+                            "worker=%d krs=%s entity_store_error %s: %s",
+                            worker_id, krs_str, type(exc).__name__, exc,
+                        )
 
-            if stats.found > 0 and stats.found % 100 == 0:
-                stats.log(worker_id)
+                store.mark(krs_num, result, worker_id)
+                stats.processed += 1
 
-        pending: set[asyncio.Task] = set()
-        krs = start_krs
+                if result == "found":
+                    stats.found += 1
+                    consecutive_task_errors = 0
+                elif result == "not_found":
+                    stats.not_found += 1
+                    consecutive_task_errors = 0
+                else:
+                    stats.errors += 1
+                    consecutive_task_errors += 1
 
-        while krs <= _MAX_KRS:
-            if consecutive_task_errors >= _MAX_CONSECUTIVE_TASK_ERRORS:
-                logger.error(
-                    "worker=%d aborting after %d consecutive errors",
-                    worker_id, consecutive_task_errors,
-                )
-                break
+                if stats.found > 0 and stats.found % 100 == 0:
+                    stats.log(worker_id)
 
-            # Fill up to `concurrency` in-flight tasks
-            while len(pending) < concurrency and krs <= _MAX_KRS:
-                task = asyncio.create_task(_handle_one(krs))
+            pending: set[asyncio.Task] = set()
+
+            # Retry items from previous rotation first
+            for retry_krs in retry_after_rotation:
+                task = asyncio.create_task(_handle_one(retry_krs))
                 pending.add(task)
                 task.add_done_callback(pending.discard)
-                krs += stride
+            retry_after_rotation.clear()
 
-            # Wait for at least one task to finish before scheduling more
-            if pending:
-                done, _ = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED,
-                )
+            while krs <= _MAX_KRS:
+                if consecutive_task_errors >= _MAX_CONSECUTIVE_TASK_ERRORS:
+                    logger.error(
+                        "worker=%d aborting after %d consecutive errors",
+                        worker_id, consecutive_task_errors,
+                    )
+                    krs = _MAX_KRS + 1  # signal outer loop to stop
+                    break
+
+                # Fill up to `concurrency` in-flight tasks
+                while (len(pending) < concurrency
+                       and krs <= _MAX_KRS
+                       and not needs_reconnect):
+                    task = asyncio.create_task(_handle_one(krs))
+                    pending.add(task)
+                    task.add_done_callback(pending.discard)
+                    krs += stride
+
+                # Wait for at least one task to finish before scheduling more
+                if pending:
+                    done, _ = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in done:
+                        exc = t.exception()
+                        if exc is not None:
+                            logger.error(
+                                "worker=%d task_error %s: %s",
+                                worker_id, type(exc).__name__, exc,
+                            )
+
+                if needs_reconnect:
+                    # Drain remaining tasks before switching proxy
+                    if pending:
+                        done, _ = await asyncio.wait(pending)
+                    break
+
+            # Drain remaining tasks if exiting normally
+            if not needs_reconnect and pending:
+                done, _ = await asyncio.wait(pending)
                 for t in done:
                     exc = t.exception()
                     if exc is not None:
-                        logger.error(
-                            "worker=%d task_error %s: %s",
-                            worker_id, type(exc).__name__, exc,
-                        )
+                        logger.error("worker=%d drain_task_error %s", worker_id, exc)
 
-        # Drain remaining tasks
-        if pending:
-            done, _ = await asyncio.wait(pending)
-            for t in done:
-                exc = t.exception()
-                if exc is not None:
-                    logger.error("worker=%d drain_task_error %s", worker_id, exc)
+        # After client context exits — switch to new proxy if rotated
+        if needs_reconnect and rotator and not rotator.exhausted:
+            connection = rotator.current
+            health = ConnectionHealth()
+            consecutive_task_errors = 0
+            logger.info(
+                "worker=%d rotated to proxy=%s",
+                worker_id, connection.name,
+            )
+        elif not needs_reconnect:
+            break  # Normal exit (finished range or max errors)
 
-        stats.log(worker_id)
-        logger.info("worker=%d finished krs_reached=%d", worker_id, krs)
+    stats.log(worker_id)
+    logger.info("worker=%d finished krs_reached=%d", worker_id, krs)
 
 
 def run_worker(
@@ -361,6 +419,7 @@ def run_worker(
     concurrency: int,
     delay: float,
     dsn: str,
+    proxy_pool: list[Connection] | None = None,
 ) -> None:
     """Entrypoint for multiprocessing.Process — sets up logging and runs the async loop."""
     logging.basicConfig(
@@ -380,5 +439,6 @@ def run_worker(
             concurrency=concurrency,
             delay=delay,
             dsn=dsn,
+            proxy_pool=proxy_pool,
         )
     )

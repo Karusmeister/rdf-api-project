@@ -20,7 +20,7 @@ import httpx
 from app.config import settings
 from app.crypto import encrypt_nrkrs
 from app.scraper.storage import StorageBackend, create_storage, make_doc_dir
-from batch.connections import Connection
+from batch.connections import Connection, DeadProxyRegistry, ProxyRotator
 from batch.rdf_document_store import RdfDocumentStore
 from batch.rdf_progress import RdfProgressStore
 
@@ -474,6 +474,7 @@ async def _worker_loop(
     page_size: int,
     dsn: str,
     skip_metadata: bool = False,
+    proxy_pool: list[Connection] | None = None,
 ) -> None:
     """Main async loop for a single RDF document discovery + download worker."""
     progress = RdfProgressStore(dsn)
@@ -483,6 +484,16 @@ async def _worker_loop(
     health = ConnectionHealth()
     adaptive_sem = AdaptiveSemaphore(concurrency)
     rate_tracker = RateLimitTracker()
+
+    # Set up proxy rotation if a pool was provided
+    rotator: ProxyRotator | None = None
+    if proxy_pool and len(proxy_pool) > 1:
+        registry = DeadProxyRegistry(dsn)
+        rotator = ProxyRotator(
+            proxy_pool, start_index=worker_id,
+            registry=registry, worker_id=worker_id,
+        )
+        connection = rotator.current
 
     def _on_429():
         if rate_tracker.record():
@@ -514,121 +525,170 @@ async def _worker_loop(
         logger.info("rdf_worker=%d no_pending_krs — exiting", worker_id)
         return
 
-    async with _make_client(connection) as client:
+    # Outer loop: reconnects with a new proxy when the rotator signals rotation
+    idx = 0
+    retry_after_rotation: list[str] = []
+    while idx < len(pending_krs) or retry_after_rotation:
+        if rotator and rotator.exhausted:
+            logger.error("rdf_worker=%d all proxies exhausted — aborting", worker_id)
+            break
 
-        async def _handle_one(krs: str) -> None:
-            already_discovered = progress.is_done(krs)
+        logger.info(
+            "rdf_worker=%d connecting via %s (remaining_proxies=%d)",
+            worker_id, connection.name,
+            rotator.remaining if rotator else 1,
+        )
 
-            # Phase 1: Discovery (skip if already done)
-            doc_count = 0
-            if not already_discovered:
-                all_docs: list[dict] = []
-                result = "error"
-                try:
-                    async with adaptive_sem:
-                        result, all_docs = await _fetch_all_documents(
-                            client, krs, page_size, delay, worker_id,
-                            on_429=_on_429,
-                        )
-                        effective_delay = delay + health.extra_delay
-                        await asyncio.sleep(effective_delay)
-                except Exception as exc:
-                    logger.error(
-                        "rdf_worker=%d krs=%s unexpected_error %s: %s",
-                        worker_id, krs, type(exc).__name__, exc,
-                    )
+        needs_reconnect = False
+
+        async with _make_client(connection) as client:
+
+            async def _handle_one(krs: str) -> None:
+                nonlocal needs_reconnect
+                already_discovered = progress.is_done(krs)
+
+                # Phase 1: Discovery (skip if already done)
+                doc_count = 0
+                if not already_discovered:
+                    all_docs: list[dict] = []
                     result = "error"
-
-                # Track connection health
-                if result == "error" and not all_docs:
-                    cooldown = health.record_failure()
-                    if cooldown:
-                        logger.warning(
-                            "rdf_worker=%d connection=%s cooldown=%.0fs",
-                            worker_id, connection.name, cooldown,
-                        )
-                        await asyncio.sleep(cooldown)
-                else:
-                    health.record_success()
-
-                # Store discovered documents
-                if all_docs:
                     try:
-                        doc_count = doc_store.insert_documents(krs, all_docs)
-                    except Exception as exc:
-                        logger.warning(
-                            "rdf_worker=%d krs=%s doc_store_error %s: %s",
-                            worker_id, krs, type(exc).__name__, exc,
-                        )
-
-                stats.documents_found += doc_count
-
-                # Update discovery progress
-                if result == "ok":
-                    final_status = "done" if doc_count > 0 else "empty"
-                elif all_docs:
-                    final_status = "partial"
-                else:
-                    final_status = "error"
-
-                progress.mark(krs, final_status, doc_count, worker_id)
-
-                if final_status == "done":
-                    stats.krs_with_docs += 1
-                elif final_status == "empty":
-                    stats.krs_empty += 1
-                else:
-                    stats.krs_errors += 1
-
-            # Phase 2: Download undownloaded documents (parallel within KRS)
-            try:
-                undownloaded = doc_store.get_undownloaded(krs)
-                if undownloaded:
-                    async def _dl_one(doc_id: str) -> None:
                         async with adaptive_sem:
-                            await _download_one_document(
-                                client, krs, doc_id, doc_store, storage,
-                                download_delay, worker_id, stats,
-                                skip_metadata=skip_metadata,
+                            result, all_docs = await _fetch_all_documents(
+                                client, krs, page_size, delay, worker_id,
                                 on_429=_on_429,
                             )
+                            effective_delay = delay + health.extra_delay
+                            await asyncio.sleep(effective_delay)
+                    except Exception as exc:
+                        logger.error(
+                            "rdf_worker=%d krs=%s unexpected_error %s: %s",
+                            worker_id, krs, type(exc).__name__, exc,
+                        )
+                        result = "error"
 
-                    await asyncio.gather(
-                        *(_dl_one(did) for did in undownloaded),
-                        return_exceptions=True,
+                    # Track connection health + proxy rotation
+                    if result == "error" and not all_docs:
+                        cooldown = health.record_failure()
+                        if rotator:
+                            new_conn = rotator.record_failure()
+                            if new_conn is not None:
+                                # Don't persist — retry this item on the new proxy
+                                retry_after_rotation.append(krs)
+                                needs_reconnect = True
+                                return
+                        if cooldown:
+                            logger.warning(
+                                "rdf_worker=%d connection=%s cooldown=%.0fs",
+                                worker_id, connection.name, cooldown,
+                            )
+                            await asyncio.sleep(cooldown)
+                    else:
+                        health.record_success()
+                        if rotator:
+                            rotator.record_success()
+
+                    # Store discovered documents
+                    if all_docs:
+                        try:
+                            doc_count = doc_store.insert_documents(krs, all_docs)
+                        except Exception as exc:
+                            logger.warning(
+                                "rdf_worker=%d krs=%s doc_store_error %s: %s",
+                                worker_id, krs, type(exc).__name__, exc,
+                            )
+
+                    stats.documents_found += doc_count
+
+                    # Update discovery progress
+                    if result == "ok":
+                        final_status = "done" if doc_count > 0 else "empty"
+                    elif all_docs:
+                        final_status = "partial"
+                    else:
+                        final_status = "error"
+
+                    progress.mark(krs, final_status, doc_count, worker_id)
+
+                    if final_status == "done":
+                        stats.krs_with_docs += 1
+                    elif final_status == "empty":
+                        stats.krs_empty += 1
+                    else:
+                        stats.krs_errors += 1
+
+                # Phase 2: Download undownloaded documents (parallel within KRS)
+                try:
+                    undownloaded = doc_store.get_undownloaded(krs)
+                    if undownloaded:
+                        async def _dl_one(doc_id: str) -> None:
+                            async with adaptive_sem:
+                                await _download_one_document(
+                                    client, krs, doc_id, doc_store, storage,
+                                    download_delay, worker_id, stats,
+                                    skip_metadata=skip_metadata,
+                                    on_429=_on_429,
+                                )
+
+                        await asyncio.gather(
+                            *(_dl_one(did) for did in undownloaded),
+                            return_exceptions=True,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "rdf_worker=%d krs=%s download_phase_error %s: %s",
+                        worker_id, krs, type(exc).__name__, exc,
                     )
-            except Exception as exc:
-                logger.warning(
-                    "rdf_worker=%d krs=%s download_phase_error %s: %s",
-                    worker_id, krs, type(exc).__name__, exc,
-                )
 
-            stats.krs_processed += 1
+                stats.krs_processed += 1
 
-            if stats.krs_processed % 50 == 0:
-                stats.log(worker_id)
+                if stats.krs_processed % 50 == 0:
+                    stats.log(worker_id)
 
-        # Process KRS numbers with bounded concurrency
-        pending: set[asyncio.Task] = set()
-        idx = 0
+            # Process KRS numbers with bounded concurrency
+            pending: set[asyncio.Task] = set()
 
-        while idx < len(pending_krs) or pending:
-            while len(pending) < adaptive_sem.capacity and idx < len(pending_krs):
-                krs = pending_krs[idx]
-                idx += 1
-                task = asyncio.create_task(_handle_one(krs))
+            # Retry items from previous rotation first
+            for retry_krs in retry_after_rotation:
+                task = asyncio.create_task(_handle_one(retry_krs))
                 pending.add(task)
                 task.add_done_callback(pending.discard)
+            retry_after_rotation.clear()
 
-            if pending:
-                done, _ = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED,
-                )
-                for t in done:
-                    if t.exception() is not None:
-                        logger.error(
-                            "rdf_worker=%d task_error %s", worker_id, t.exception(),
-                        )
+            while idx < len(pending_krs) or pending:
+                while (len(pending) < adaptive_sem.capacity
+                       and idx < len(pending_krs)
+                       and not needs_reconnect):
+                    krs = pending_krs[idx]
+                    idx += 1
+                    task = asyncio.create_task(_handle_one(krs))
+                    pending.add(task)
+                    task.add_done_callback(pending.discard)
+
+                if pending:
+                    done, _ = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in done:
+                        if t.exception() is not None:
+                            logger.error(
+                                "rdf_worker=%d task_error %s", worker_id, t.exception(),
+                            )
+
+                if needs_reconnect:
+                    # Drain remaining tasks before switching proxy
+                    if pending:
+                        done, _ = await asyncio.wait(pending)
+                    break
+
+        # After client context exits — switch to new proxy if rotated
+        if needs_reconnect and rotator and not rotator.exhausted:
+            connection = rotator.current
+            health = ConnectionHealth()
+            logger.info(
+                "rdf_worker=%d rotated to proxy=%s",
+                worker_id, connection.name,
+            )
 
     stats.log(worker_id)
     logger.info("rdf_worker=%d finished", worker_id)
@@ -644,6 +704,7 @@ def run_rdf_worker(
     page_size: int,
     dsn: str,
     skip_metadata: bool = False,
+    proxy_pool: list[Connection] | None = None,
 ) -> None:
     """Entrypoint for multiprocessing.Process."""
     logging.basicConfig(
@@ -652,9 +713,11 @@ def run_rdf_worker(
     )
     logger.info(
         "rdf_worker=%d starting total_workers=%d connection=%s concurrency=%d "
-        "delay=%.1f download_delay=%.1f page_size=%d storage_backend=%s skip_metadata=%s",
+        "delay=%.1f download_delay=%.1f page_size=%d storage_backend=%s "
+        "skip_metadata=%s proxy_pool_size=%d",
         worker_id, total_workers, connection.name, concurrency, delay,
         download_delay, page_size, settings.storage_backend, skip_metadata,
+        len(proxy_pool) if proxy_pool else 0,
     )
     asyncio.run(
         _worker_loop(
@@ -667,5 +730,6 @@ def run_rdf_worker(
             page_size=page_size,
             dsn=dsn,
             skip_metadata=skip_metadata,
+            proxy_pool=proxy_pool,
         )
     )

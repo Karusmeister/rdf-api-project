@@ -20,6 +20,7 @@ from app.config import settings
 from batch.connections import Connection, build_pool
 from batch.entity_store import EntityStore
 from batch.progress import ProgressStore
+from batch.proxy_pool import build_full_pool
 from batch.worker import run_worker
 
 logger = logging.getLogger(__name__)
@@ -96,14 +97,22 @@ def run_batch(
     ProgressStore(_db)
     EntityStore(_db)
 
+    # Build proxy pool only when VPN mode is enabled
+    full_pool = build_full_pool() if _vpn else None
+
     logger.info(
-        "batch_start workers=%d start_krs=%d vpn=%s concurrency=%d delay=%.1f dsn=%s",
-        _workers, _start, _vpn, _concurrency, _delay, _db.split("@")[-1] if "@" in _db else _db,
+        "batch_start workers=%d start_krs=%d vpn=%s concurrency=%d delay=%.1f "
+        "dsn=%s proxy_pool_size=%d",
+        _workers, _start, _vpn, _concurrency, _delay,
+        _db.split("@")[-1] if "@" in _db else _db,
+        len(full_pool) if full_pool else 0,
     )
 
     processes: list[multiprocessing.Process] = []
     for worker_id in range(_workers):
-        conn = _pick_connection(worker_id, _vpn)
+        # When proxy_pool is provided, worker owns connection selection
+        # via ProxyRotator. Fall back to _pick_connection for non-pool mode.
+        conn = Connection(name="pool-managed") if full_pool else _pick_connection(worker_id, _vpn)
         p = multiprocessing.Process(
             target=run_worker,
             name=f"krs-worker-{worker_id}",
@@ -115,6 +124,7 @@ def run_batch(
                 concurrency=_concurrency,
                 delay=_delay,
                 dsn=_db,
+                proxy_pool=full_pool,
             ),
         )
         processes.append(p)
