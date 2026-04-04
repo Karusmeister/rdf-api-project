@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # --- Stats Overview ---
@@ -74,9 +74,10 @@ class KrsCoverageResponse(BaseModel):
 
 class KrsDetailResponse(BaseModel):
     company: dict[str, Any] | None = None
-    documents: list[dict[str, Any]] = []
-    sync_history: list[dict[str, Any]] = []
-    user_activity: list[dict[str, Any]] = []
+    documents: list[dict[str, Any]] = Field(default_factory=list)
+    doc_total: int = 0
+    sync_history: list[dict[str, Any]] = Field(default_factory=list)
+    user_activity: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class RefreshResponse(BaseModel):
@@ -103,6 +104,8 @@ class UserWithStats(BaseModel):
 class UsersResponse(BaseModel):
     items: list[UserWithStats]
     total: int
+    page: int
+    size: int
 
 
 class ActivityEntry(BaseModel):

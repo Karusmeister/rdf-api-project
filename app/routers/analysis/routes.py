@@ -255,6 +255,12 @@ async def compare(
             "name": c_company.get("name"),
             "krs": c_company.get("krs"),
             "nip": c_company.get("nip"),
+            "pkd": c_company.get("pkd"),
+            "period_start": c_company.get("period_start"),
+            "period_end": c_company.get("period_end"),
+            "date_prepared": c_company.get("date_prepared"),
+            "schema_type": c_company.get("schema_type"),
+            "rzis_variant": c_company.get("rzis_variant"),
         },
         "current_period": {
             "start": c_company.get("period_start"),

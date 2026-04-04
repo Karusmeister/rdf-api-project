@@ -96,8 +96,40 @@ These are set as plain env vars (non-sensitive):
 | `LOG_LEVEL` | `INFO` | Python logging level |
 | `ENVIRONMENT` | `production` | Enables JWT secret validation |
 | `BATCH_USE_VPN` | `true` | Route batch workers through NordVPN |
+| `BATCH_USE_PUBLIC_PROXIES` | `true` | Include prioritized `proxies.json` pool after NordVPN proxies |
+| `BATCH_REQUIRE_VPN_ONLY` | `true` | Strict mode: never fall back to direct egress |
 | `CORS_ORIGINS` | `["*"]` | Allowed CORS origins (tighten for prod frontend) |
 | `NORDVPN_SERVERS` | `["amsterdam.nl.socks.nordhold.net", ...]` | VPN server pool |
+
+### Batch proxy env profiles
+
+Use one of these explicit profiles depending on your risk/availability policy.
+
+#### Strict profile (recommended for cloud)
+
+```bash
+BATCH_USE_VPN=true
+BATCH_USE_PUBLIC_PROXIES=true
+BATCH_REQUIRE_VPN_ONLY=true
+```
+
+Behavior:
+- All batch workers must use proxy egress.
+- No direct fallback is allowed.
+- Job fails fast if no proxy survives preflight/dead-proxy filtering.
+
+#### Non-strict profile (local/dev fallback)
+
+```bash
+BATCH_USE_VPN=true
+BATCH_USE_PUBLIC_PROXIES=false
+BATCH_REQUIRE_VPN_ONLY=false
+```
+
+Behavior:
+- VPN is preferred.
+- Direct egress can be used as last-resort fallback.
+- Better resilience, weaker egress policy guarantees.
 
 ## How to deploy a new version
 

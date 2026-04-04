@@ -81,6 +81,47 @@ class TestJWT:
 
 
 # ---------------------------------------------------------------------------
+# POST /api/auth/google
+# ---------------------------------------------------------------------------
+
+class TestGoogleLogin:
+    @patch("app.db.prediction_db.get_user_krs_access", return_value=["0000123456"])
+    @patch("app.db.prediction_db.update_last_login")
+    @patch("app.db.prediction_db.get_user_by_email", return_value=_FAKE_USER)
+    @patch("google.oauth2.id_token.verify_oauth2_token")
+    def test_google_login_existing_user(self, mock_verify, mock_get, mock_login, mock_krs):
+        mock_verify.return_value = {"email": "test@example.com", "name": "Test User"}
+        resp = client.post("/api/auth/google", json={"id_token": "fake-google-token"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "token" in data
+        assert data["user"]["email"] == "test@example.com"
+        assert data["user"]["krs_access"] == ["0000123456"]
+
+    @patch("app.db.prediction_db.get_user_krs_access", return_value=[])
+    @patch("app.db.prediction_db.update_last_login")
+    @patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_USER)
+    @patch("app.db.prediction_db.verify_user")
+    @patch("app.db.prediction_db.create_user")
+    @patch("app.db.prediction_db.get_user_by_email", return_value=None)
+    @patch("google.oauth2.id_token.verify_oauth2_token")
+    def test_google_login_new_user(self, mock_verify, mock_get_email, mock_create, mock_verify_user, mock_get_id, mock_login, mock_krs):
+        mock_verify.return_value = {"email": "new@example.com", "name": "New User"}
+        resp = client.post("/api/auth/google", json={"id_token": "fake-google-token"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "token" in data
+        assert data["user"]["krs_access"] == []
+        mock_create.assert_called_once()
+        mock_verify_user.assert_called_once()
+
+    @patch("google.oauth2.id_token.verify_oauth2_token", side_effect=ValueError("Bad token"))
+    def test_google_login_invalid_token(self, mock_verify):
+        resp = client.post("/api/auth/google", json={"id_token": "bad-token"})
+        assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # POST /api/auth/signup
 # ---------------------------------------------------------------------------
 
@@ -191,10 +232,11 @@ class TestRegister:
 # ---------------------------------------------------------------------------
 
 class TestVerify:
+    @patch("app.db.prediction_db.get_user_krs_access", return_value=["0000694720"])
     @patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_USER)
     @patch("app.db.prediction_db.verify_user")
     @patch("app.db.prediction_db.consume_verification_code", return_value=True)
-    def test_verify_success(self, mock_consume, mock_verify, mock_get):
+    def test_verify_success(self, mock_consume, mock_verify, mock_get, mock_krs):
         resp = client.post("/api/auth/verify", json={
             "user_id": "user-1",
             "code": "123456",
@@ -202,6 +244,7 @@ class TestVerify:
         assert resp.status_code == 200
         data = resp.json()
         assert "token" in data
+        assert data["user"]["krs_access"] == ["0000694720"]
         mock_verify.assert_called_once_with("user-1")
 
     @patch("app.db.prediction_db.consume_verification_code", return_value=False)
@@ -225,11 +268,12 @@ class TestVerify:
 # ---------------------------------------------------------------------------
 
 class TestLogin:
+    @patch("app.db.prediction_db.get_user_krs_access", return_value=["0000694720"])
     @patch("app.routers.auth.routes.verify_captcha", new_callable=AsyncMock)
     @patch("app.db.prediction_db.update_last_login")
     @patch("app.routers.auth.routes._verify_password", return_value=True)
     @patch("app.db.prediction_db.get_user_by_email", return_value=_FAKE_USER)
-    def test_login_success(self, mock_get, mock_verify, mock_login, mock_captcha):
+    def test_login_success(self, mock_get, mock_verify, mock_login, mock_captcha, mock_krs):
         resp = client.post("/api/auth/login", json={
             "email": "test@example.com",
             "password": "securepass123",
@@ -238,6 +282,7 @@ class TestLogin:
         data = resp.json()
         assert "token" in data
         assert data["user"]["email"] == "test@example.com"
+        assert data["user"]["krs_access"] == ["0000694720"]
 
     @patch("app.routers.auth.routes.verify_captcha", new_callable=AsyncMock)
     @patch("app.db.prediction_db.get_user_by_email", return_value=None)
@@ -558,10 +603,11 @@ class TestRateLimiting:
         assert resp.status_code == 429
         limiter.reset()
 
+    @patch("app.db.prediction_db.get_user_krs_access", return_value=[])
     @patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_USER)
     @patch("app.db.prediction_db.verify_user")
     @patch("app.db.prediction_db.consume_verification_code", return_value=True)
-    def test_verify_rate_limit(self, mock_consume, mock_verify, mock_get):
+    def test_verify_rate_limit(self, mock_consume, mock_verify, mock_get, mock_krs):
         limiter.reset()
         for i in range(10):
             resp = client.post("/api/auth/verify", json={

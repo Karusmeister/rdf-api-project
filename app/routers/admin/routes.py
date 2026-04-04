@@ -206,6 +206,8 @@ def krs_coverage(
 def krs_detail(
     krs_number: Annotated[str, Path(pattern=r"^\d{1,10}$")],
     user: CurrentUser,
+    doc_page: Annotated[int, Query(ge=0)] = 0,
+    doc_size: Annotated[int, Query(ge=1, le=200)] = 20,
 ) -> KrsDetailResponse:
     """Everything known about a single KRS: company info, documents, sync history, user activity. Admin only."""
     require_admin(user)
@@ -225,10 +227,15 @@ def krs_detail(
             if hasattr(v, "isoformat"):
                 company[k] = v.isoformat()
 
-    # Documents
+    # Documents (paginated)
+    doc_total = conn.execute(
+        "SELECT COUNT(*) FROM krs_documents_current WHERE krs = %s", (krs,)
+    ).fetchone()[0]
+
     doc_rows = conn.execute(
-        "SELECT * FROM krs_documents_current WHERE krs = %s ORDER BY okres_end DESC",
-        (krs,),
+        "SELECT * FROM krs_documents_current WHERE krs = %s "
+        "ORDER BY okres_end DESC NULLS LAST, document_id DESC LIMIT %s OFFSET %s",
+        (krs, doc_size, doc_page * doc_size),
     )
     doc_cols = [desc[0] for desc in doc_rows.description]
     documents = []
@@ -272,6 +279,7 @@ def krs_detail(
     return KrsDetailResponse(
         company=company,
         documents=documents,
+        doc_total=doc_total,
         sync_history=sync_history,
         user_activity=user_activity,
     )
@@ -378,10 +386,18 @@ async def _do_refresh(krs: str) -> None:
 # ---------------------------------------------------------------------------
 
 @router.get("/users", summary="List all users with activity stats")
-def list_users(user: CurrentUser) -> UsersResponse:
-    """All users with aggregated activity statistics. Admin only."""
+def list_users(
+    user: CurrentUser,
+    page: Annotated[int, Query(ge=0)] = 0,
+    size: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> UsersResponse:
+    """Paginated user list with aggregated activity statistics. Admin only."""
     require_admin(user)
     conn = get_conn()
+
+    total = conn.execute("""
+        SELECT COUNT(*) FROM users
+    """).fetchone()[0]
 
     rows = conn.execute("""
         SELECT
@@ -400,7 +416,8 @@ def list_users(user: CurrentUser) -> UsersResponse:
             GROUP BY user_id
         ) a ON u.id = a.user_id
         ORDER BY u.created_at DESC
-    """).fetchall()
+        LIMIT %s OFFSET %s
+    """, (size, page * size)).fetchall()
 
     items = [
         UserWithStats(
@@ -419,7 +436,7 @@ def list_users(user: CurrentUser) -> UsersResponse:
         for r in rows
     ]
 
-    return UsersResponse(items=items, total=len(items))
+    return UsersResponse(items=items, total=total, page=page, size=size)
 
 
 @router.get("/users/{user_id}/activity", summary="User activity log")

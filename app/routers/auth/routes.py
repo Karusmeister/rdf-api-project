@@ -178,11 +178,13 @@ def google_login(body: GoogleLoginRequest) -> AuthResponse:
 
     prediction_db.update_last_login(user["id"])
     token = create_token(user["id"], user["email"])
+    krs_list = prediction_db.get_user_krs_access(user["id"])
     return AuthResponse(
         token=token,
         user=UserProfile(
             id=user["id"], email=user["email"], name=user.get("name"),
             has_full_access=user.get("has_full_access", False),
+            krs_access=krs_list,
         ),
     )
 
@@ -252,11 +254,13 @@ def verify_email(request: Request, body: VerifyRequest):
         raise HTTPException(404, "User not found")
 
     token = create_token(user["id"], user["email"])
+    krs_list = prediction_db.get_user_krs_access(user["id"])
     return AuthResponse(
         token=token,
         user=UserProfile(
             id=user["id"], email=user["email"], name=user.get("name"),
             has_full_access=user.get("has_full_access", False),
+            krs_access=krs_list,
         ),
     )
 
@@ -284,11 +288,13 @@ async def login(body: LoginRequest) -> AuthResponse:
 
     prediction_db.update_last_login(user["id"])
     token = create_token(user["id"], user["email"])
+    krs_list = prediction_db.get_user_krs_access(user["id"])
     return AuthResponse(
         token=token,
         user=UserProfile(
             id=user["id"], email=user["email"], name=user.get("name"),
             has_full_access=user.get("has_full_access", False),
+            krs_access=krs_list,
         ),
     )
 
