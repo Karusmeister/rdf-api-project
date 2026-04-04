@@ -70,6 +70,7 @@ class Settings(BaseSettings):
 
     # Public proxy pool (opt-in, default off)
     batch_use_public_proxies: bool = False  # load proxies.json into the proxy pool
+    batch_require_vpn_only: bool = False    # strict mode: never use direct egress
 
     # --- Auth ---
     jwt_secret: str = "change-me-in-production"

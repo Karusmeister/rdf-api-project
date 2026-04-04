@@ -181,12 +181,17 @@ def build_full_pool(
     include_public: bool | None = None,
     dsn: str | None = None,
     run_preflight: bool = True,
+    allow_direct_fallback: bool = True,
 ) -> list[Connection]:
     """Build the complete priority-ordered proxy pool.
 
     Order: NordVPN proxies → public proxies (by country priority) → direct.
     Direct is last so workers prefer proxied connections for geo-distribution,
     falling back to the VM's own IP only when all proxies are exhausted.
+
+    When ``allow_direct_fallback`` is False (strict VPN mode), the direct
+    connection is never added. If all proxies are dead/unreachable after
+    filtering and preflight, a RuntimeError is raised.
 
     Public proxies are only included when ``include_public`` is True (or
     ``settings.batch_use_public_proxies`` is True). Default is off to avoid
@@ -210,8 +215,9 @@ def build_full_pool(
     if _use_public:
         pool.extend(_load_public_proxies(proxies_path))
 
-    # Direct connection as last-resort fallback
-    pool.append(Connection(name="direct"))
+    # Direct connection as last-resort fallback (unless strict VPN mode)
+    if allow_direct_fallback:
+        pool.append(Connection(name="direct"))
 
     # Filter out proxies already known dead from previous runs
     if dsn:
@@ -234,5 +240,14 @@ def build_full_pool(
     # Pre-flight: TCP-ping all proxies, remove unreachable
     if run_preflight:
         pool = preflight_check(pool, dsn=dsn)
+
+    # Fail fast in strict mode if no proxies survived
+    proxied = [c for c in pool if c.proxy_url is not None]
+    if not allow_direct_fallback and not proxied:
+        raise RuntimeError(
+            "BATCH_REQUIRE_VPN_ONLY is enabled but no proxies survived "
+            "dead-proxy filtering and preflight checks. Cannot start workers "
+            "without proxy connections."
+        )
 
     return pool

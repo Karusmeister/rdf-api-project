@@ -147,6 +147,7 @@ scripts/
   seed_features.py     - Populate feature_definitions and feature_sets
   seed_admin.py        - Bootstrap admin user (--password or --google)
   quick_scan.py        - Find N valid KRS entities, scrape docs, run ETL
+  pull_cloud_data.sh   - Pull cloud DB data to local for KRS numbers in data/documents/krs/
 tests/
   api/                 - FastAPI endpoint tests (endpoints, jobs, auth, predictions)
   db/                  - DB schema + CRUD tests (prediction_db, krs_repo, scraper_db,
@@ -189,6 +190,7 @@ data/
 
 ### Batch scanner table (batch/progress.py)
 - `batch_progress` - Tracks which KRS integers have been probed by the batch scanner. PK = krs BIGINT. Status: found/not_found/error.
+- `dead_proxies` - Global dead-proxy registry shared across all workers. PK = proxy_name TEXT. 6h TTL. Populated by ProxyRotator on eviction and preflight check.
 
 ### Prediction tables (app/db/prediction_db.py)
 Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
@@ -300,6 +302,10 @@ python -m batch.rdf_runner --workers 5 --concurrency 5
 # Metadata backfill (for docs downloaded with --skip-metadata)
 python -m batch.metadata_runner --no-vpn
 python -m batch.metadata_runner --workers 3 --concurrency 10 --delay 0.2
+
+# Pull cloud DB data to local (for KRS numbers in data/documents/krs/)
+cloud-sql-proxy "rdf-api-project:europe-central2:rdf-postgres" --port 15432 &
+bash scripts/pull_cloud_data.sh
 ```
 
 ## API endpoints
@@ -383,6 +389,16 @@ python -m batch.metadata_runner --workers 3 --concurrency 10 --delay 0.2
 16. VPN is ON by default for `metadata_runner` unless `--no-vpn` is passed. VPN config is validated before spawning workers (fail-fast)
 17. `async_save_extracted()` on storage classes runs sync I/O in `run_in_executor` — keeps the event loop unblocked during GCS uploads
 18. `batch/connections.py` has shared `validate_vpn_config()` — used by both `rdf_runner` and `metadata_runner`
+19. Cloud DB password is stored in GCP Secret Manager (`cloud-db-password`). Never hardcode it — always fetch via `gcloud secrets versions access latest --secret=cloud-db-password --project=rdf-api-project`
+20. GCP secrets: `database-url` (full Cloud SQL connection string), `cloud-db-password` (postgres password only), `jwt-secret`, `nordvpn-username`, `nordvpn-password`
+21. **Proxy pool configuration** — three env vars control proxy behavior:
+    - `BATCH_USE_VPN=true` — enables proxy pool (NordVPN + public proxies)
+    - `BATCH_USE_PUBLIC_PROXIES=true` — loads `proxies.json` into the pool (opt-in, default off)
+    - `BATCH_REQUIRE_VPN_ONLY=true` — strict mode: no direct egress fallback. Job fails if all proxies are dead.
+    - Pool order: NordVPN → public proxies (PL/DE/CZ/SK/SE/NL/FR/AT/ES priority) → direct (unless strict mode)
+    - Preflight TCP-check runs at startup, removing unreachable proxies. Dead proxies stored in `dead_proxies` table (6h TTL).
+    - Strict production: `BATCH_USE_VPN=true BATCH_USE_PUBLIC_PROXIES=true BATCH_REQUIRE_VPN_ONLY=true`
+    - Permissive local: `BATCH_USE_VPN=false` (all workers use direct, no proxy pool loaded)
 
 ## Keeping docs current
 

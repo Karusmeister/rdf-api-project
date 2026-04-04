@@ -19,7 +19,7 @@ import httpx
 
 from app.config import settings
 from app.db.connection import make_connection
-from batch.connections import Connection
+from batch.connections import Connection, DeadProxyRegistry, ProxyRotator
 from batch.rdf_document_store import RdfDocumentStore
 from batch.rdf_worker import (
     _fetch_metadata_with_backoff,
@@ -103,6 +103,7 @@ async def _backfill_loop(
     delay: float,
     dsn: str,
     batch_size: int | None = None,
+    proxy_pool: list[Connection] | None = None,
 ) -> None:
     """Fetch metadata for all downloaded docs missing it.
 
@@ -114,81 +115,126 @@ async def _backfill_loop(
     stats = BackfillStats()
     sem = asyncio.Semaphore(concurrency)
     unexpected_errors = 0
+    consecutive_failures = 0
+    _MAX_CONSECUTIVE_FAILURES = 3
+
+    # Set up proxy rotation if a pool was provided
+    rotator: ProxyRotator | None = None
+    if proxy_pool and len(proxy_pool) > 1:
+        registry = DeadProxyRegistry(dsn)
+        rotator = ProxyRotator(
+            proxy_pool, start_index=worker_id,
+            registry=registry, worker_id=worker_id,
+        )
+        connection = rotator.current
 
     # Keyset cursor — start from the beginning
     after_krs: str | None = None
     after_doc_id: str | None = None
     batch_num = 0
 
-    async with _make_client(connection) as client:
+    while True:
+        if rotator and rotator.exhausted:
+            logger.error("metadata_backfill=%d all proxies exhausted", worker_id)
+            break
 
-        while True:
-            # Fetch next batch via keyset pagination
-            batch = _get_needs_metadata_batch(
-                dsn, worker_id, total_workers, _batch_size,
-                after_krs=after_krs, after_doc_id=after_doc_id,
-            )
+        needs_reconnect = False
 
-            if not batch:
-                break
+        async with _make_client(connection) as client:
 
-            batch_num += 1
+            while True:
+                # Fetch next batch via keyset pagination
+                batch = _get_needs_metadata_batch(
+                    dsn, worker_id, total_workers, _batch_size,
+                    after_krs=after_krs, after_doc_id=after_doc_id,
+                )
+
+                if not batch:
+                    break
+
+                batch_num += 1
+                logger.info(
+                    "metadata_backfill=%d batch=%d size=%d cursor=(%s, %s)",
+                    worker_id, batch_num, len(batch),
+                    after_krs or "START", (after_doc_id or "START")[:20],
+                )
+
+                async def _do_one(doc_id: str, krs: str) -> None:
+                    nonlocal consecutive_failures, needs_reconnect
+                    async with sem:
+                        meta = await _fetch_metadata_with_backoff(
+                            client, doc_id, worker_id,
+                        )
+                        await asyncio.sleep(delay)
+
+                    stats.total += 1
+
+                    if meta is None:
+                        stats.failed += 1
+                        consecutive_failures += 1
+                        if rotator and consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                            new_conn = rotator.record_failure()
+                            if new_conn is not None:
+                                needs_reconnect = True
+                        return
+
+                    consecutive_failures = 0
+                    if rotator:
+                        rotator.record_success()
+
+                    try:
+                        doc_store.update_metadata(doc_id, meta)
+                        stats.success += 1
+                    except Exception as exc:
+                        logger.warning(
+                            "metadata_backfill=%d doc=%s error=%s",
+                            worker_id, doc_id[:20], exc,
+                        )
+                        stats.failed += 1
+
+                    if stats.total % 100 == 0:
+                        stats.log(worker_id)
+
+                results = await asyncio.gather(
+                    *(_do_one(doc_id, krs) for doc_id, krs in batch),
+                    return_exceptions=True,
+                )
+
+                # Surface any unexpected exceptions
+                for i, result in enumerate(results):
+                    if isinstance(result, BaseException):
+                        doc_id, krs = batch[i]
+                        logger.error(
+                            "metadata_backfill=%d doc=%s unexpected_error %s: %s",
+                            worker_id, doc_id[:20], type(result).__name__, result,
+                        )
+                        unexpected_errors += 1
+                        stats.failed += 1
+
+                # Advance keyset cursor to last row in this batch
+                last_doc_id, last_krs = batch[-1]
+                after_krs = last_krs
+                after_doc_id = last_doc_id
+
+                # If batch was smaller than limit, there are no more rows
+                if len(batch) < _batch_size:
+                    break
+
+                if needs_reconnect:
+                    break
+
+        # Switch to new proxy if rotated
+        if needs_reconnect and rotator and not rotator.exhausted:
+            connection = rotator.current
+            consecutive_failures = 0
             logger.info(
-                "metadata_backfill=%d batch=%d size=%d cursor=(%s, %s)",
-                worker_id, batch_num, len(batch),
-                after_krs or "START", (after_doc_id or "START")[:20],
+                "metadata_backfill=%d rotated to proxy=%s",
+                worker_id, connection.name,
             )
+            continue
 
-            async def _do_one(doc_id: str, krs: str) -> None:
-                async with sem:
-                    meta = await _fetch_metadata_with_backoff(
-                        client, doc_id, worker_id,
-                    )
-                    await asyncio.sleep(delay)
-
-                stats.total += 1
-
-                if meta is None:
-                    stats.failed += 1
-                    return
-
-                try:
-                    doc_store.update_metadata(doc_id, meta)
-                    stats.success += 1
-                except Exception as exc:
-                    logger.warning(
-                        "metadata_backfill=%d doc=%s error=%s",
-                        worker_id, doc_id[:20], exc,
-                    )
-                    stats.failed += 1
-
-                if stats.total % 100 == 0:
-                    stats.log(worker_id)
-
-            results = await asyncio.gather(
-                *(_do_one(doc_id, krs) for doc_id, krs in batch),
-                return_exceptions=True,
-            )
-
-            # Surface any unexpected exceptions
-            for i, result in enumerate(results):
-                if isinstance(result, BaseException):
-                    doc_id, krs = batch[i]
-                    logger.error(
-                        "metadata_backfill=%d doc=%s unexpected_error %s: %s",
-                        worker_id, doc_id[:20], type(result).__name__, result,
-                    )
-                    unexpected_errors += 1
-                    stats.failed += 1
-
-            # Advance keyset cursor to last row in this batch
-            last_doc_id, last_krs = batch[-1]
-            after_krs = last_krs
-            after_doc_id = last_doc_id
-
-            # If batch was smaller than limit, there are no more rows
-            if len(batch) < _batch_size:
-                break
+        # Normal exit — no more batches or all work done
+        break
 
     stats.log(worker_id)
 
@@ -207,6 +253,7 @@ def run_metadata_backfill(
     concurrency: int,
     delay: float,
     dsn: str,
+    proxy_pool: list[Connection] | None = None,
 ) -> None:
     """Entrypoint for multiprocessing.Process."""
     logging.basicConfig(
@@ -221,5 +268,6 @@ def run_metadata_backfill(
             concurrency=concurrency,
             delay=delay,
             dsn=dsn,
+            proxy_pool=proxy_pool,
         )
     )

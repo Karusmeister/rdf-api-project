@@ -187,6 +187,40 @@ def test_build_full_pool_public_proxies_opt_in(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Strict VPN-only mode (allow_direct_fallback=False)
+# ---------------------------------------------------------------------------
+
+def test_strict_mode_excludes_direct(tmp_path, monkeypatch):
+    monkeypatch.setattr("batch.proxy_pool.settings.nordvpn_servers", ["test.nordhold.net"])
+    monkeypatch.setattr("batch.proxy_pool.settings.nordvpn_username", "u")
+    monkeypatch.setattr("batch.proxy_pool.settings.nordvpn_password", "p")
+    path = _make_proxies_json([], tmp_path)
+    pool = build_full_pool(path, run_preflight=False, allow_direct_fallback=False)
+    names = [c.name for c in pool]
+    assert "direct" not in names
+    assert any("nordvpn" in n for n in names)
+
+
+def test_strict_mode_raises_when_pool_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr("batch.proxy_pool.settings.nordvpn_servers", [])
+    path = _make_proxies_json([], tmp_path)
+    with pytest.raises(RuntimeError, match="BATCH_REQUIRE_VPN_ONLY"):
+        build_full_pool(path, run_preflight=False, allow_direct_fallback=False)
+
+
+def test_strict_mode_with_public_proxies(tmp_path, monkeypatch):
+    monkeypatch.setattr("batch.proxy_pool.settings.nordvpn_servers", [])
+    entries = [_proxy_entry("1.1.1.1", 1000, "PL")]
+    path = _make_proxies_json(entries, tmp_path)
+    pool = build_full_pool(
+        path, include_public=True, run_preflight=False, allow_direct_fallback=False,
+    )
+    assert len(pool) == 1
+    assert "PL" in pool[0].name
+    assert "direct" not in [c.name for c in pool]
+
+
+# ---------------------------------------------------------------------------
 # ProxyRotator
 # ---------------------------------------------------------------------------
 

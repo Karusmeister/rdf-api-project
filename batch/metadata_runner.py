@@ -15,6 +15,7 @@ import signal
 from app.config import settings
 from batch.connections import Connection, build_pool, validate_vpn_config
 from batch.metadata_backfill import run_metadata_backfill
+from batch.proxy_pool import build_full_pool
 
 logger = logging.getLogger(__name__)
 
@@ -43,18 +44,22 @@ def run_metadata_batch(
     if use_vpn:
         validate_vpn_config()
 
-    pool = build_pool()
-    vpn_count = len(pool) - 1  # pool[0] is always direct
+    # Build proxy pool: same prioritized architecture as KRS/RDF runners
+    full_pool = build_full_pool(
+        dsn=_db,
+        allow_direct_fallback=not settings.batch_require_vpn_only,
+    ) if use_vpn else None
 
     logger.info(
-        "metadata_batch_start workers=%d vpn=%s vpn_connections=%d "
-        "concurrency=%d delay=%.1f",
-        workers, use_vpn, vpn_count if use_vpn else 0, concurrency, delay,
+        "metadata_batch_start workers=%d vpn=%s concurrency=%d delay=%.1f "
+        "proxy_pool_size=%d",
+        workers, use_vpn, concurrency, delay,
+        len(full_pool) if full_pool else 0,
     )
 
     processes = []
     for wid in range(workers):
-        conn = _pick_connection(wid, use_vpn)
+        conn = Connection(name="pool-managed") if full_pool else _pick_connection(wid, use_vpn)
         p = multiprocessing.Process(
             target=run_metadata_backfill,
             name=f"meta-backfill-{wid}",
@@ -65,6 +70,7 @@ def run_metadata_batch(
                 concurrency=concurrency,
                 delay=delay,
                 dsn=_db,
+                proxy_pool=full_pool,
             ),
         )
         processes.append(p)
