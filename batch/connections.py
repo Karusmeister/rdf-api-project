@@ -142,9 +142,9 @@ class DeadProxyRegistry:
         from app.db.connection import make_connection
         conn = make_connection(self._dsn)
         try:
-            # Build a single INSERT with VALUES list
+            cur = conn._conn.cursor()
             values = ", ".join(
-                conn._conn.cursor().mogrify("(%s, %s)", (name, worker_id)).decode()
+                cur.mogrify("(%s, %s, NOW())", (name, worker_id)).decode()
                 for name in proxy_names
             )
             conn.execute(f"""
