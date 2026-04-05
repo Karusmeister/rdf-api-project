@@ -386,6 +386,104 @@ def test_get_prediction_history():
     assert len(history) == 2
 
 
+def test_get_predictions_fat_orders_by_fiscal_year():
+    """Latest fiscal year should win even when an older year was rescored later."""
+    db.upsert_company("0000000033")
+    db.create_financial_report("rpt-200", "0000000033", 2022, "2022-01-01", "2022-12-31")
+    db.create_financial_report("rpt-201", "0000000033", 2023, "2023-01-01", "2023-12-31")
+    db.register_model("mcz_v1", "maczynska", "discriminant", "1.0")
+    db.create_prediction_run("run-fat-1", "mcz_v1")
+    # Insert 2023 first, then 2022 — so 2022 has a LATER created_at timestamp.
+    db.insert_prediction("pred-fat-1", "run-fat-1", "0000000033", "rpt-201",
+                         raw_score=1.5, probability=None, classification=0, risk_category="medium")
+    db.insert_prediction("pred-fat-2", "run-fat-1", "0000000033", "rpt-200",
+                         raw_score=-0.5, probability=None, classification=1, risk_category="critical")
+
+    rows = db.get_predictions_fat("0000000033")
+    assert len(rows) == 2
+    # Most recent fiscal year must come first, regardless of scoring time.
+    assert rows[0]["fiscal_year"] == 2023
+    assert rows[0]["report_id"] == "rpt-201"
+    assert rows[1]["fiscal_year"] == 2022
+
+
+def test_get_prediction_history_fat_dedupes_rescored_years():
+    """Rescoring a year should not create duplicate history points for charting."""
+    db.upsert_company("0000000034")
+    db.create_financial_report("rpt-300", "0000000034", 2021, "2021-01-01", "2021-12-31")
+    db.create_financial_report("rpt-301", "0000000034", 2022, "2022-01-01", "2022-12-31")
+    db.register_model("mcz_v2", "maczynska", "discriminant", "2.0")
+    # Two runs scoring the same reports — simulates a rescoring pass.
+    db.create_prediction_run("run-hist-1", "mcz_v2")
+    db.insert_prediction("pred-hist-1", "run-hist-1", "0000000034", "rpt-300",
+                         raw_score=0.1, probability=None, classification=0, risk_category="high")
+    db.insert_prediction("pred-hist-2", "run-hist-1", "0000000034", "rpt-301",
+                         raw_score=0.2, probability=None, classification=0, risk_category="high")
+    db.create_prediction_run("run-hist-2", "mcz_v2")
+    db.insert_prediction("pred-hist-3", "run-hist-2", "0000000034", "rpt-300",
+                         raw_score=0.9, probability=None, classification=0, risk_category="low")
+    db.insert_prediction("pred-hist-4", "run-hist-2", "0000000034", "rpt-301",
+                         raw_score=1.1, probability=None, classification=0, risk_category="medium")
+
+    history = db.get_prediction_history_fat("0000000034")
+    # One point per (model, fiscal_year), not four.
+    assert len(history) == 2
+    years = [h["fiscal_year"] for h in history]
+    assert years == [2021, 2022]  # chronological order for charting
+    # Most recently scored value wins for each year.
+    by_year = {h["fiscal_year"]: h for h in history}
+    assert by_year[2021]["raw_score"] == pytest.approx(0.9)
+    assert by_year[2022]["raw_score"] == pytest.approx(1.1)
+
+
+def test_get_predictions_fat_deterministic_on_timestamp_tie():
+    """Two predictions with identical created_at must resolve to a stable winner."""
+    db.upsert_company("0000000035")
+    db.create_financial_report("rpt-400", "0000000035", 2024, "2024-01-01", "2024-12-31")
+    db.register_model("mcz_v3", "maczynska", "discriminant", "3.0")
+    db.create_prediction_run("run-tie-1", "mcz_v3")
+    db.insert_prediction("pred-tie-a", "run-tie-1", "0000000035", "rpt-400",
+                         raw_score=0.1, probability=None, classification=0, risk_category="high")
+    db.insert_prediction("pred-tie-b", "run-tie-1", "0000000035", "rpt-400",
+                         raw_score=0.9, probability=None, classification=0, risk_category="low")
+    # Force identical timestamps so only the secondary tie-breakers decide the winner.
+    conn = db.get_conn()
+    conn.execute(
+        "UPDATE predictions SET created_at = '2026-04-01 12:00:00+00' WHERE id IN (%s, %s)",
+        ["pred-tie-a", "pred-tie-b"],
+    )
+
+    rows = db.get_predictions_fat("0000000035")
+    # Stable tie-break: p.id DESC => 'pred-tie-b' wins over 'pred-tie-a'.
+    assert rows[0]["raw_score"] == pytest.approx(0.9)
+    # Repeated calls return the same winner (deterministic).
+    assert db.get_predictions_fat("0000000035")[0]["raw_score"] == pytest.approx(0.9)
+
+
+def test_get_prediction_history_fat_deterministic_on_timestamp_tie():
+    """History dedupe must pick the same row deterministically when timestamps tie."""
+    db.upsert_company("0000000036")
+    db.create_financial_report("rpt-500", "0000000036", 2023, "2023-01-01", "2023-12-31")
+    db.register_model("mcz_v4", "maczynska", "discriminant", "4.0")
+    db.create_prediction_run("run-tie-2", "mcz_v4")
+    db.insert_prediction("pred-hist-a", "run-tie-2", "0000000036", "rpt-500",
+                         raw_score=0.2, probability=None, classification=0, risk_category="high")
+    db.insert_prediction("pred-hist-b", "run-tie-2", "0000000036", "rpt-500",
+                         raw_score=0.8, probability=None, classification=0, risk_category="low")
+    conn = db.get_conn()
+    conn.execute(
+        "UPDATE predictions SET created_at = '2026-04-01 09:00:00+00' WHERE id IN (%s, %s)",
+        ["pred-hist-a", "pred-hist-b"],
+    )
+
+    history = db.get_prediction_history_fat("0000000036")
+    assert len(history) == 1  # deduped
+    # p.id DESC => 'pred-hist-b' wins.
+    assert history[0]["raw_score"] == pytest.approx(0.8)
+    # Stable across repeated calls.
+    assert db.get_prediction_history_fat("0000000036")[0]["raw_score"] == pytest.approx(0.8)
+
+
 def test_prediction_no_duplicate_id():
     db.upsert_company("0000000032")
     db.create_financial_report("rpt-103", "0000000032", 2023, "2023-01-01", "2023-12-31")

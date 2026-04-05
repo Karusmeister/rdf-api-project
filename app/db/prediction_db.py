@@ -1131,7 +1131,14 @@ def get_prediction_history(krs: str) -> list[dict]:
 # --- Fat queries for predictions API (PKR-64) ---
 
 def get_predictions_fat(krs: str) -> list[dict]:
-    """Single JOINed query returning all prediction data for a KRS number."""
+    """Single JOINed query returning all prediction data for a KRS number.
+
+    Ordered by fiscal_year DESC so callers taking the first row per model
+    get the most recent reporting year (not merely the most recently scored).
+    Ties are broken deterministically: latest scoring time first, then the
+    higher report_version (correction filings win over originals), then
+    prediction id — so equal timestamps still yield a stable winner.
+    """
     conn = get_conn()
     cur = conn.execute("""
         SELECT
@@ -1147,7 +1154,7 @@ def get_predictions_fat(krs: str) -> list[dict]:
         JOIN model_registry mr ON mr.id = pr.model_id
         JOIN financial_reports fr ON fr.id = p.report_id
         WHERE p.krs = %s AND mr.is_active = true
-        ORDER BY p.created_at DESC
+        ORDER BY fr.fiscal_year DESC, p.created_at DESC, fr.report_version DESC, p.id DESC
     """, [krs])
     results = _cursor_to_dicts(cur)
     for d in results:
@@ -1214,7 +1221,16 @@ def get_models_with_details() -> list[dict]:
 
 
 def get_prediction_history_fat(krs: str, model_id: str | None = None) -> list[dict]:
-    """Get prediction history with report context for charting."""
+    """Get prediction history with report context for charting.
+
+    Returns one row per (model, fiscal_year) — the most recently scored
+    prediction wins when a year has been rescored multiple times. Ordered
+    by fiscal_year ASC so the frontend can plot the time series directly.
+
+    The business rule is one valid filing per fiscal year; when corrections
+    exist, the most recent filing (highest report_version) is preferred.
+    Same-timestamp ties fall back to prediction id for deterministic output.
+    """
     conn = get_conn()
     params: list = [krs]
     model_filter = ""
@@ -1223,16 +1239,28 @@ def get_prediction_history_fat(krs: str, model_id: str | None = None) -> list[di
         params.append(model_id)
     cur = conn.execute(f"""
         SELECT
-            p.raw_score, p.probability, p.classification, p.risk_category,
-            p.feature_contributions, p.created_at AS scored_at,
-            mr.id AS model_id, mr.name AS model_name, mr.version AS model_version,
-            fr.fiscal_year, fr.period_start, fr.period_end
-        FROM predictions p
-        JOIN prediction_runs pr ON pr.id = p.prediction_run_id
-        JOIN model_registry mr ON mr.id = pr.model_id
-        JOIN financial_reports fr ON fr.id = p.report_id
-        WHERE p.krs = %s AND mr.is_active = true {model_filter}
-        ORDER BY fr.fiscal_year ASC, p.created_at DESC
+            raw_score, probability, classification, risk_category,
+            feature_contributions, scored_at,
+            model_id, model_name, model_version,
+            fiscal_year, period_start, period_end
+        FROM (
+            SELECT
+                p.raw_score, p.probability, p.classification, p.risk_category,
+                p.feature_contributions, p.created_at AS scored_at,
+                mr.id AS model_id, mr.name AS model_name, mr.version AS model_version,
+                fr.fiscal_year, fr.period_start, fr.period_end,
+                row_number() OVER (
+                    PARTITION BY mr.id, fr.fiscal_year
+                    ORDER BY p.created_at DESC, fr.report_version DESC, p.id DESC
+                ) AS rn
+            FROM predictions p
+            JOIN prediction_runs pr ON pr.id = p.prediction_run_id
+            JOIN model_registry mr ON mr.id = pr.model_id
+            JOIN financial_reports fr ON fr.id = p.report_id
+            WHERE p.krs = %s AND mr.is_active = true {model_filter}
+        ) ranked
+        WHERE rn = 1
+        ORDER BY fiscal_year ASC
     """, params)
     results = _cursor_to_dicts(cur)
     for d in results:

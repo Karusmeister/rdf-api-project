@@ -113,15 +113,30 @@ class PredictionResponse(BaseModel):
     """Full prediction response: company info, latest predictions per model, and score history."""
 
     company: CompanyInfo
-    predictions: list[PredictionDetail] = Field(default_factory=list, description="Latest prediction per active model")
-    history: list[HistoryEntry] = Field(default_factory=list, description="All historical scores for timeline charts")
+    predictions: list[PredictionDetail] = Field(
+        default_factory=list,
+        description="Latest prediction per active model — one entry per model, picked by most recent fiscal year",
+    )
+    history: list[HistoryEntry] = Field(
+        default_factory=list,
+        description=(
+            "Score timeline for charting: one entry per (model, fiscal_year), ordered by fiscal year ascending. "
+            "When a fiscal year has been rescored multiple times, only the most recent score is returned."
+        ),
+    )
 
 
 class HistoryResponse(BaseModel):
     """Prediction score history for a single KRS, optionally filtered by model."""
 
     krs: str = Field(description="KRS number")
-    history: list[HistoryEntry] = Field(default_factory=list, description="Historical scores ordered by fiscal year")
+    history: list[HistoryEntry] = Field(
+        default_factory=list,
+        description=(
+            "One entry per (model, fiscal_year), ordered by fiscal year ascending. "
+            "Rescored years are deduped — only the latest score per year is returned."
+        ),
+    )
 
 
 class ModelCatalogEntry(BaseModel):
