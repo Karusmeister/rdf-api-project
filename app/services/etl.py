@@ -193,13 +193,31 @@ def ingest_document(document_id: str, storage: Optional[LocalStorage] = None) ->
     xml_path_for_attempt = xml_path
     try:
         company = parsed["company"]
-        period_start = company.get("period_start") or "1970-01-01"
-        period_end = company.get("period_end") or "1970-01-01"
+        period_start = company.get("period_start")
+        period_end = company.get("period_end")
+
+        if not period_end:
+            _finish_etl_attempt(
+                attempt_id, status="failed",
+                reason_code="invalid_period_end",
+                error_message="period_end is missing from parsed XML",
+                xml_path=xml_path,
+            )
+            return {"report_id": document_id, "status": "failed", "error": "invalid_period_end"}
 
         try:
             fiscal_year = _determine_fiscal_year(period_end)
-        except ValueError:
-            fiscal_year = 0
+        except ValueError as e:
+            _finish_etl_attempt(
+                attempt_id, status="failed",
+                reason_code="invalid_period_end",
+                error_message=str(e),
+                xml_path=xml_path,
+            )
+            return {"report_id": document_id, "status": "failed", "error": "invalid_period_end"}
+
+        if not period_start:
+            period_start = period_end
 
         # 4. Upsert company
         prediction_db.upsert_company(

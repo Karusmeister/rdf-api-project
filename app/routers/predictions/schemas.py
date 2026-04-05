@@ -115,7 +115,12 @@ class PredictionResponse(BaseModel):
     company: CompanyInfo
     predictions: list[PredictionDetail] = Field(
         default_factory=list,
-        description="Latest prediction per active model — one entry per model, picked by most recent fiscal year",
+        description=(
+            "All scored predictions — one entry per (model, fiscal_year). "
+            "Each entry carries its own features[] and data_source.fiscal_year, "
+            "so historical years light up the full per-year calculation view. "
+            "Rescored years are deduped: the latest scoring wins."
+        ),
     )
     history: list[HistoryEntry] = Field(
         default_factory=list,

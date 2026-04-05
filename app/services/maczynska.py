@@ -69,10 +69,15 @@ def score_report(report_id: str) -> Optional[dict]:
     """Score a single report using the Maczynska discriminant function.
 
     Returns dict with raw_score, classification, risk_category, feature_contributions,
-    or None if required features are missing.
+    feature_snapshot, or None if required features are missing.
+
+    feature_snapshot captures the exact (feature_definition_id -> computation_version)
+    that fed the score, so downstream reads can fetch the immutable snapshot instead
+    of inferring it from timestamps.
     """
     features = prediction_db.get_computed_features_for_report(report_id, valid_only=True)
     feature_map = {f["feature_definition_id"]: f["value"] for f in features}
+    version_map = {f["feature_definition_id"]: f["computation_version"] for f in features}
 
     missing = [fid for fid in REQUIRED_FEATURES if fid not in feature_map or feature_map[fid] is None]
     if missing:
@@ -97,11 +102,14 @@ def score_report(report_id: str) -> Optional[dict]:
     z_score = round(z_score, 6)
     classification, risk_category = classify(z_score)
 
+    feature_snapshot = {fid: version_map[fid] for fid in REQUIRED_FEATURES}
+
     return {
         "raw_score": z_score,
         "classification": classification,
         "risk_category": risk_category,
         "feature_contributions": contributions,
+        "feature_snapshot": feature_snapshot,
     }
 
 
@@ -146,6 +154,7 @@ def score_batch(report_ids: Optional[list[str]] = None) -> dict:
                 classification=result["classification"],
                 risk_category=result["risk_category"],
                 feature_contributions=result["feature_contributions"],
+                feature_snapshot=result.get("feature_snapshot"),
             )
             scored += 1
 
