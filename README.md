@@ -85,6 +85,7 @@ app/
     xml_parser.py         Statement parsing and comparison logic
     etl.py                XML -> PostgreSQL ingestion
     feature_engine.py     Ratio and feature computation
+    maczynska.py          Mączyńska 1994 discriminant model (baseline bankruptcy predictor)
     predictions.py        Scoring, caching, response assembly for predictions API
 batch/
   connections.py          Connection pool + shared VPN validation
@@ -461,7 +462,7 @@ Current pipeline after documents are on disk:
 2. [`scripts/seed_features.py`](/Users/piotrkraus/piotr/rdf-api-project/scripts/seed_features.py) seeds feature metadata
 3. [`app/services/feature_engine.py`](/Users/piotrkraus/piotr/rdf-api-project/app/services/feature_engine.py) computes ratios and derived features
 
-Prediction scores are exposed via `/api/predictions/{krs}` (see Auth and Predictions sections above). Scores are pre-computed by `app/services/maczynska.py` and stored in the `predictions` table.
+Prediction scores are exposed via `/api/predictions/{krs}` (see Auth and Predictions sections above). Scores are pre-computed by `app/services/maczynska.py` and persisted to the `predictions` table, which carries a `feature_snapshot` JSON column mapping each feature to the immutable `computation_version` that fed the score. The API read path (`app/services/predictions.py`) assembles every response in exactly two batched DB round-trips — one for features (keyed by a unique `request_id` per prediction so distinct predictions sharing a report + feature set never collapse), one for source line items across all reports (with `value_previous` resolved from the prior fiscal year constrained by `data_source_id` + `report_type`). Historical years return the full per-year calculation view, including `source_tags[]` with `label_pl`, `value_current`, `value_previous`, `section`, and the optional `higher_is_better` semantic flag.
 
 ## Testing
 
