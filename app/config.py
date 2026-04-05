@@ -49,6 +49,19 @@ class Settings(BaseSettings):
     db_pool_min: int = 2
     db_pool_max: int = 10
 
+    # --- PostgreSQL (pipeline / analytics database) ---
+    # Separate instance for predictions, features, pipeline orchestration.
+    # In production, supplied via the `pipeline-database-url` GCP secret.
+    pipeline_database_url: str = "postgresql://rdf:rdf_dev@localhost:5433/pipeline"
+    pipeline_db_pool_min: int = 1
+    pipeline_db_pool_max: int = 5
+
+    # --- Pipeline / BigQuery ---
+    gcp_project_id: str = "rdf-api-project"
+    bq_dataset: str = "rdf_analytics"
+    bq_location: str = "europe-central2"
+    pipeline_gcs_bucket: str = "rdf-pipeline-staging"
+
     # --- Batch runner ---
     batch_use_vpn: bool = False
     batch_workers: int = 4

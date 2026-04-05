@@ -17,6 +17,7 @@ from app.adapters.registry import get as get_adapter
 from app.adapters.registry import register as register_adapter
 from app.config import settings
 from app.db import connection as db_conn
+from app.db import pipeline_db
 from app.db import prediction_db
 from app.jobs import krs_scanner, krs_sync
 from app.logging_config import configure_logging
@@ -29,6 +30,7 @@ from app.routers.scraper import router as scraper_router
 from app.routers.etl.routes import router as etl_router
 from app.routers.jobs.routes import router as jobs_router
 from app.routers.predictions import router as predictions_router
+from app.routers.pipeline import router as pipeline_router
 from app.routers.auth import router as auth_router
 from app.routers.admin import router as admin_router
 from app.rate_limit import limiter
@@ -47,6 +49,15 @@ async def lifespan(app: FastAPI):
     db_conn.init_pool(settings.database_url, settings.db_pool_min, settings.db_pool_max)
     scraper_db.connect()
     prediction_db.connect()
+    try:
+        pipeline_db.connect()
+        pipeline_db.init_pool()
+    except Exception:
+        logger.error(
+            "pipeline_db_connect_failed — prediction reads will fall back to prediction_db",
+            extra={"event": "pipeline_db_connect_failed"},
+            exc_info=True,
+        )
     krs_repo.connect()
     predictions_service.warm_caches()
     await rdf_client.start()
@@ -82,6 +93,10 @@ async def lifespan(app: FastAPI):
         scheduler.shutdown(wait=False)
     await krs_client.stop()
     await rdf_client.stop()
+    try:
+        pipeline_db.close()
+    except Exception:
+        logger.warning("pipeline_db_close_error", exc_info=True)
     db_conn.close()
     db_conn.close_pool()
 
@@ -96,6 +111,7 @@ tags_metadata = [
     {"name": "jobs", "description": "Scheduled KRS sync and sequential scanner jobs."},
     {"name": "auth", "description": "User authentication: signup, login, email verification, Google SSO."},
     {"name": "predictions", "description": "Bankruptcy prediction scores, feature detail, and model catalog."},
+    {"name": "pipeline", "description": "Prediction pipeline status, queue, and manual triggers."},
     {"name": "admin", "description": "Admin-only operations (cache flush, access grants)."},
     {"name": "admin-dashboard", "description": "Admin dashboard: pipeline stats, KRS management, user activity."},
 ]
@@ -136,9 +152,11 @@ async def db_connection_middleware(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path == "/health":
         return await call_next(request)
     db_conn.acquire_request_conn()
+    pipeline_db.acquire_request_conn()
     try:
         response = await call_next(request)
     finally:
+        pipeline_db.release_request_conn()
         db_conn.release_request_conn()
     return response
 
@@ -176,6 +194,7 @@ app.include_router(scraper_router)
 app.include_router(etl_router)
 app.include_router(jobs_router)
 app.include_router(predictions_router)
+app.include_router(pipeline_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
 

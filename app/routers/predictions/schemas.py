@@ -25,6 +25,18 @@ class FeatureDetail(BaseModel):
     source_tags: list[SourceTag] = Field(default_factory=list, description="Financial line items used to compute this feature")
 
 
+class PeerGroupStats(BaseModel):
+    """Peer-group (PKD × tenure) score distribution from the pipeline population stats."""
+
+    pkd_code: str | None = Field(default=None)
+    tenure_bucket: str | None = Field(default=None)
+    z_score: float | None = Field(default=None, description="Z-score relative to the peer group")
+    percentile_rank: float | None = Field(default=None, description="Approximate percentile (0-100)")
+    peer_group_mean: float | None = Field(default=None)
+    peer_group_stddev: float | None = Field(default=None)
+    peer_group_size: int | None = Field(default=None)
+
+
 class ResultDetail(BaseModel):
     """Model scoring result."""
 
@@ -32,6 +44,7 @@ class ResultDetail(BaseModel):
     probability: float | None = Field(default=None, description="Calibrated probability, if available")
     classification: int | None = Field(default=None, description="Binary classification: 0 = healthy, 1 = bankruptcy risk")
     risk_category: str | None = Field(default=None, description="Risk bucket: critical, high, medium, or low")
+    peer_stats: PeerGroupStats | None = Field(default=None, description="Peer-group score distribution for this prediction")
 
 
 class ThresholdDetail(BaseModel):
