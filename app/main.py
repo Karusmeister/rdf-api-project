@@ -17,6 +17,7 @@ from app.adapters.registry import get as get_adapter
 from app.adapters.registry import register as register_adapter
 from app.config import settings
 from app.db import connection as db_conn
+from app.db import migrations as db_migrations
 from app.db import prediction_db
 from app.jobs import krs_scanner, krs_sync
 from app.logging_config import configure_logging
@@ -48,6 +49,15 @@ async def lifespan(app: FastAPI):
     scraper_db.connect()
     prediction_db.connect()
     krs_repo.connect()
+    # CR2-OPS-004: apply versioned SQL migrations after bootstrap tables exist
+    # but before any write path runs. Migrations carry the mutating operations
+    # (ALTER TABLE, backfills, FK constraints) that used to run implicitly on
+    # every startup. Tracked in `schema_migrations`, idempotent across reboots.
+    db_migrations.apply_pending(db_conn.get_conn())
+    # CR-PZN-001: deterministically register built-in models BEFORE warming
+    # caches, so `/api/predictions/models` reflects them immediately even on a
+    # fresh environment where no scoring run has happened yet.
+    predictions_service.register_builtin_models()
     predictions_service.warm_caches()
     await rdf_client.start()
     await krs_client.start()
@@ -228,6 +238,31 @@ async def upstream_request_error_handler(request: Request, exc: httpx.RequestErr
 async def health():
     """Returns `{"status": "ok"}` if the service is running."""
     return {"status": "ok"}
+
+
+@app.get("/health/predictions", tags=["health"], summary="Predictions subsystem readiness")
+async def health_predictions():
+    """Readiness check for the predictions subsystem.
+
+    CR2-REL-006: returns 503 when the built-in model catalog is incomplete
+    (e.g. a registrar raised during startup in local dev, where we fall open
+    rather than crashing the process). Alerts should page on a sustained 503
+    here because `/api/predictions/models` will be missing rows.
+
+    In non-local environments a registration failure aborts startup outright
+    (see `predictions_service.register_builtin_models`), so this endpoint
+    only ever reports `degraded` in local dev.
+    """
+    registration = predictions_service.get_builtin_models_health()
+    body = {
+        "status": "ok" if registration["ok"] else "degraded",
+        "builtin_models": {
+            "ok": registration["ok"],
+            "failed_registrars": registration["failed_registrars"],
+        },
+    }
+    status_code = 200 if registration["ok"] else 503
+    return JSONResponse(status_code=status_code, content=body)
 
 
 @app.get("/health/krs", tags=["health"], summary="KRS adapter health")

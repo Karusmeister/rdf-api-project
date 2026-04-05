@@ -219,6 +219,35 @@ class TestETLRouteAfterStartup:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_etl_ingest_error_does_not_leak_exception_text(self, api_client, monkeypatch):
+        """CR2-SEC-002: an unexpected ETL failure must surface a stable public
+        error message to the client — raw exception text (file paths, DB
+        errors, stack snippets) stays in logs only.
+        """
+        from app.services import etl as etl_service
+
+        sentinel_message = (
+            "leak-me /etc/passwd psycopg2.errors.SomeInternal: schema `public`"
+        )
+
+        def _blow_up(_doc_id):
+            raise RuntimeError(sentinel_message)
+
+        monkeypatch.setattr(etl_service, "ingest_document", _blow_up)
+
+        resp = await api_client.post(
+            "/api/etl/ingest",
+            json={"document_id": "any-id"},
+        )
+        assert resp.status_code == 500
+        body = resp.json()
+        # Stable public message only.
+        assert body["detail"] == "ETL ingestion failed"
+        assert sentinel_message not in body["detail"]
+        assert "/etc/passwd" not in body["detail"]
+        assert "psycopg2" not in body["detail"]
+
+    @pytest.mark.asyncio
     async def test_dataset_stats_requires_feature_set(self, api_client):
         resp = await api_client.get("/api/etl/training/dataset-stats")
         assert resp.status_code == 422

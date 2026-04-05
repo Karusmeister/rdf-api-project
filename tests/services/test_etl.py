@@ -404,7 +404,12 @@ class TestEtlAttempts:
         assert sentinel_count == 0
 
     def test_parse_error_records_etl_attempt(self, isolated_db):
-        """parse_error should create etl_attempts row, NOT a sentinel report."""
+        """parse_error should create etl_attempts row, NOT a sentinel report.
+
+        Also enforces CR3-SEC-002: the returned payload must use the stable
+        `parse_error` code and MUST NOT carry the raw exception text. Full
+        detail stays in logs and the etl_attempts audit row.
+        """
         storage_dir = isolated_db / "documents"
         storage = LocalStorage(str(storage_dir))
         krs = "0000099002"
@@ -425,21 +430,77 @@ class TestEtlAttempts:
 
         result = etl.ingest_document(doc_id, storage=storage)
         assert result["status"] == "failed"
+        # CR3-SEC-002: stable error code only, no ElementTree/parser internals.
+        assert result["error"] == "parse_error"
+        assert "line" not in str(result)  # parser errors often embed "line N, col M"
+        assert "<<<" not in str(result)
+        assert "ParseError" not in str(result)
 
         conn = prediction_db.get_conn()
         attempts = conn.execute(
-            "SELECT status, reason_code FROM etl_attempts WHERE document_id = %s",
+            "SELECT status, reason_code, error_message FROM etl_attempts WHERE document_id = %s",
             [doc_id],
         ).fetchall()
         assert len(attempts) == 1
         assert attempts[0][0] == "failed"
         assert attempts[0][1] == "parse_error"
+        # The raw exception text IS allowed in the audit table (operator-only);
+        # only the API return contract is sanitized.
+        assert attempts[0][2] is not None
 
         sentinel_count = conn.execute("""
             SELECT count(*) FROM financial_reports
             WHERE source_document_id = %s AND fiscal_year = 0
         """, [doc_id]).fetchone()[0]
         assert sentinel_count == 0
+
+    def test_ingest_all_pending_sanitizes_unexpected_errors(self, isolated_db, monkeypatch):
+        """CR3-SEC-002: bulk ingestion must surface stable error codes in the
+        aggregated `errors[]` list — raw exception text is for logs, not for
+        clients. The old implementation stuffed `str(e)` directly into the
+        returned dict.
+        """
+        import sys
+
+        storage_dir = isolated_db / "documents"
+        storage = LocalStorage(str(storage_dir))
+        krs = "0000099099"
+        doc_id = "doc-boom"
+
+        scraper_db.upsert_krs(krs, "Boom Corp", None, True)
+        now = datetime.now(timezone.utc)
+        scraper_db.insert_documents([{
+            "document_id": doc_id, "krs": krs,
+            "rodzaj": "18", "status": "NIEUSUNIETY",
+            "discovered_at": now,
+        }])
+        scraper_db.mark_downloaded(doc_id, f"krs/{krs}/{doc_id}", "local", 0, 0, 1, "xml")
+
+        # Force an unexpected RuntimeError from the per-document path so we
+        # land in the bulk except-branch, which is the one that used to
+        # stringify the exception directly.
+        sentinel = "LEAK: /etc/shadow postgres://user:pass@host/db"
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError(sentinel)
+
+        monkeypatch.setattr(etl, "ingest_document", _boom)
+
+        result = etl.ingest_all_pending(storage=storage)
+
+        assert result["failed"] == 1
+        assert result["errors"], "bulk result should record the failure"
+        err = result["errors"][0]
+        assert err["document_id"] == doc_id
+        # Stable code only — no raw exception text allowed in the payload.
+        assert err["error"] == "unexpected_error"
+        assert err.get("error_type") == "RuntimeError"
+        # Negative assertions — the leaky substrings must not appear anywhere
+        # in the returned object.
+        flat = str(result)
+        assert sentinel not in flat
+        assert "/etc/shadow" not in flat
+        assert "postgres://" not in flat
 
     def test_success_records_etl_attempt_with_timestamps(self, storage_with_xml):
         """Successful ingest should have started_at < finished_at."""

@@ -120,6 +120,27 @@ class TestGoogleLogin:
         resp = client.post("/api/auth/google", json={"id_token": "bad-token"})
         assert resp.status_code == 401
 
+    @patch(
+        "google.oauth2.id_token.verify_oauth2_token",
+        side_effect=ValueError(
+            "Invalid token: expired, kid=xyz123, issuer=https://accounts.google.com"
+        ),
+    )
+    def test_google_login_does_not_leak_library_internals(self, mock_verify):
+        """CR2-SEC-002: the `google-auth` library's ValueError text carries
+        key IDs, issuer URLs, and expiry metadata that must never land in a
+        client-facing response. Only a stable public message is returned."""
+        limiter.reset()
+        resp = client.post("/api/auth/google", json={"id_token": "bad-token"})
+        assert resp.status_code == 401
+        body = resp.json()
+        assert body["detail"] == "Invalid Google ID token"
+        # Negative assertions guard against accidentally re-introducing
+        # `f"Invalid Google ID token: {e}"` style interpolation.
+        assert "kid=" not in body["detail"]
+        assert "issuer" not in body["detail"]
+        assert "expired" not in body["detail"].lower()
+
 
 # ---------------------------------------------------------------------------
 # POST /api/auth/signup
@@ -313,6 +334,111 @@ class TestLogin:
                 "password": "securepass123",
             })
         assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# CR2-AUTH-001: login brute-force protection
+# ---------------------------------------------------------------------------
+
+
+class TestLoginBruteForceProtection:
+    """Regression guards for the rate limit + per-account/IP lockout on
+    /api/auth/login. The limiter runs per-IP with a ceiling of 10/minute, and
+    the in-process cooldown locks an account or an IP after
+    LOGIN_MAX_FAILURES consecutive failures.
+    """
+
+    def setup_method(self):
+        from app.routers.auth import routes as auth_routes
+        limiter.reset()
+        auth_routes._reset_login_cooldowns()
+
+    def teardown_method(self):
+        from app.routers.auth import routes as auth_routes
+        limiter.reset()
+        auth_routes._reset_login_cooldowns()
+
+    @patch("app.routers.auth.routes.verify_captcha", new_callable=AsyncMock)
+    @patch("app.db.prediction_db.get_user_by_email", return_value=None)
+    def test_account_lockout_triggers_429_after_max_failures(self, mock_get, mock_captcha):
+        """After LOGIN_MAX_FAILURES bad attempts against one email, the next
+        attempt returns 429 with a Retry-After header, regardless of the
+        password supplied on the final try."""
+        from app.routers.auth.routes import LOGIN_MAX_FAILURES
+
+        # LOGIN_MAX_FAILURES bad attempts → each returns 401 (user not found).
+        for i in range(LOGIN_MAX_FAILURES):
+            resp = client.post(
+                "/api/auth/login",
+                json={"email": "victim@example.com", "password": f"wrong{i}"},
+            )
+            assert resp.status_code == 401, (
+                f"attempt {i} expected 401 got {resp.status_code}: {resp.text}"
+            )
+
+        # Next attempt must be blocked by the per-account cooldown.
+        blocked = client.post(
+            "/api/auth/login",
+            json={"email": "victim@example.com", "password": "still-wrong"},
+        )
+        assert blocked.status_code == 429
+        assert "Retry-After" in blocked.headers
+        assert int(blocked.headers["Retry-After"]) > 0
+
+    @patch("app.routers.auth.routes.verify_captcha", new_callable=AsyncMock)
+    @patch("app.db.prediction_db.get_user_by_email", return_value=None)
+    def test_ip_lockout_blocks_attacker_across_accounts(self, mock_get, mock_captcha):
+        """A single attacker iterating over many usernames from one IP still
+        gets locked out, because the cooldown also keys on the client IP. This
+        is the credential-stuffing scenario where per-account-only lockout
+        would let the attacker keep probing."""
+        from app.routers.auth.routes import LOGIN_MAX_FAILURES
+
+        for i in range(LOGIN_MAX_FAILURES):
+            resp = client.post(
+                "/api/auth/login",
+                json={"email": f"victim{i}@example.com", "password": "guess"},
+            )
+            assert resp.status_code == 401
+
+        blocked = client.post(
+            "/api/auth/login",
+            json={"email": "yet-another@example.com", "password": "guess"},
+        )
+        assert blocked.status_code == 429
+
+    @patch("app.db.prediction_db.get_user_krs_access", return_value=[])
+    @patch("app.routers.auth.routes.verify_captcha", new_callable=AsyncMock)
+    @patch("app.db.prediction_db.update_last_login")
+    @patch("app.routers.auth.routes._verify_password", return_value=True)
+    @patch("app.db.prediction_db.get_user_by_email", return_value=_FAKE_USER)
+    def test_successful_login_clears_prior_failure_streak(
+        self, mock_get, mock_verify, mock_login, mock_captcha, mock_krs
+    ):
+        """A successful login must wipe the stored failure counter for both
+        the account and the IP so legitimate users don't inherit a lingering
+        lockout after a password correction."""
+        from app import auth_lockout
+        from app.routers.auth import routes as auth_routes
+
+        # Prime the account with sub-threshold failures via direct state
+        # manipulation. Doing it through HTTP would trip the per-IP slowapi
+        # limit before we could verify the clear.
+        auth_routes._record_login_failure("test@example.com", "testclient")
+        auth_routes._record_login_failure("test@example.com", "testclient")
+        assert auth_lockout.account_lockout_store.size() > 0
+
+        # Successful login clears the streak.
+        resp = client.post(
+            "/api/auth/login",
+            json={"email": "test@example.com", "password": "securepass123"},
+        )
+        assert resp.status_code == 200
+
+        # The per-account counter for this email is gone; the IP counter is
+        # cleared for whatever key the TestClient used.
+        assert auth_lockout.account_lockout_store.is_locked("test@example.com") == 0
+        assert auth_lockout.ip_lockout_store.size() == 0
 
 
 # ---------------------------------------------------------------------------

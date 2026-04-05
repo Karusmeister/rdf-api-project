@@ -599,6 +599,67 @@ def node_to_comparison(
     }
 
 
+def _is_empty_comparison_tree(node: Optional[dict]) -> bool:
+    """Detect a synthetic or extracted comparison root that carries no data.
+
+    A statement tree is "empty" when the top-level node has `current` and
+    `previous` both null AND every descendant also has `current` and
+    `previous` null (including the degenerate case of no descendants at
+    all). Returning True here is the trigger for `build_comparison` to emit
+    `None` for that field instead of a stub root the frontend would render
+    as an empty table (see backend_changes.json: jednostkainna-empty-statement-trees).
+
+    Bilans aktywa/pasywa are also statement trees and use the same rule, so
+    this helper is shared across rzis, cash_flow, and the balance-sheet
+    halves. The preferred long-term fix — mapping JednostkaInna-specific tag
+    paths into the common RZiS.*/CF.* taxonomy — still benefits: once the
+    mapping is in place, populated trees stop triggering this branch
+    automatically.
+    """
+    if node is None:
+        return True
+    if node.get("current") is not None or node.get("previous") is not None:
+        return False
+    for child in node.get("children", []) or []:
+        if not _is_empty_comparison_tree(child):
+            return False
+    return True
+
+
+# Synthetic root labels for wrapping the top-level RZiS / CF node list into
+# a single ComparisonNode. The frontend expects a single tree per statement
+# section (mirroring `bilans.aktywa` / `bilans.pasywa`), not a bare list.
+_SYNTHETIC_ROOTS: dict[str, tuple[str, str]] = {
+    "rzis": ("RZiS", "Rachunek zysków i strat"),
+    "cash_flow": ("CF", "Rachunek przepływów pieniężnych"),
+}
+
+
+def _wrap_section_as_root(section: str, children: list[dict]) -> dict:
+    """Turn the list of top-level RZiS/CF comparison nodes into a single
+    synthetic root that matches the `ComparisonNode` contract.
+
+    The synthetic root carries no numeric totals because RZiS / CF don't have
+    a single "grand total" line (unlike Aktywa / Pasywa which balance to a
+    single sum). `current` and `previous` are therefore explicitly None, and
+    all derived fields are None too.
+    """
+    tag, label = _SYNTHETIC_ROOTS[section]
+    return {
+        "tag": tag,
+        "label": label,
+        "current": None,
+        "previous": None,
+        "change_absolute": None,
+        "change_percent": None,
+        "share_of_parent_current": None,
+        "share_of_parent_previous": None,
+        "depth": 0,
+        "is_w_tym": False,
+        "children": children,
+    }
+
+
 def build_comparison(
     current_stmt: dict,
     previous_stmt: Optional[dict] = None,
@@ -608,6 +669,17 @@ def build_comparison(
     If previous_stmt is None, uses kwota_b (embedded column) from current_stmt.
     If previous_stmt is provided, only that statement's kwota_a is used as the
     previous value — kwota_b from current_stmt is never read.
+
+    Contract:
+      * bilans.aktywa / bilans.pasywa: `ComparisonNode | None`
+      * rzis / cash_flow: `ComparisonNode | None` — a single root whose
+        `children` holds the top-level statement items, or `None` when the
+        underlying statement section is empty or carries no real values.
+
+    Before the jednostkainna-empty-statement-trees fix, rzis and cash_flow
+    were returned as bare lists. That mismatched the frontend contract
+    (`ComparisonNode | null`) and caused empty sections to render as a
+    single-row stub instead of the intended "unavailable" message.
     """
     # Use kwota_b fallback only in single-statement mode
     use_kwota_b = previous_stmt is None
@@ -655,13 +727,21 @@ def build_comparison(
             result.append(node_to_comparison(node, None, None, prev_node, use_kwota_b))
         return result
 
+    def _build_section(section_key: str) -> Optional[dict]:
+        """Assemble rzis/cash_flow as a single synthetic root or `None`."""
+        items = cmp_list(current_stmt[section_key])
+        root = _wrap_section_as_root(section_key, items)
+        if _is_empty_comparison_tree(root):
+            return None
+        return root
+
     return {
         "bilans": {
             "aktywa": cmp_tree(current_stmt["bilans"]["aktywa"]),
             "pasywa": cmp_tree(current_stmt["bilans"]["pasywa"]),
         },
-        "rzis": cmp_list(current_stmt["rzis"]),
-        "cash_flow": cmp_list(current_stmt["cash_flow"]),
+        "rzis": _build_section("rzis"),
+        "cash_flow": _build_section("cash_flow"),
     }
 
 

@@ -10,6 +10,7 @@ import bcrypt as _bcrypt
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
+from app import auth_lockout
 from app.auth import CurrentUser, create_token
 from app.config import settings
 from app.db import prediction_db
@@ -32,6 +33,102 @@ logger = logging.getLogger(__name__)
 from app.rate_limit import limiter
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+# ---------------------------------------------------------------------------
+# CR2-AUTH-001 / CR3-AUTH-003: brute-force protection for /login
+#
+# Two layers run on top of slowapi's per-IP rate limit:
+#   1. Per-account lockout: LOGIN_MAX_FAILURES failures inside
+#      LOGIN_WINDOW_SECONDS lock the email for LOGIN_LOCKOUT_SECONDS regardless
+#      of the source IP. Prevents distributed credential-stuffing from grinding
+#      through a single account.
+#   2. Per-IP lockout: LOGIN_MAX_FAILURES failures inside LOGIN_WINDOW_SECONDS
+#      from one IP locks the IP regardless of which email it targets. Catches
+#      credential-stuffing across many accounts from a single host that stays
+#      below slowapi's per-IP request-rate ceiling.
+#
+# CR3-AUTH-003 hardening:
+#   * Sliding window counts only failures inside LOGIN_WINDOW_SECONDS. Trickle
+#     failures that fall outside the window drop out of the count, so a
+#     low-rate attacker cannot slowly accrete a lockout on an innocent user.
+#   * State is kept in a bounded LRU store (`LOGIN_STATE_MAX_KEYS` cap).
+#     Random-identity floods cannot grow process memory past the cap.
+#   * Backend lives behind a `LockoutStore` protocol so a multi-worker Redis
+#     backend is a drop-in swap without touching the router.
+# ---------------------------------------------------------------------------
+
+
+def _login_state_key(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _check_login_cooldown(email: str, ip: str | None) -> None:
+    """Raise 429 if `email` or `ip` is currently locked out.
+
+    Called at the very start of /login so a locked account or IP short-circuits
+    without touching the database (avoids acting as a timing oracle too).
+    """
+    account_key = _login_state_key(email)
+    account_wait = auth_lockout.account_lockout_store.is_locked(account_key)
+    if account_wait > 0:
+        logger.warning(
+            "login_account_locked",
+            extra={
+                "event": "login_account_locked",
+                "email": account_key,
+                "retry_after_seconds": account_wait,
+            },
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Try again later.",
+            headers={"Retry-After": str(account_wait)},
+        )
+
+    if ip:
+        ip_wait = auth_lockout.ip_lockout_store.is_locked(ip)
+        if ip_wait > 0:
+            logger.warning(
+                "login_ip_locked",
+                extra={
+                    "event": "login_ip_locked",
+                    "ip": ip,
+                    "retry_after_seconds": ip_wait,
+                },
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed login attempts. Try again later.",
+                headers={"Retry-After": str(ip_wait)},
+            )
+
+
+def _record_login_failure(email: str, ip: str | None) -> None:
+    account_key = _login_state_key(email)
+    auth_lockout.account_lockout_store.record_failure(account_key)
+    if ip:
+        auth_lockout.ip_lockout_store.record_failure(ip)
+
+
+def _record_login_success(email: str, ip: str | None) -> None:
+    account_key = _login_state_key(email)
+    auth_lockout.account_lockout_store.record_success(account_key)
+    if ip:
+        auth_lockout.ip_lockout_store.record_success(ip)
+
+
+def _reset_login_cooldowns() -> None:
+    """Test helper — clears the shared lockout stores."""
+    auth_lockout.account_lockout_store.clear()
+    auth_lockout.ip_lockout_store.clear()
+
+
+# Re-export tuneables so tests that imported them from this module keep
+# working without changes.
+LOGIN_MAX_FAILURES = auth_lockout.LOGIN_MAX_FAILURES
+LOGIN_LOCKOUT_SECONDS = auth_lockout.LOGIN_LOCKOUT_SECONDS
+LOGIN_WINDOW_SECONDS = auth_lockout.LOGIN_WINDOW_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +251,13 @@ async def verify_captcha(token: str | None, action: str) -> None:
 # ---------------------------------------------------------------------------
 
 @router.post("/google", summary="Google SSO login")
-def google_login(body: GoogleLoginRequest) -> AuthResponse:
-    """Exchange a Google OAuth2 ID token for a JWT. Auto-creates and verifies the user on first login."""
+@limiter.limit("10/minute")
+async def google_login(request: Request, body: GoogleLoginRequest) -> AuthResponse:
+    """Exchange a Google OAuth2 ID token for a JWT. Auto-creates and verifies the user on first login.
+
+    Rate limited to 10/minute per IP (CR2-AUTH-001) to prevent brute-forcing of
+    forged Google ID tokens through this SSO endpoint.
+    """
     from google.auth.transport import requests
     from google.oauth2 import id_token
 
@@ -163,8 +265,17 @@ def google_login(body: GoogleLoginRequest) -> AuthResponse:
         info = id_token.verify_oauth2_token(
             body.id_token, requests.Request(), settings.google_client_id
         )
-    except ValueError as e:
-        raise HTTPException(401, f"Invalid Google ID token: {e}")
+    except ValueError:
+        # CR2-SEC-002: never surface the raw ValueError text — the `google-auth`
+        # library embeds implementation detail (key IDs, timing info, parser
+        # state) in its messages that leaks to clients. Log the exception
+        # server-side and return a stable public message.
+        logger.warning(
+            "google_id_token_invalid",
+            extra={"event": "google_id_token_invalid"},
+            exc_info=True,
+        )
+        raise HTTPException(401, "Invalid Google ID token")
 
     email = info["email"]
     name = info.get("name")
@@ -266,18 +377,35 @@ def verify_email(request: Request, body: VerifyRequest):
 
 
 @router.post("/login", summary="Login with email and password")
-async def login(body: LoginRequest) -> AuthResponse:
-    """Authenticate with email and password. Returns a JWT. Account must be verified and active."""
+@limiter.limit("10/minute")
+async def login(request: Request, body: LoginRequest) -> AuthResponse:
+    """Authenticate with email and password. Returns a JWT. Account must be verified and active.
+
+    CR2-AUTH-001 protections:
+      * slowapi per-IP rate limit (10/minute).
+      * Per-account lockout after `LOGIN_MAX_FAILURES` consecutive bad
+        passwords — blocks distributed attacks on a single account.
+      * Per-IP lockout after `LOGIN_MAX_FAILURES` consecutive failures from
+        one host — catches credential stuffing that stays below slowapi's
+        request-rate ceiling by hammering different accounts.
+    """
+    client_ip = request.client.host if request.client else None
+    # Check cooldowns BEFORE captcha / DB work so a locked account or IP
+    # short-circuits without additional side effects or timing leaks.
+    _check_login_cooldown(body.email, client_ip)
+
     await verify_captcha(body.captcha_token, "login")
 
     user = prediction_db.get_user_by_email(body.email)
     if user is None:
+        _record_login_failure(body.email, client_ip)
         raise HTTPException(401, "Invalid email or password")
 
     if user["auth_method"] != "local":
         raise HTTPException(400, "This account uses Google sign-in")
 
     if not user.get("password_hash") or not _verify_password(body.password, user["password_hash"]):
+        _record_login_failure(body.email, client_ip)
         raise HTTPException(401, "Invalid email or password")
 
     if not user["is_verified"]:
@@ -285,6 +413,9 @@ async def login(body: LoginRequest) -> AuthResponse:
 
     if not user["is_active"]:
         raise HTTPException(403, "Account deactivated")
+
+    # Successful login — clear any prior failure streak for this account/IP.
+    _record_login_success(body.email, client_ip)
 
     prediction_db.update_last_login(user["id"])
     token = create_token(user["id"], user["email"])

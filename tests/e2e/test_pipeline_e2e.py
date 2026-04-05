@@ -391,15 +391,34 @@ class TestE2EPipeline:
         batch_result = poznanski.score_batch([downloaded_doc["document_id"]])
         assert batch_result["scored"] == 1
         assert batch_result["errors"] == 0
+        run_id = batch_result["run_id"]
+        assert run_id is not None, "Batch should issue a prediction_run when scoring happened"
 
-        # Verify model registered + prediction persisted
+        # Verify model registered + prediction persisted under this run.
         models = prediction_db.get_active_models()
         assert any(m["id"] == poznanski.MODEL_ID for m in models), \
             "Poznanski model should be registered after score_batch"
 
-        pred = prediction_db.get_latest_prediction(KRS)
-        assert pred is not None
-        assert pred["raw_score"] is not None
+        # CR-PZN-005: scope the persistence assertion to the run we just created
+        # and the Poznanski model specifically. `get_latest_prediction(krs)` returns
+        # the latest row across *all* models — a Maczynska-only write would have
+        # false-passed the old assertion and masked a Poznanski persistence regression.
+        conn = prediction_db.get_conn()
+        row = conn.execute(
+            """
+            SELECT p.id, p.raw_score, pr.model_id
+            FROM predictions p
+            JOIN prediction_runs pr ON pr.id = p.prediction_run_id
+            WHERE p.prediction_run_id = %s
+              AND pr.model_id = %s
+              AND p.krs = %s
+            """,
+            [run_id, poznanski.MODEL_ID, KRS],
+        ).fetchone()
+        assert row is not None, (
+            f"No Poznanski prediction persisted for run_id={run_id} krs={KRS}"
+        )
+        assert row[1] is not None, "Persisted prediction should carry a raw_score"
 
     def test_11_idempotent_reingest(self, downloaded_doc):
         """Re-ingesting the same document doesn't break anything."""

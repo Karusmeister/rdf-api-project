@@ -255,3 +255,134 @@ class TestGetDatasetStats:
         assert stats["row_count"] == 2
         # x1_maczynska requires Pasywa_B which partial doesn't have
         assert stats["missing_pct"]["x1_maczynska"] > 0
+
+
+# ---------------------------------------------------------------------------
+# CR2-SCALE-005: dataset-assembly scalability regression guards
+# ---------------------------------------------------------------------------
+
+
+class TestDatasetScalability:
+    """Guards against the old row-wise pandas `apply` + global table pulls.
+
+    The previous implementation was O(rows * bankruptcy_events) because
+    labeling filtered the full events DataFrame once per row. These tests
+    force a moderately large synthetic dataset and assert two invariants:
+      * Labels stay correct after the vectorized merge-based rewrite.
+      * DB-side scoping actually restricts the bankruptcy-events pull to the
+        working krs set instead of scanning the whole table. Both invariants
+        are the acceptance criteria from CR2-SCALE-005.
+    """
+
+    def test_labels_match_reference_for_many_rows(self, seeded_db):
+        # 30 companies × 3 years = 90 rows. Every third company is marked
+        # bankrupt in the year immediately after its 2022 report so we can
+        # check that the vectorized horizon match lines up with the reference
+        # Python implementation.
+        years = [2020, 2021, 2022]
+        for i in range(30):
+            krs = f"{500000 + i:010d}"
+            for year in years:
+                _create_company_with_report(krs, f"scale-rpt-{i}-{year}", year, STANDARD_TAGS)
+
+            if i % 3 == 0:
+                prediction_db.get_conn().execute(
+                    """
+                    INSERT INTO bankruptcy_events (id, krs, event_type, event_date, is_confirmed)
+                    VALUES (%s, %s, 'bankruptcy', %s, true)
+                    """,
+                    [str(uuid.uuid4()), krs, "2023-06-15"],
+                )
+
+        df = training_data.build_training_dataset(
+            "maczynska_6", prediction_horizon_years=2
+        )
+        assert len(df) == 90, (
+            f"Expected 30 companies × 3 years = 90 rows, got {len(df)}"
+        )
+
+        # Every row for a "bankrupt within horizon" company in fiscal 2022
+        # must be labeled 1 (event in 2023 falls inside period_end 2022-12-31
+        # + 2 years). Fiscal 2020/2021 rows are labeled 0 because the event
+        # lies outside their horizon.
+        bankrupt_krs = {f"{500000 + i:010d}" for i in range(0, 30, 3)}
+        labels = df.set_index(["krs", "fiscal_year"])["is_bankrupt_within_2y"]
+
+        for krs in bankrupt_krs:
+            assert labels.loc[(krs, 2022)] == 1, (
+                f"{krs}@2022 should be bankrupt (event in 2023, horizon covers it)"
+            )
+            # 2020 period_end = 2020-12-31; horizon end = 2022-12-31 — event in
+            # 2023 is past the horizon → 0.
+            assert labels.loc[(krs, 2020)] == 0, (
+                f"{krs}@2020 should not be bankrupt (event outside 2y horizon)"
+            )
+
+        # Every non-bankrupt company row must be 0.
+        healthy_rows = df[~df["krs"].isin(bankrupt_krs)]
+        assert healthy_rows["is_bankrupt_within_2y"].sum() == 0
+
+    def test_bankruptcy_query_scoped_to_working_krs_set(self, seeded_db):
+        """CR2-SCALE-005 acceptance criterion: metadata/event queries are
+        restricted to the report_id/krs set in the feature dataset.
+
+        We seed bankruptcy events for both "in-scope" and "out-of-scope" krs
+        values and confirm the out-of-scope events never even get pulled into
+        Python memory. This is asserted by monkeypatching the connection
+        `execute` to record every SQL call and making sure the pulled
+        bankruptcy rows only cover the working krs set.
+        """
+        import re
+
+        _create_company_with_report("0000555001", "scoped-rpt-1", 2022, STANDARD_TAGS)
+        _create_company_with_report("0000555002", "scoped-rpt-2", 2022, STANDARD_TAGS)
+
+        conn = prediction_db.get_conn()
+        # In-scope bankruptcy — should influence labels.
+        conn.execute(
+            """
+            INSERT INTO bankruptcy_events (id, krs, event_type, event_date, is_confirmed)
+            VALUES (%s, %s, 'bankruptcy', %s, true)
+            """,
+            [str(uuid.uuid4()), "0000555001", "2023-03-01"],
+        )
+        # Out-of-scope bankruptcy — no matching row in the feature set, so
+        # the optimized query should filter it server-side.
+        conn.execute(
+            """
+            INSERT INTO bankruptcy_events (id, krs, event_type, event_date, is_confirmed)
+            VALUES (%s, %s, 'bankruptcy', %s, true)
+            """,
+            [str(uuid.uuid4()), "0000999999", "2023-03-01"],
+        )
+
+        captured_sql: list[str] = []
+        original_execute = type(conn).execute
+
+        def _capturing_execute(self, sql, params=None):
+            captured_sql.append(" ".join(sql.split()))
+            return original_execute(self, sql, params)
+
+        with patch.object(type(conn), "execute", _capturing_execute):
+            df = training_data.build_training_dataset("maczynska_6")
+
+        # Behavior: in-scope company labeled 1, no row for the out-of-scope
+        # bankruptcy exists in the dataset.
+        labels = df.set_index(["krs", "fiscal_year"])["is_bankrupt_within_2y"]
+        assert labels.loc[("0000555001", 2022)] == 1
+        assert "0000999999" not in df["krs"].values
+
+        # Structural guard: the bankruptcy query must be parameterized on a
+        # krs ANY(...) filter, not an unbounded scan of the whole table.
+        events_queries = [
+            sql for sql in captured_sql
+            if "FROM bankruptcy_events" in sql
+        ]
+        assert events_queries, "bankruptcy_events query never executed"
+        assert all(
+            re.search(r"krs\s*=\s*ANY", sql, re.IGNORECASE)
+            for sql in events_queries
+        ), (
+            "CR2-SCALE-005 regression: bankruptcy_events query is no longer "
+            f"scoped to a working krs set — captured SQL: {events_queries}"
+        )

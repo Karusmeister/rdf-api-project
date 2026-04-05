@@ -21,7 +21,7 @@ from app.config import settings
 from app.db import connection as db_conn
 from app.db import prediction_db
 from app.scraper import db as scraper_db
-from app.services import feature_engine, maczynska, predictions
+from app.services import feature_engine, maczynska, poznanski, predictions
 from scripts.seed_features import FEATURE_DEFINITIONS, FEATURE_SETS
 
 
@@ -56,6 +56,10 @@ def seeded_predictions_db(pg_dsn, clean_pg):
             prediction_db.upsert_feature_set(set_id, info["name"], info.get("description"))
             for ordinal, member_id in enumerate(info["members"], start=1):
                 prediction_db.add_feature_set_member(set_id, member_id, ordinal)
+
+        # CR-PZN-001: mirror production startup — register every built-in model
+        # up front instead of relying on `score_batch` side effects.
+        predictions.register_builtin_models()
 
         yield
         db_conn.close()
@@ -228,3 +232,63 @@ class TestPredictionsContract:
                 assert st["value_previous"] is None, (
                     f"{st['tag_path']}: expected value_previous=None for first-year company"
                 )
+
+    def test_poznanski_warning_and_interpretation_contract(self, seeded_predictions_db):
+        """CR-PZN-002/005: a Poznanski prediction must surface `result.warnings`
+        and interpretation thresholds end-to-end through the read path.
+
+        We drive the warning deterministically by injecting a pathologically
+        high X2 (quick ratio) via large Aktywa_B / Aktywa_B_I values relative to
+        Pasywa_B_III. The scorer raises `WARNING_NON_LINEAR_LIQUIDITY` and the
+        service must propagate it into the API response shape.
+        """
+        krs = "0000500003"
+
+        # Build a tag set where Aktywa_B ~= 10M and Pasywa_B_III = 100K so
+        # quick ratio X2 >> NON_LINEAR_LIQUIDITY_THRESHOLD (4.0).
+        tags = _tag_values(scale=1.0)
+        tags["Aktywa_B"] = 10_000_000.0
+        tags["Aktywa_B_I"] = 100_000.0
+        tags["Pasywa_B_III"] = 100_000.0
+        # Poznanski also needs Pasywa_B_II for X3 (fixed capital ratio). Keep
+        # it small so the model doesn't numerically explode while we exercise
+        # the warning path.
+        tags["Pasywa_B_II"] = 50_000.0
+        _seed_year(krs, "rpt-pzn-2024", 2024, tags)
+
+        # Compute both sets so the synthesized report carries every required
+        # feature, then score with Poznanski.
+        feature_engine.compute_features_for_report(
+            "rpt-pzn-2024", feature_set_id="poznanski_4"
+        )
+        result = poznanski.score_batch(report_ids=["rpt-pzn-2024"])
+        assert result["scored"] == 1
+        predictions.invalidate_caches()
+
+        resp = predictions.get_predictions(krs)
+        pzn = [p for p in resp["predictions"] if p["model"]["model_id"] == "poznanski_2004_v1"]
+        assert len(pzn) == 1, "Poznanski prediction missing from response"
+        pzn_pred = pzn[0]
+
+        # CR-PZN-002: warnings list carries the stable code.
+        assert "WARNING_NON_LINEAR_LIQUIDITY" in pzn_pred["result"]["warnings"]
+
+        # CR-PZN-002: the `_warnings` / `_intercept` metadata keys must NOT
+        # leak as feature-level contributions — they are implementation-detail
+        # keys stashed in the persisted contributions JSON.
+        feature_ids = {f["feature_id"] for f in pzn_pred["features"]}
+        assert "_warnings" not in feature_ids
+        assert "_intercept" not in feature_ids
+
+        # Interpretation guide must be present with the Poznanski bands.
+        interp = pzn_pred["interpretation"]
+        assert interp is not None
+        labels = {t["label"] for t in interp["thresholds"]}
+        assert {"critical", "medium", "low"}.issubset(labels)
+        assert interp["higher_is_better"] is True
+        # Exactly one threshold should be marked current (the one containing
+        # the raw score the API returned).
+        current_bands = [t for t in interp["thresholds"] if t["is_current"]]
+        assert len(current_bands) == 1, (
+            f"Expected exactly one current band, got {current_bands}"
+        )

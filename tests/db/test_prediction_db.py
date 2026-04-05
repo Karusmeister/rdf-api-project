@@ -952,7 +952,17 @@ def test_get_features_for_predictions_batch_rejects_duplicate_request_ids():
 
 
 def test_x1_maczynska_migration_hardens_null_required_tags():
-    """R2-003: backfill updates both stale and NULL required_tags rows."""
+    """R2-003: backfill updates both stale and NULL required_tags rows.
+
+    The backfill lives in migrations/prediction/003_*.sql (CR2-OPS-004).
+    This test validates the migration's SQL is idempotent against legacy
+    data shapes (stale row + NULL required_tags), so we execute the file's
+    SQL directly rather than re-driving the runner. Re-driving the runner
+    after deleting one tracking row would (correctly, CR3-MIG-001) raise a
+    retroactive-insertion error since later migrations are already applied.
+    """
+    from pathlib import Path
+
     conn = db.get_conn()
     # Seed a stale row missing CF.A_II_1 entirely.
     db.upsert_feature_definition(
@@ -965,9 +975,16 @@ def test_x1_maczynska_migration_hardens_null_required_tags():
     # Force a NULL required_tags directly in the DB.
     conn.execute("UPDATE feature_definitions SET required_tags = NULL WHERE id = 'x1_maczynska'")
 
-    # Re-run schema init: migration block must fix both cases idempotently.
-    db._schema_initialized = False
-    db._init_schema()
+    # Apply the migration SQL directly. Using the runner isn't possible here
+    # because later migrations are already recorded in schema_migrations and
+    # CR3-MIG-001's retroactive-insertion check would (rightly) raise.
+    migration_sql = (
+        Path(__file__).resolve().parents[2]
+        / "migrations"
+        / "prediction"
+        / "003_x1_maczynska_required_tags_backfill.sql"
+    ).read_text(encoding="utf-8")
+    conn.execute(migration_sql)
 
     row = conn.execute(
         "SELECT required_tags::text FROM feature_definitions WHERE id = 'x1_maczynska'"
@@ -977,10 +994,140 @@ def test_x1_maczynska_migration_hardens_null_required_tags():
     assert "RZiS.I" in row[0]
     assert "Pasywa_B" in row[0]
 
-    # Re-running the migration is a no-op (idempotent).
-    db._schema_initialized = False
-    db._init_schema()
+    # Re-running the migration SQL is a no-op (idempotency guaranteed by the
+    # WHERE clause on missing/NULL required_tags).
+    conn.execute(migration_sql)
     row2 = conn.execute(
         "SELECT required_tags::text FROM feature_definitions WHERE id = 'x1_maczynska'"
     ).fetchone()
     assert row2[0] == row[0]
+
+
+# ---------------------------------------------------------------------------
+# CR2-DB-003: prediction table foreign-key integrity
+# ---------------------------------------------------------------------------
+
+
+class TestPredictionForeignKeys:
+    """Orphan inserts into prediction_runs / predictions must fail loud.
+
+    Migration `004_prediction_fk_constraints.sql` adds three FKs that guard
+    against data drift between model_registry / prediction_runs /
+    financial_reports and the prediction tables. These tests exercise each
+    constraint directly instead of going through the service layer so a
+    regression in the migration file (e.g. dropped ALTER statement, wrong
+    referenced table) fails immediately.
+    """
+
+    def test_prediction_run_rejects_missing_model(self):
+        import psycopg2
+
+        conn = db.get_conn()
+        with pytest.raises(psycopg2.Error):
+            conn.execute(
+                """
+                INSERT INTO prediction_runs (id, model_id, status)
+                VALUES (%s, %s, 'running')
+                """,
+                ["run-orphan-1", "model-that-does-not-exist"],
+            )
+
+    def test_prediction_rejects_missing_prediction_run(self):
+        import psycopg2
+
+        # Create the dependency chain up to — but not including — the run.
+        db.register_model(
+            model_id="fk-test-model",
+            name="fk-test",
+            model_type="discriminant",
+            version="v1",
+        )
+        db.upsert_company("0000999901")
+        db.create_financial_report(
+            report_id="fk-test-report",
+            krs="0000999901",
+            fiscal_year=2024,
+            period_start="2024-01-01",
+            period_end="2024-12-31",
+        )
+
+        conn = db.get_conn()
+        with pytest.raises(psycopg2.Error):
+            conn.execute(
+                """
+                INSERT INTO predictions (id, prediction_run_id, krs, report_id, raw_score)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                [
+                    "pred-orphan-run",
+                    "run-does-not-exist",
+                    "0000999901",
+                    "fk-test-report",
+                    0.5,
+                ],
+            )
+
+    def test_prediction_rejects_missing_report(self):
+        import psycopg2
+
+        db.register_model(
+            model_id="fk-test-model-2",
+            name="fk-test-2",
+            model_type="discriminant",
+            version="v1",
+        )
+        db.create_prediction_run("run-for-orphan-report", "fk-test-model-2")
+
+        conn = db.get_conn()
+        with pytest.raises(psycopg2.Error):
+            conn.execute(
+                """
+                INSERT INTO predictions (id, prediction_run_id, krs, report_id, raw_score)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                [
+                    "pred-orphan-report",
+                    "run-for-orphan-report",
+                    "0000999902",
+                    "report-does-not-exist",
+                    0.5,
+                ],
+            )
+
+    def test_cascade_delete_run_removes_predictions(self):
+        """Dropping a prediction_run cascades to its predictions (policy
+        decision in the migration: predictions are meaningless without their
+        run, so the child rows go with it)."""
+        db.register_model(
+            model_id="fk-test-cascade",
+            name="fk-test-cascade",
+            model_type="discriminant",
+            version="v1",
+        )
+        db.upsert_company("0000999903")
+        db.create_financial_report(
+            report_id="fk-test-cascade-report",
+            krs="0000999903",
+            fiscal_year=2024,
+            period_start="2024-01-01",
+            period_end="2024-12-31",
+        )
+        db.create_prediction_run("run-cascade", "fk-test-cascade")
+        db.insert_prediction(
+            prediction_id="pred-cascade",
+            prediction_run_id="run-cascade",
+            krs="0000999903",
+            report_id="fk-test-cascade-report",
+            raw_score=0.5,
+            probability=None,
+            classification=0,
+            risk_category="low",
+        )
+
+        conn = db.get_conn()
+        conn.execute("DELETE FROM prediction_runs WHERE id = %s", ["run-cascade"])
+        remaining = conn.execute(
+            "SELECT count(*) FROM predictions WHERE id = %s",
+            ["pred-cascade"],
+        ).fetchone()
+        assert remaining[0] == 0, "CASCADE on prediction_run_id did not drop children"

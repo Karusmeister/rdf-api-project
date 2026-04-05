@@ -78,6 +78,7 @@ def _init_schema() -> None:
             source_file_path   VARCHAR,
             ingestion_status VARCHAR(20) DEFAULT 'pending',
             ingestion_error  VARCHAR,
+            schema_code     VARCHAR(10),
             created_at       TIMESTAMP DEFAULT current_timestamp,
             UNIQUE(logical_key, report_version)
         )
@@ -105,6 +106,7 @@ def _init_schema() -> None:
             value_current   DOUBLE PRECISION,
             value_previous  DOUBLE PRECISION,
             currency        VARCHAR(3) DEFAULT 'PLN',
+            schema_code     VARCHAR(10),
             PRIMARY KEY(report_id, section, tag_path, extraction_version)
         )
     """)
@@ -210,6 +212,7 @@ def _init_schema() -> None:
             classification  SMALLINT,
             risk_category   VARCHAR(20),
             feature_contributions JSON,
+            feature_snapshot JSON,
             created_at      TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -414,46 +417,25 @@ def _init_schema() -> None:
         ("idx_reset_token_hash",    "CREATE UNIQUE INDEX idx_reset_token_hash ON password_reset_tokens(token_hash) WHERE used_at IS NULL"),
         ("idx_reset_token_lookup",  "CREATE INDEX idx_reset_token_lookup ON password_reset_tokens(token_hash, expires_at, created_at DESC) WHERE used_at IS NULL"),
         ("idx_reset_token_user",    "CREATE INDEX idx_reset_token_user ON password_reset_tokens(user_id, used_at, expires_at)"),
+        # CR-PZN-003: supports `_find_unscored_reports` in model scorers. The
+        # unscored-lookup query filters `computed_features` by
+        # feature_definition_id with `is_valid = true`, so a partial index on
+        # (feature_definition_id, report_id) keyed on the valid rows keeps that
+        # path linear in the number of target features rather than scanning the
+        # whole table.
+        ("idx_features_valid_fid_report",
+         "CREATE INDEX idx_features_valid_fid_report ON computed_features(feature_definition_id, report_id) WHERE is_valid = true"),
     ]
 
     for name, sql in index_defs:
         if name not in existing:
             conn.execute(sql)
 
-    # --- schema_code column migration (multi-schema parser support) ---
-    for tbl in ("financial_reports", "financial_line_items"):
-        try:
-            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN schema_code VARCHAR(10)")
-        except Exception:
-            pass  # column already exists
-    conn.execute("UPDATE financial_reports SET schema_code = 'SFJINZ' WHERE schema_code IS NULL")
-    conn.execute("UPDATE financial_line_items SET schema_code = 'SFJINZ' WHERE schema_code IS NULL")
-
-    # --- feature_snapshot migration: immutable reference to the exact feature
-    # values used at scoring time. Removes the timestamp-based heuristic in
-    # predictions read path when the snapshot is present.
-    try:
-        conn.execute("ALTER TABLE predictions ADD COLUMN feature_snapshot JSON")
-    except Exception:
-        pass  # column already exists
-
-    # --- CR-006 / R2-003: backfill x1_maczynska.required_tags to include
-    # CF.A_II_1 (depreciation). The seed script is authoritative, but
-    # environments may not re-run the seed on deploy, so enforce it here.
-    # Idempotent across startups and covers NULL required_tags rows.
-    try:
-        conn.execute(
-            """
-            UPDATE feature_definitions
-            SET required_tags = %s::json
-            WHERE id = 'x1_maczynska'
-              AND (required_tags IS NULL
-                   OR required_tags::text NOT LIKE '%%CF.A_II_1%%')
-            """,
-            ['["RZiS.I", "CF.A_II_1", "Pasywa_B"]'],
-        )
-    except Exception:
-        pass  # feature_definitions not yet seeded — seed script will handle it
+    # CR2-OPS-004: ALTER TABLE + UPDATE backfills that used to run here now
+    # live in migrations/prediction/*.sql and are applied via
+    # `app.db.migrations.apply_pending()` after `_init_schema` completes. This
+    # file is responsible only for idempotent CREATE operations that are safe
+    # to re-run on every boot (tables, indexes, views).
     for idx_name, idx_sql in [
         ("idx_reports_schema", "CREATE INDEX idx_reports_schema ON financial_reports(schema_code)"),
         ("idx_line_items_schema", "CREATE INDEX idx_line_items_schema ON financial_line_items(schema_code)"),
@@ -752,6 +734,30 @@ def get_financial_report(report_id: str) -> Optional[dict]:
     return dict(zip(cols, row))
 
 
+def get_financial_reports_batch(report_ids: list[str]) -> dict[str, dict]:
+    """Fetch many financial reports in a single round-trip keyed by id.
+
+    CR-PZN-003: the per-report scoring loop previously issued one SELECT per
+    report (see callers of `get_financial_report`). This helper lets
+    `score_batch` load them in a single query.
+    """
+    if not report_ids:
+        return {}
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT id, logical_key, report_version, supersedes_report_id, krs, data_source_id,
+               report_type, fiscal_year, period_start, period_end,
+               ingestion_status, ingestion_error, source_document_id, schema_code
+        FROM financial_reports WHERE id = ANY(%s)
+    """, [list(report_ids)]).fetchall()
+    cols = [
+        "id", "logical_key", "report_version", "supersedes_report_id", "krs",
+        "data_source_id", "report_type", "fiscal_year", "period_start", "period_end",
+        "ingestion_status", "ingestion_error", "source_document_id", "schema_code",
+    ]
+    return {row[0]: dict(zip(cols, row)) for row in rows}
+
+
 def get_reports_for_krs(krs: str) -> list[dict]:
     conn = get_conn()
     rows = conn.execute("""
@@ -992,6 +998,41 @@ def get_computed_features_for_report(report_id: str, valid_only: bool = True) ->
     return [dict(zip(cols, row)) for row in rows]
 
 
+def get_computed_features_for_reports_batch(
+    report_ids: list[str],
+    valid_only: bool = True,
+) -> dict[str, list[dict]]:
+    """Fetch computed features for many reports in a single query.
+
+    CR-PZN-003: collapses the N+1 `get_computed_features_for_report` loop in
+    model `score_batch` paths. Returns a map `{report_id: [feature_row, ...]}`
+    with the same row shape as `get_computed_features_for_report`.
+    """
+    if not report_ids:
+        return {}
+    conn = get_conn()
+    base_sql = """
+        SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid,
+               error_message, source_extraction_version, computation_version
+        FROM latest_computed_features
+        WHERE report_id = ANY(%s)
+    """
+    if valid_only:
+        base_sql += " AND is_valid = true"
+    base_sql += " ORDER BY report_id, feature_definition_id"
+
+    rows = conn.execute(base_sql, [list(report_ids)]).fetchall()
+    cols = [
+        "report_id", "feature_definition_id", "krs", "fiscal_year", "value",
+        "is_valid", "error_message", "source_extraction_version", "computation_version",
+    ]
+    grouped: dict[str, list[dict]] = {rid: [] for rid in report_ids}
+    for row in rows:
+        rec = dict(zip(cols, row))
+        grouped.setdefault(rec["report_id"], []).append(rec)
+    return grouped
+
+
 def get_computed_features(krs: str, fiscal_year: Optional[int] = None) -> list[dict]:
     conn = get_conn()
     if fiscal_year is not None:
@@ -1119,6 +1160,47 @@ def insert_prediction(prediction_id: str, prediction_run_id: str, krs: str, repo
           json.dumps(feature_contributions) if feature_contributions else None,
           json.dumps(feature_snapshot) if feature_snapshot else None,
           now])
+
+
+def insert_predictions_batch(rows: list[dict]) -> int:
+    """Bulk-insert prediction rows.
+
+    CR-PZN-003: replaces the per-row `insert_prediction` loop in `score_batch`
+    with a single `executemany`. Each row dict must carry the same keys as
+    `insert_prediction`'s kwargs (prediction_id, prediction_run_id, krs,
+    report_id, raw_score, probability, classification, risk_category,
+    feature_contributions, feature_snapshot). Returns the count of rows queued
+    (not strictly the count inserted — rows conflicting on id are skipped).
+    """
+    if not rows:
+        return 0
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    payload = [
+        (
+            r["prediction_id"],
+            r["prediction_run_id"],
+            r["krs"],
+            r["report_id"],
+            r.get("raw_score"),
+            r.get("probability"),
+            r.get("classification"),
+            r.get("risk_category"),
+            json.dumps(r["feature_contributions"]) if r.get("feature_contributions") else None,
+            json.dumps(r["feature_snapshot"]) if r.get("feature_snapshot") else None,
+            now,
+        )
+        for r in rows
+    ]
+    with conn.raw.cursor() as cur:  # psycopg2 executemany is fine for moderate batches
+        cur.executemany("""
+            INSERT INTO predictions
+                (id, prediction_run_id, krs, report_id, raw_score, probability,
+                 classification, risk_category, feature_contributions, feature_snapshot, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+        """, payload)
+    return len(rows)
 
 
 def get_latest_prediction(krs: str) -> Optional[dict]:

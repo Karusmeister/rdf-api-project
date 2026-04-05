@@ -33,12 +33,26 @@ async def ingest(body: IngestRequest):
             result = await loop.run_in_executor(None, etl.ingest_all_pending)
         logger.info("etl_ingest_complete", extra={"event": "etl_ingest_complete", "result": result})
         return result
-    except ValueError as e:
-        logger.warning("etl_ingest_not_found", extra={"event": "etl_ingest_not_found", "error": str(e)})
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error("etl_ingest_error", extra={"event": "etl_ingest_error", "error": str(e)}, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError:
+        # CR2-SEC-002: ValueError here means "document not found / not ready".
+        # Return a stable, safe public message; keep the raw detail in logs.
+        logger.warning(
+            "etl_ingest_not_found",
+            extra={"event": "etl_ingest_not_found", "document_id": body.document_id},
+            exc_info=True,
+        )
+        raise HTTPException(status_code=404, detail="Document not found or not ready for ingestion")
+    except Exception:
+        # CR2-SEC-002: never surface the raw exception message to clients. The
+        # underlying exception can embed database schema, file paths, or stack
+        # context. Log the full exception server-side and return a stable
+        # error code that operators can correlate via logs.
+        logger.error(
+            "etl_ingest_error",
+            extra={"event": "etl_ingest_error", "document_id": body.document_id},
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="ETL ingestion failed")
 
 
 @router.get("/training/dataset-stats", summary="Training dataset statistics")
@@ -58,8 +72,19 @@ async def dataset_stats(
             ),
         )
         return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error("dataset_stats_error", extra={"event": "dataset_stats_error", "error": str(e)}, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError:
+        # CR2-SEC-002: the only ValueError callers can trigger here is "feature
+        # set not found". Log full context and return a safe public message.
+        logger.warning(
+            "dataset_stats_not_found",
+            extra={"event": "dataset_stats_not_found", "feature_set": feature_set},
+            exc_info=True,
+        )
+        raise HTTPException(status_code=404, detail="Feature set not found")
+    except Exception:
+        logger.error(
+            "dataset_stats_error",
+            extra={"event": "dataset_stats_error", "feature_set": feature_set},
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to build dataset stats")

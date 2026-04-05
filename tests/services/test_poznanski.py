@@ -8,7 +8,7 @@ from app.config import settings
 from app.db import connection as db_conn
 from app.db import prediction_db
 from app.scraper import db as scraper_db
-from app.services import feature_engine, poznanski
+from app.services import feature_engine, poznanski, predictions
 from scripts.seed_features import FEATURE_DEFINITIONS, FEATURE_SETS
 
 
@@ -52,6 +52,9 @@ def seeded_db(isolated_db):
         prediction_db.upsert_feature_set(set_id, info["name"], info.get("description"))
         for ordinal, member_id in enumerate(info["members"], start=1):
             prediction_db.add_feature_set_member(set_id, member_id, ordinal)
+    # CR-PZN-001: mirror production startup — register built-in models up front
+    # instead of relying on `score_batch` side effects.
+    predictions.register_builtin_models()
     return isolated_db
 
 
@@ -370,3 +373,77 @@ class TestScoreBatch:
 
         result2 = poznanski.score_batch(report_ids=None)
         assert result2["scored"] == 0
+
+
+# ---------------------------------------------------------------------------
+# CR3-REL-004: prediction run finalization on batch failure
+# ---------------------------------------------------------------------------
+
+
+class TestBatchFinalizationOnFailure:
+    """Same guarantees as Maczynska — a batch-level exception must not leave
+    the `prediction_runs` row stuck in `running`.
+    """
+
+    def test_bulk_read_failure_finalizes_run_as_failed(self, seeded_db, monkeypatch):
+        _create_report_with_tags("0000300900", "pzn-rel-rpt", _full_tagset())
+        feature_engine.compute_features_for_report(
+            "pzn-rel-rpt", feature_set_id="poznanski_4"
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated DB outage during bulk-load")
+
+        monkeypatch.setattr(
+            prediction_db, "get_computed_features_for_reports_batch", _boom
+        )
+
+        with pytest.raises(RuntimeError, match="simulated DB outage"):
+            poznanski.score_batch(["pzn-rel-rpt"])
+
+        conn = prediction_db.get_conn()
+        row = conn.execute(
+            """
+            SELECT status, error_message
+            FROM prediction_runs
+            WHERE model_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [poznanski.MODEL_ID],
+        ).fetchone()
+        assert row is not None
+        status, error_message = row
+        assert status == "failed", (
+            f"Run must be finalized as 'failed' after batch-level error, got {status!r}"
+        )
+        assert error_message and error_message.startswith("batch_error:")
+        assert "simulated DB outage" not in (error_message or "")
+
+    def test_bulk_insert_failure_finalizes_run_as_failed(self, seeded_db, monkeypatch):
+        _create_report_with_tags("0000300901", "pzn-rel-rpt-2", _full_tagset())
+        feature_engine.compute_features_for_report(
+            "pzn-rel-rpt-2", feature_set_id="poznanski_4"
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated DB outage during bulk-insert")
+
+        monkeypatch.setattr(prediction_db, "insert_predictions_batch", _boom)
+
+        with pytest.raises(RuntimeError, match="simulated DB outage"):
+            poznanski.score_batch(["pzn-rel-rpt-2"])
+
+        conn = prediction_db.get_conn()
+        row = conn.execute(
+            """
+            SELECT status
+            FROM prediction_runs
+            WHERE model_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [poznanski.MODEL_ID],
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "failed"

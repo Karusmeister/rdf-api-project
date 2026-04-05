@@ -13,6 +13,8 @@ import re
 from typing import Callable
 
 from app.db import prediction_db
+from app.services import maczynska as maczynska_module
+from app.services import poznanski as poznanski_module
 from app.services.maczynska import COEFFICIENTS as MACZYNSKA_COEFFICIENTS
 from app.services.maczynska import classify as maczynska_classify
 from app.services.poznanski import (
@@ -78,6 +80,97 @@ def invalidate_caches() -> None:
     global _feature_defs_cache, _models_cache
     _feature_defs_cache = None
     _models_cache = None
+
+
+# CR-PZN-001: Registration of built-in models MUST be deterministic and run at
+# startup — not as a side effect of calling `score_batch`. Otherwise a freshly
+# deployed model is invisible to `/api/predictions/models` (backed by
+# `_models_cache`) until someone triggers scoring AND flushes caches.
+_BUILTIN_MODEL_REGISTRARS: list[Callable[[], None]] = [
+    maczynska_module.ensure_model_registered,
+    poznanski_module.ensure_model_registered,
+]
+
+
+# CR2-REL-006: registration health state.
+#
+# `builtin_models_registration_ok` reflects whether every built-in registrar
+# ran cleanly on the most recent `register_builtin_models()` call. The health
+# endpoint reads it to surface a degraded signal when the catalog is
+# incomplete. `builtin_models_failed_registrars` gives operators the specific
+# modules that failed so they can triage without digging through logs.
+#
+# In non-local environments `register_builtin_models()` fails startup if ANY
+# registrar raises — the model catalog cannot silently ship partial. In local
+# dev we fall open so a broken migration in progress doesn't block iteration.
+_registration_state: dict[str, object] = {
+    "ok": True,
+    "failed": [],
+}
+
+
+def get_builtin_models_health() -> dict:
+    """Return a snapshot of the built-in model registration state.
+
+    Used by the `/health` endpoint (CR2-REL-006) and by tests to assert
+    degraded-mode behavior. The snapshot is a plain dict to avoid exposing
+    the mutable module-level state to callers.
+    """
+    return {
+        "ok": bool(_registration_state["ok"]),
+        "failed_registrars": list(_registration_state["failed"]),  # type: ignore[arg-type]
+    }
+
+
+def register_builtin_models() -> None:
+    """Register every built-in discriminant model in `model_registry`.
+
+    Idempotent (each `ensure_model_registered` uses UPSERT). Safe to call on
+    every startup. Invalidates the model cache so subsequent reads see the
+    freshly registered rows.
+
+    Failure policy (CR2-REL-006):
+      * In non-local environments (`settings.environment != "local"`), any
+        registrar raising an exception aborts startup with a
+        `RuntimeError`. The service must not accept traffic with a partial
+        model catalog in staging/production.
+      * In local dev the call degrades gracefully: failures are logged and
+        tracked in `_registration_state` so the health endpoint reports a
+        degraded signal, but the process continues booting. This keeps the
+        iteration loop fast when a new migration is in flight.
+    """
+    from app.config import settings  # local import avoids circular
+
+    failures: list[str] = []
+    for registrar in _BUILTIN_MODEL_REGISTRARS:
+        try:
+            registrar()
+        except Exception:
+            logger.error(
+                "builtin_model_registration_failed",
+                extra={
+                    "event": "builtin_model_registration_failed",
+                    "registrar": registrar.__module__,
+                },
+                exc_info=True,
+            )
+            failures.append(registrar.__module__)
+
+    _registration_state["ok"] = not failures
+    _registration_state["failed"] = failures
+
+    invalidate_caches()
+
+    if failures and settings.environment != "local":
+        # Fail-fast outside local dev — a partial model catalog in
+        # staging/production is unacceptable and the operator needs to see it
+        # immediately rather than via a subtle `/api/predictions/models` gap.
+        raise RuntimeError(
+            "CR2-REL-006: built-in model registration failed for "
+            f"{failures}; refusing to start in environment="
+            f"{settings.environment}. Fix the underlying registrar error "
+            "(usually a missing migration or feature definition) and redeploy."
+        )
 
 
 def warm_caches() -> None:
@@ -149,6 +242,24 @@ register_scorer("poznanski_2004_v1", score_poznanski)
 # ---------------------------------------------------------------------------
 # Response assembly
 # ---------------------------------------------------------------------------
+
+def _extract_warnings(feature_contributions: dict | None) -> list[str]:
+    """Extract stable warning codes from a persisted `feature_contributions` map.
+
+    Scorers (currently Poznanski) stash warning codes under the reserved
+    `_warnings` key inside the contributions JSON so they persist in the
+    `predictions` row without schema changes. The API exposes them as a
+    first-class `result.warnings` list (see `ResultDetail.warnings`), which
+    means the underscore-prefixed key stays an implementation detail of the
+    storage layer.
+    """
+    if not feature_contributions:
+        return []
+    raw = feature_contributions.get("_warnings")
+    if not isinstance(raw, list):
+        return []
+    return [str(w) for w in raw if isinstance(w, (str, int))]
+
 
 def _build_interpretation(model_id: str, risk_category: str | None) -> dict | None:
     interp = INTERPRETATION.get(model_id)
@@ -462,6 +573,7 @@ def get_predictions(krs: str) -> dict:
                 "probability": p["probability"],
                 "classification": p["classification"],
                 "risk_category": p["risk_category"],
+                "warnings": _extract_warnings(contributions),
             },
             "interpretation": _build_interpretation(p["model_id"], p["risk_category"]),
             "features": features,

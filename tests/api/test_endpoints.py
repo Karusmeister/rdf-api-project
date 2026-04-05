@@ -477,6 +477,242 @@ async def test_compare_sfzurt_net_profit_delta_is_null(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# jednostkainna-empty-statement-trees regression (backend_changes.json)
+# ---------------------------------------------------------------------------
+#
+# Before this fix, /api/analysis/compare returned `rzis` and `cash_flow` as
+# bare lists. The frontend typed them as `ComparisonNode | null` and had a
+# null-guard on `cash_flow`, but the list was truthy and didn't match the
+# contract, so empty statement sections rendered as a single-row stub table.
+#
+# New contract:
+#   * rzis / cash_flow are either a single ComparisonNode (synthetic root
+#     with the extracted top-level items as children) OR `None` when the
+#     section is empty / all null.
+# These tests cover both branches and guard against a silent regression to
+# the bare-list shape.
+
+
+@pytest.mark.asyncio
+async def test_compare_empty_rzis_and_cash_flow_return_null(client, monkeypatch):
+    """JednostkaInna filing with no RZiS or cash-flow data → both fields null.
+
+    Mocks a parsed statement whose `rzis` and `cash_flow` lists are empty
+    (the failure mode the bug report described). After the fix, the
+    comparison response must expose them as JSON `null` so the frontend
+    null-guard fires and renders the "unavailable" message instead of a
+    stub table.
+    """
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    empty_stmt = {
+        "company": {
+            "name": "JednostkaInna Test",
+            "krs": "0000694720",
+            "nip": "1234567890",
+            "pkd": "6810Z",
+            "period_start": "2024-01-01",
+            "period_end": "2024-12-31",
+            "date_prepared": "2025-03-01",
+            "schema_type": "JednostkaInna",
+            "schema_code": "SFJINZ",
+            "rzis_variant": None,
+            "cf_method": None,
+        },
+        "bilans": {"aktywa": None, "pasywa": None},
+        "rzis": [],        # ← empty income statement
+        "cash_flow": [],   # ← empty cash flow
+        "extras": {},
+    }
+    prev_stmt = {
+        **empty_stmt,
+        "company": {**empty_stmt["company"], "period_end": "2023-12-31", "period_start": "2023-01-01"},
+    }
+
+    search_two = {
+        "content": [
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2024", "okresSprawozdawczyKoniec": "2024-12-31"},
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2023", "okresSprawozdawczyKoniec": "2023-12-31",
+             "okresSprawozdawczyPoczatek": "2023-01-01"},
+        ],
+        "metadaneWynikow": {**_SEARCH_PAGE["metadaneWynikow"], "calkowitaLiczbaObiektow": 2},
+    }
+
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(search_two))
+    monkeypatch.setattr(rdf_client, "metadata", lambda doc_id: _async(_META))
+    monkeypatch.setattr(rdf_client, "download", lambda doc_ids: _async(b"fake"))
+    monkeypatch.setattr(xml_parser, "extract_xml_from_zip", lambda b: "<fake/>")
+
+    call_count = {"n": 0}
+    def fake_parse(s):
+        call_count["n"] += 1
+        return empty_stmt if call_count["n"] % 2 == 1 else prev_stmt
+    monkeypatch.setattr(xml_parser, "parse_statement", fake_parse)
+
+    resp = await client.post(
+        "/api/analysis/compare",
+        json={"krs": "694720", "period_end_current": "2024-12-31", "period_end_previous": "2023-12-31"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # Core fix: both fields must be JSON null, NOT a bare list, NOT a
+    # stub root with empty children.
+    assert body["rzis"] is None, (
+        f"Empty rzis section must collapse to null, got {body['rzis']!r}"
+    )
+    assert body["cash_flow"] is None, (
+        f"Empty cash_flow section must collapse to null, got {body['cash_flow']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compare_populated_rzis_and_cash_flow_return_single_tree(client, monkeypatch):
+    """Populated statement → rzis/cash_flow are single ComparisonNode trees.
+
+    Guards the positive path: when the underlying parsed statement actually
+    has RZiS or cash-flow items, the endpoint must wrap them under a single
+    synthetic root (not a bare list), with the extracted top-level items as
+    children. This matches the frontend `ComparisonNode | null` contract.
+    """
+    from app import rdf_client
+    from app.services import xml_parser
+
+    xml_parser._cache.clear()
+
+    rzis_node = {
+        "tag": "RZiS.A", "label": "Przychody",
+        "kwota_a": 100000.0, "kwota_b": 90000.0, "kwota_b1": None,
+        "depth": 0, "is_w_tym": False, "children": [],
+    }
+    cf_node = {
+        "tag": "CF.D", "label": "Przepływ netto",
+        "kwota_a": 5000.0, "kwota_b": 4000.0, "kwota_b1": None,
+        "depth": 0, "is_w_tym": False, "children": [],
+    }
+    curr_stmt = {
+        "company": {
+            "name": "Pop Test Co", "krs": "0000694720", "nip": "1234567890",
+            "pkd": "62.01.Z", "period_start": "2024-01-01", "period_end": "2024-12-31",
+            "date_prepared": "2025-03-01", "schema_type": "JednostkaInna",
+            "schema_code": "SFJINZ", "rzis_variant": "porownawczy", "cf_method": "posrednia",
+        },
+        "bilans": {"aktywa": None, "pasywa": None},
+        "rzis": [rzis_node],
+        "cash_flow": [cf_node],
+        "extras": {},
+    }
+    prev_stmt = {
+        **curr_stmt,
+        "company": {**curr_stmt["company"], "period_end": "2023-12-31", "period_start": "2023-01-01"},
+        "rzis": [{**rzis_node, "kwota_a": 90000.0}],
+        "cash_flow": [{**cf_node, "kwota_a": 4000.0}],
+    }
+
+    search_two = {
+        "content": [
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2024", "okresSprawozdawczyKoniec": "2024-12-31"},
+            {**_SEARCH_PAGE["content"][0], "id": "doc-2023", "okresSprawozdawczyKoniec": "2023-12-31",
+             "okresSprawozdawczyPoczatek": "2023-01-01"},
+        ],
+        "metadaneWynikow": {**_SEARCH_PAGE["metadaneWynikow"], "calkowitaLiczbaObiektow": 2},
+    }
+    monkeypatch.setattr(rdf_client, "wyszukiwanie", lambda *a, **kw: _async(search_two))
+    monkeypatch.setattr(rdf_client, "metadata", lambda doc_id: _async(_META))
+    monkeypatch.setattr(rdf_client, "download", lambda doc_ids: _async(b"fake"))
+    monkeypatch.setattr(xml_parser, "extract_xml_from_zip", lambda b: "<fake/>")
+
+    call_count = {"n": 0}
+    def fake_parse(s):
+        call_count["n"] += 1
+        return curr_stmt if call_count["n"] % 2 == 1 else prev_stmt
+    monkeypatch.setattr(xml_parser, "parse_statement", fake_parse)
+
+    resp = await client.post(
+        "/api/analysis/compare",
+        json={"krs": "694720", "period_end_current": "2024-12-31", "period_end_previous": "2023-12-31"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # --- rzis contract ---
+    rzis = body["rzis"]
+    assert isinstance(rzis, dict), (
+        "rzis must be a single ComparisonNode, not a bare list (the frontend "
+        "contract is ComparisonNode | null)"
+    )
+    assert rzis["tag"] == "RZiS"
+    assert rzis["current"] is None
+    assert rzis["previous"] is None
+    assert isinstance(rzis["children"], list)
+    assert len(rzis["children"]) == 1
+    assert rzis["children"][0]["tag"] == "RZiS.A"
+    assert rzis["children"][0]["current"] == 100000.0
+    assert rzis["children"][0]["previous"] == 90000.0
+
+    # --- cash_flow contract ---
+    cf = body["cash_flow"]
+    assert isinstance(cf, dict)
+    assert cf["tag"] == "CF"
+    assert cf["current"] is None
+    assert len(cf["children"]) == 1
+    assert cf["children"][0]["tag"] == "CF.D"
+    assert cf["children"][0]["current"] == 5000.0
+
+
+def test_build_comparison_empty_tree_helper_detects_null_descendants():
+    """Unit coverage for `_is_empty_comparison_tree`.
+
+    A synthesized root whose children all carry null `current` and
+    `previous` values (e.g. because the source XML had no matching tags) is
+    indistinguishable from a root with no children at all from the
+    frontend's perspective. Both must be classified as empty so
+    `build_comparison` collapses them to `None`.
+    """
+    from app.services.xml_parser import _is_empty_comparison_tree
+
+    # Case 1: None itself.
+    assert _is_empty_comparison_tree(None) is True
+
+    # Case 2: root with no children and null values.
+    assert _is_empty_comparison_tree({
+        "tag": "RZiS", "label": "…",
+        "current": None, "previous": None,
+        "children": [],
+    }) is True
+
+    # Case 3: root with children, all descendants null.
+    assert _is_empty_comparison_tree({
+        "tag": "RZiS", "label": "…",
+        "current": None, "previous": None,
+        "children": [
+            {"tag": "RZiS.A", "label": "…", "current": None, "previous": None, "children": []},
+            {"tag": "RZiS.B", "label": "…", "current": None, "previous": None, "children": [
+                {"tag": "RZiS.B1", "label": "…", "current": None, "previous": None, "children": []},
+            ]},
+        ],
+    }) is True
+
+    # Case 4: ANY non-null descendant → NOT empty.
+    assert _is_empty_comparison_tree({
+        "tag": "RZiS", "label": "…",
+        "current": None, "previous": None,
+        "children": [
+            {"tag": "RZiS.A", "label": "…", "current": 100.0, "previous": None, "children": []},
+        ],
+    }) is False
+
+    # Case 5: root itself has a current value → NOT empty.
+    assert _is_empty_comparison_tree({
+        "tag": "RZiS", "label": "…",
+        "current": 42.0, "previous": None,
+        "children": [],
+    }) is False
+
+
+# ---------------------------------------------------------------------------
 # Time-series with extras tags (FS-003 regression)
 # ---------------------------------------------------------------------------
 

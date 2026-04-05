@@ -65,17 +65,12 @@ def classify(z_score: float) -> tuple[int, str]:
         return (0, "low")
 
 
-def score_report(report_id: str) -> Optional[dict]:
-    """Score a single report using the Maczynska discriminant function.
+def _score_from_feature_rows(report_id: str, features: list[dict]) -> Optional[dict]:
+    """Pure scoring path that takes pre-loaded feature rows.
 
-    Returns dict with raw_score, classification, risk_category, feature_contributions,
-    feature_snapshot, or None if required features are missing.
-
-    feature_snapshot captures the exact (feature_definition_id -> computation_version)
-    that fed the score, so downstream reads can fetch the immutable snapshot instead
-    of inferring it from timestamps.
+    Factored out so `score_batch` can drive it from a single bulk query instead
+    of one `get_computed_features_for_report` call per report (CR-PZN-003).
     """
-    features = prediction_db.get_computed_features_for_report(report_id, valid_only=True)
     feature_map = {f["feature_definition_id"]: f["value"] for f in features}
     version_map = {f["feature_definition_id"]: f["computation_version"] for f in features}
 
@@ -113,16 +108,49 @@ def score_report(report_id: str) -> Optional[dict]:
     }
 
 
+def score_report(report_id: str) -> Optional[dict]:
+    """Score a single report using the Maczynska discriminant function.
+
+    Returns dict with raw_score, classification, risk_category, feature_contributions,
+    feature_snapshot, or None if required features are missing.
+
+    feature_snapshot captures the exact (feature_definition_id -> computation_version)
+    that fed the score, so downstream reads can fetch the immutable snapshot instead
+    of inferring it from timestamps.
+    """
+    features = prediction_db.get_computed_features_for_report(report_id, valid_only=True)
+    return _score_from_feature_rows(report_id, features)
+
+
 def score_batch(report_ids: Optional[list[str]] = None) -> dict:
     """Score multiple reports and write results to predictions.
 
     If report_ids is None, finds reports with computed Maczynska features
     but no existing prediction for this model.
-    """
-    ensure_model_registered()
 
+    Note: the model is registered at application startup
+    (`predictions_service.register_builtin_models`), so this path does not
+    register as a side effect. Registration is idempotent so callers running
+    outside an app context (scripts, tests) can still call
+    `ensure_model_registered()` explicitly.
+    """
     if report_ids is None:
         report_ids = _find_unscored_reports()
+
+    # CR-PZN-003: short-circuit on empty input so we don't create a "ran, did
+    # nothing" row in prediction_runs.
+    if not report_ids:
+        logger.info(
+            "maczynska_batch_noop",
+            extra={"event": "maczynska_batch_noop", "model_id": MODEL_ID},
+        )
+        return {
+            "run_id": None,
+            "scored": 0,
+            "skipped": 0,
+            "errors": 0,
+            "duration_seconds": 0.0,
+        }
 
     run_id = str(uuid.uuid4())
     prediction_db.create_prediction_run(run_id, MODEL_ID)
@@ -130,53 +158,125 @@ def score_batch(report_ids: Optional[list[str]] = None) -> dict:
     start = time.monotonic()
     scored = 0
     skipped = 0
-    errors = []
+    error_counts: dict[str, int] = {}
 
-    for report_id in report_ids:
+    # CR3-REL-004: wrap the entire bulk-load / scoring / bulk-insert sequence
+    # in an outer try/except so a failure in any pre-loop step (DB outage in
+    # `get_computed_features_for_reports_batch`, `get_financial_reports_batch`,
+    # or `insert_predictions_batch`) still transitions the `prediction_runs`
+    # row out of `running` status. Previously a failure before the explicit
+    # `finish_prediction_run` call could strand the run forever and mask the
+    # outage in the dashboard.
+    batch_level_error: str | None = None
+    try:
+        # CR-PZN-003: bulk-load inputs in two queries instead of 2*N.
+        features_by_report = prediction_db.get_computed_features_for_reports_batch(
+            report_ids, valid_only=True
+        )
+        reports_by_id = prediction_db.get_financial_reports_batch(report_ids)
+
+        prediction_rows: list[dict] = []
+        for report_id in report_ids:
+            try:
+                report = reports_by_id.get(report_id)
+                if report is None:
+                    skipped += 1
+                    continue
+
+                result = _score_from_feature_rows(
+                    report_id, features_by_report.get(report_id, [])
+                )
+                if result is None:
+                    skipped += 1
+                    continue
+
+                prediction_rows.append({
+                    "prediction_id": str(uuid.uuid4()),
+                    "prediction_run_id": run_id,
+                    "krs": report["krs"],
+                    "report_id": report_id,
+                    "raw_score": result["raw_score"],
+                    "probability": None,
+                    "classification": result["classification"],
+                    "risk_category": result["risk_category"],
+                    "feature_contributions": result["feature_contributions"],
+                    "feature_snapshot": result.get("feature_snapshot"),
+                })
+                scored += 1
+
+            except Exception as e:
+                skipped += 1
+                # CR-PZN-004: never persist raw exception text; aggregate by stable
+                # error code and log full details with access controls.
+                code = type(e).__name__
+                error_counts[code] = error_counts.get(code, 0) + 1
+                logger.error(
+                    "maczynska_score_error",
+                    extra={
+                        "event": "maczynska_score_error",
+                        "model_id": MODEL_ID,
+                        "run_id": run_id,
+                        "report_id": report_id,
+                        "error_code": code,
+                    },
+                    exc_info=True,
+                )
+
+        if prediction_rows:
+            prediction_db.insert_predictions_batch(prediction_rows)
+
+    except Exception as e:
+        # CR3-REL-004: surface a batch-level failure in the run's error_message
+        # and re-raise after the finally block finalizes the row. We don't
+        # swallow the exception because callers (scripts, scheduled jobs)
+        # legitimately need to see it.
+        batch_level_error = f"batch_error:{type(e).__name__}"
+        logger.error(
+            "maczynska_batch_error",
+            extra={
+                "event": "maczynska_batch_error",
+                "model_id": MODEL_ID,
+                "run_id": run_id,
+                "error_code": type(e).__name__,
+            },
+            exc_info=True,
+        )
+        raise
+    finally:
+        duration = round(time.monotonic() - start, 3)
+        if batch_level_error is not None:
+            status = "failed"
+            error_summary = batch_level_error[:500]
+        elif error_counts:
+            status = "completed_with_errors"
+            error_summary = ",".join(
+                f"{code}:{count}" for code, count in sorted(error_counts.items())
+            )[:500]
+        else:
+            status = "completed"
+            error_summary = None
+
+        # CR3-REL-004: finalization in `finally` guarantees the run row is
+        # never left stuck in `running`, even if the bulk-load/insert raised.
         try:
-            result = score_report(report_id)
-            if result is None:
-                skipped += 1
-                continue
-
-            report = prediction_db.get_financial_report(report_id)
-            if report is None:
-                skipped += 1
-                continue
-
-            prediction_db.insert_prediction(
-                prediction_id=str(uuid.uuid4()),
-                prediction_run_id=run_id,
-                krs=report["krs"],
-                report_id=report_id,
-                raw_score=result["raw_score"],
-                probability=None,
-                classification=result["classification"],
-                risk_category=result["risk_category"],
-                feature_contributions=result["feature_contributions"],
-                feature_snapshot=result.get("feature_snapshot"),
+            prediction_db.finish_prediction_run(
+                run_id=run_id,
+                status=status,
+                companies_scored=scored,
+                duration_seconds=duration,
+                error_message=error_summary,
             )
-            scored += 1
-
-        except Exception as e:
-            skipped += 1
-            errors.append({"report_id": report_id, "error": str(e)})
+        except Exception:
             logger.error(
-                "maczynska_score_error",
-                extra={"event": "maczynska_score_error", "report_id": report_id, "error": str(e)},
+                "maczynska_finalize_failed",
+                extra={
+                    "event": "maczynska_finalize_failed",
+                    "model_id": MODEL_ID,
+                    "run_id": run_id,
+                },
                 exc_info=True,
             )
-
-    duration = round(time.monotonic() - start, 3)
-    status = "completed" if not errors else "completed_with_errors"
-
-    prediction_db.finish_prediction_run(
-        run_id=run_id,
-        status=status,
-        companies_scored=scored,
-        duration_seconds=duration,
-        error_message="; ".join(e["error"] for e in errors)[:500] if errors else None,
-    )
+            # Don't mask the original exception (if any) by raising from here.
 
     logger.info(
         "maczynska_batch_completed",
@@ -185,7 +285,7 @@ def score_batch(report_ids: Optional[list[str]] = None) -> dict:
             "run_id": run_id,
             "scored": scored,
             "skipped": skipped,
-            "errors": len(errors),
+            "errors": sum(error_counts.values()),
             "duration": duration,
         },
     )
@@ -194,7 +294,7 @@ def score_batch(report_ids: Optional[list[str]] = None) -> dict:
         "run_id": run_id,
         "scored": scored,
         "skipped": skipped,
-        "errors": len(errors),
+        "errors": sum(error_counts.values()),
         "duration_seconds": duration,
     }
 
