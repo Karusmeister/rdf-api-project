@@ -11,6 +11,15 @@ class SourceTag(BaseModel):
     value_current: float | None = Field(default=None, description="Value for the current reporting period")
     value_previous: float | None = Field(default=None, description="Value for the previous reporting period")
     section: str | None = Field(default=None, description="Statement section: Bilans, RZiS, or CF")
+    higher_is_better: bool | None = Field(
+        default=None,
+        description=(
+            "Semantic direction of the tag: true if higher values indicate better "
+            "financial health, false if higher values are a negative signal, null "
+            "if the tag is neutral or the backend has no opinion. The frontend uses "
+            "this to color year-over-year change indicators."
+        ),
+    )
 
 
 class FeatureDetail(BaseModel):

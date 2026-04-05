@@ -153,6 +153,58 @@ def _infer_section_from_tag(tag_path: str) -> str:
     return "Bilans"
 
 
+# BE-PRED-010: semantic direction per source tag.
+#
+# Explicit, per-tag registry at full-tag-path granularity (no prefix
+# inheritance). Adding a new entry is a deliberate domain decision — every row
+# has been reviewed against the canonical Polish financial-statement taxonomy
+# and tracks "does a higher value indicate better financial health?". Tags
+# outside this registry resolve to `None` and the frontend renders them with
+# neutral coloring; we do NOT guess for unknowns because prefix-based rules
+# can silently miscolor siblings that happen to carry opposite business
+# meaning (e.g. a `Pasywa_B_*` bucket where one child is equity-like).
+#
+# Scope: covers every tag used by the Mączyńska model's features
+# (x1..x6 → RZiS.I, RZiS.A, CF.A_II_1, Pasywa_B, Aktywa, Aktywa_B_I) plus the
+# nearest-neighbor tags the frontend exposes in the expanded detail panel.
+# Extend deliberately and paired with a test in
+# tests/services/test_predictions_service.py.
+_TAG_SEMANTIC_REGISTRY: dict[str, bool] = {
+    # --- Profit & loss statement (RZiS) — higher is generally better. ---
+    "RZiS.A": True,    # Przychody netto ze sprzedaży (net revenue)
+    "RZiS.C": True,    # Zysk brutto ze sprzedaży (gross profit on sales)
+    "RZiS.F": True,    # Zysk z działalności operacyjnej (operating profit)
+    "RZiS.I": True,    # Zysk brutto (pre-tax profit)
+    "RZiS.L": True,    # Zysk netto (net profit)
+    # --- Cash flow statement (CF) — operating cash + depreciation. ---
+    "CF.A_II_1": True,  # Amortyzacja (depreciation add-back in CF)
+    # --- Balance sheet: equity (Pasywa_A) — higher is better. ---
+    "Pasywa_A": True,   # Kapitał (fundusz) własny (equity)
+    # --- Balance sheet: liabilities (Pasywa_B) — higher is worse. ---
+    "Pasywa_B": False,  # Zobowiązania i rezerwy na zobowiązania (total liabilities)
+    # --- Balance sheet: current inventory (Aktywa_B_I) — bloating is negative. ---
+    "Aktywa_B_I": False,  # Zapasy (inventories)
+    # --- Neutral tags: intentionally omitted (resolve to None). ---
+    # "Aktywa"       — size proxy, neither good nor bad alone.
+    # "Aktywa_B_II"  — short-term receivables: direction is context-dependent.
+    # "Aktywa_B_III" — cash & short-term investments: context-dependent.
+    # "Aktywa_A"     — fixed assets: neutral.
+    # "Pasywa_B_III" — short-term liabilities: already covered by Pasywa_B when exposed.
+}
+
+
+def _resolve_higher_is_better(tag_path: str) -> bool | None:
+    """Look up the semantic direction of a tag.
+
+    Returns True if higher values indicate better financial health, False if
+    higher values are a negative signal, None if the tag is not in the
+    registry (neutral — frontend colors it muted). Matching is exact on the
+    full `tag_path` by design — see `_TAG_SEMANTIC_REGISTRY` docstring for
+    rationale.
+    """
+    return _TAG_SEMANTIC_REGISTRY.get(tag_path)
+
+
 def _resolve_tag_label(tag_path: str, schema_code: str | None) -> str | None:
     schema = SCHEMA_REGISTRY.get(schema_code or "SFJINZ")
     labels = schema["tag_labels"] if schema else {}
@@ -230,6 +282,7 @@ def _assemble_features(
                 "value_current": si.get("value_current"),
                 "value_previous": si.get("value_previous"),
                 "section": si.get("section") or _infer_section_from_tag(tp),
+                "higher_is_better": _resolve_higher_is_better(tp),
             })
 
         contribution = None

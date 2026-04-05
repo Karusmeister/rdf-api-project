@@ -368,6 +368,13 @@ curl 'http://localhost:8000/api/predictions/0000694720/history?model_id=maczynsk
   -H 'Authorization: Bearer <token>'
 ```
 
+#### Response shape notes
+
+- `predictions[]` contains **one `PredictionDetail` per `(model_id, fiscal_year)`**. Every entry carries its own `features[]`, `data_source.fiscal_year`, `data_source.period_start/end`, and `scored_at` — historical years render the full per-year calculation view, not a summary fallback. Rescored years are deduped: the most recent scoring wins.
+- `history[]` is returned for backwards compatibility with clients that index scores for timeline charting. It is a strict subset of `predictions[]` and can be ignored by new consumers.
+- `features[].source_tags[]` lists every line item referenced by the feature's `formula_description`, including `value_current`, `value_previous` (raw prior-year value from the same `(data_source_id, report_type)`), `label_pl`, and `section`.
+- **Additive field (2026-04):** `SourceTag.higher_is_better: bool | null` — semantic direction of the tag, sourced from an explicit per-tag registry in `app/services/predictions.py`. `true` = higher values indicate better financial health, `false` = higher values are a negative signal, `null` (default) = the backend has no opinion. Registry currently covers the Mączyńska feature tags (`RZiS.A/C/F/I/L`, `CF.A_II_1`, `Pasywa_A/B`, `Aktywa_B_I`); other tags fall through to `null`. Clients treating the response as strict should mark this field optional.
+
 ## Bulk Scraping Workflow
 
 The scraper is CLI-driven. Typical flow:
