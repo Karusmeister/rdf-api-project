@@ -270,6 +270,9 @@ CREATE TABLE IF NOT EXISTS predictions (
     classification  SMALLINT,                         -- 0 = healthy, 1 = high risk
     risk_category   VARCHAR(20),                      -- 'low', 'medium', 'high', 'critical'
     feature_contributions JSON,                       -- SHAP values or similar
+    feature_snapshot JSON,                            -- {feature_id: computation_version} map captured at scoring time
+                                                      -- Immutable reference used by the API read path to fetch the exact
+                                                      -- feature values that fed this score. Added via ALTER TABLE migration.
     created_at      TIMESTAMP DEFAULT current_timestamp
 );
 

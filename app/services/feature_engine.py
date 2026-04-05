@@ -72,6 +72,40 @@ def _x1_maczynska(
     return (gross_profit + dep) / liabilities
 
 
+@register_custom("x2_poznanski")
+def _x2_poznanski(
+    values: dict[str, Optional[float]], fdef: dict
+) -> Optional[float]:
+    """(Current assets - Inventory) / Short-term liabilities (quick ratio)."""
+    current_assets = values.get("Aktywa_B")
+    inventory = values.get("Aktywa_B_I")
+    st_liabilities = values.get("Pasywa_B_III")
+    if current_assets is None or st_liabilities is None or st_liabilities == 0:
+        return None
+    inv = inventory or 0.0
+    return (current_assets - inv) / st_liabilities
+
+
+@register_custom("x3_poznanski")
+def _x3_poznanski(
+    values: dict[str, Optional[float]], fdef: dict
+) -> Optional[float]:
+    """(Equity + Long-term liabilities) / Total assets.
+
+    Equity             = Pasywa_A  (Kapital wlasny)
+    Long-term liab.    = Pasywa_B_II  (Zobowiazania dlugoterminowe)
+    Total assets       = Aktywa
+    """
+    equity = values.get("Pasywa_A")
+    lt_liabilities = values.get("Pasywa_B_II")
+    total_assets = values.get("Aktywa")
+    if equity is None or total_assets is None or total_assets == 0:
+        return None
+    # Long-term liabilities may legitimately be absent/zero
+    lt = lt_liabilities or 0.0
+    return (equity + lt) / total_assets
+
+
 @register_custom("log_revenue")
 def _log_revenue(values: dict[str, Optional[float]], fdef: dict) -> Optional[float]:
     """ln(Revenue)."""

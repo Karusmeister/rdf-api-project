@@ -1,0 +1,130 @@
+{
+  "review_date": "2026-04-05",
+  "type": "third_pass_delta",
+  "focus": [
+    "security",
+    "scalability",
+    "database reliability",
+    "regression coverage"
+  ],
+  "tasks": [
+    {
+      "id": "CR3-AUTH-004",
+      "priority": "P1",
+      "category": "security-scalability",
+      "title": "Move login lockout state to a shared backend (Redis) instead of in-process memory",
+      "problem": "Lockout counters are still process-local. In multi-worker or multi-pod deployments, attackers can bypass lockout by spraying requests across instances, and all lockout state is lost on restart.",
+      "evidence": [
+        {
+          "file": "app/auth_lockout.py",
+          "line": 56,
+          "note": "Only in-memory `InMemoryLockoutStore` implementation exists."
+        },
+        {
+          "file": "app/auth_lockout.py",
+          "line": 197,
+          "note": "Module-level singletons use in-process stores (`account_lockout_store`, `ip_lockout_store`)."
+        },
+        {
+          "file": "app/routers/auth/routes.py",
+          "line": 73,
+          "note": "Login cooldown checks read directly from those in-process stores."
+        }
+      ],
+      "actions": [
+        "Implement a Redis-backed `LockoutStore` (sliding-window counters + TTL lock key), selectable via config.",
+        "Keep `InMemoryLockoutStore` for local/test mode only.",
+        "Add integration tests proving lockout consistency across two app instances sharing Redis and persistence across process restart."
+      ],
+      "acceptance_criteria": [
+        "Lockout behavior is identical regardless of which app worker handles each request.",
+        "Restarting a worker does not immediately clear active lockouts.",
+        "Local/test mode still runs without Redis."
+      ]
+    },
+    {
+      "id": "CR3-SEC-005",
+      "priority": "P1",
+      "category": "security",
+      "title": "Remove account-state enumeration signals from `/api/auth/login`",
+      "problem": "`/login` returns distinguishable responses for invalid credentials vs. Google-only account vs. unverified/deactivated account. This leaks account existence and account type to unauthenticated callers.",
+      "evidence": [
+        {
+          "file": "app/routers/auth/routes.py",
+          "line": 400,
+          "note": "Unknown user returns `401 Invalid email or password`."
+        },
+        {
+          "file": "app/routers/auth/routes.py",
+          "line": 404,
+          "note": "Google-auth account returns `400 This account uses Google sign-in`."
+        },
+        {
+          "file": "app/routers/auth/routes.py",
+          "line": 411,
+          "note": "Unverified/deactivated paths return distinct 403 responses."
+        }
+      ],
+      "actions": [
+        "Normalize externally visible failure response for all credential/account-state failures to a single 401 message.",
+        "Log internal reason codes server-side for support/debugging (`bad_password`, `google_only`, `unverified`, `inactive`).",
+        "Add regression tests asserting response-body/status equivalence across all failed-login variants."
+      ],
+      "acceptance_criteria": [
+        "Unauthenticated callers cannot infer whether an email exists, is Google-only, unverified, or deactivated from login responses.",
+        "Operational logs still preserve enough reason detail for incident triage."
+      ]
+    },
+    {
+      "id": "CR3-DB-006",
+      "priority": "P2",
+      "category": "database-reliability",
+      "title": "Serialize startup migrations with a PostgreSQL advisory lock",
+      "problem": "Every app instance runs `apply_pending()` during startup, but migration execution is not guarded by a cross-process lock. Concurrent startups can race on DDL and produce avoidable startup failures.",
+      "evidence": [
+        {
+          "file": "app/main.py",
+          "line": 56,
+          "note": "Migrations are run in app lifespan at startup for every instance."
+        },
+        {
+          "file": "app/db/migrations.py",
+          "line": 219,
+          "note": "`apply_pending` has no advisory lock / inter-process serialization."
+        }
+      ],
+      "actions": [
+        "Wrap migration execution in `pg_advisory_lock` (or `pg_try_advisory_lock` with timeout + clear error).",
+        "Hold the lock for the full validation+apply phase and release in `finally`.",
+        "Add a concurrency regression test with two connections attempting migration apply in parallel."
+      ],
+      "acceptance_criteria": [
+        "Parallel app startups no longer race each other while applying migrations.",
+        "If lock acquisition times out, startup fails with a deterministic operator-facing error."
+      ]
+    },
+    {
+      "id": "CR3-SCALE-007",
+      "priority": "P3",
+      "category": "scalability",
+      "title": "Optimize prediction bulk insert path for large scoring batches",
+      "problem": "`insert_predictions_batch` uses `cursor.executemany` on an autocommit connection, which scales poorly for large batches because it executes many individual INSERT statements.",
+      "evidence": [
+        {
+          "file": "app/db/prediction_db.py",
+          "line": 1195,
+          "note": "Batch insert currently uses `executemany` with one-row VALUES template."
+        }
+      ],
+      "actions": [
+        "Switch to `psycopg2.extras.execute_values` (paged multi-row insert) and explicit transaction for the batch.",
+        "Keep `ON CONFLICT` semantics identical.",
+        "Add a performance regression benchmark test (or scripted check) for 1k+ prediction rows."
+      ],
+      "acceptance_criteria": [
+        "Large scoring batches complete with materially lower DB round-trip overhead.",
+        "No behavior change in conflict handling or persisted payload shape."
+      ]
+    }
+  ]
+}

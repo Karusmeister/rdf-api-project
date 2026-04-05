@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.db.connection import ConnectionWrapper
+from pipeline.catalog import ensure_builtin_catalog
 from pipeline.db import DualConns, open_dual_connections
 from pipeline.etl_batch import ingest_batch
 from pipeline.feature_compute import compute_features_for_reports
@@ -73,6 +74,17 @@ def run_pipeline(
 
     with open_dual_connections() as conns:
         _ensure_schema(conns.pipeline)
+        # Ensure the pipeline DB has every feature definition, feature set,
+        # and built-in model registered before we try to compute features or
+        # score. Idempotent — safe to run every execution.
+        try:
+            ensure_builtin_catalog(conns.pipeline)
+        except Exception:
+            logger.error(
+                "pipeline_catalog_bootstrap_failed",
+                extra={"event": "pipeline_catalog_bootstrap_failed"},
+                exc_info=True,
+            )
 
         run_id = create_pipeline_run(conns.pipeline, trigger)
         metrics = PipelineMetrics(run_id=run_id)

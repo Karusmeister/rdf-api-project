@@ -130,19 +130,37 @@ def _upsert_company(pipeline_conn: ConnectionWrapper, krs: str, company: dict) -
     )
 
 
+class InvalidPeriodEnd(Exception):
+    """Raised when the parsed XML lacks a usable period_end date."""
+
+
 def _upsert_report(
     pipeline_conn: ConnectionWrapper,
     report_id: str,
     krs: str,
     parsed: dict,
 ) -> int:
+    """Insert / update the financial_reports row. Mirrors app/services/etl.py's
+    validation on main: period_end MUST be present and parseable — otherwise
+    we raise InvalidPeriodEnd so the caller marks the document failed instead
+    of silently writing a 1970-01-01 stub. period_start falls back to
+    period_end when missing (also matches main)."""
     company = parsed["company"]
-    period_start = company.get("period_start") or "1970-01-01"
-    period_end = company.get("period_end") or "1970-01-01"
+    period_start = company.get("period_start")
+    period_end = company.get("period_end")
+
+    if not period_end:
+        raise InvalidPeriodEnd("period_end is missing from parsed XML")
+
     try:
         fiscal_year = int(period_end[:4])
-    except Exception:
-        fiscal_year = 0
+        if fiscal_year < 1900 or fiscal_year > 2999:
+            raise ValueError(f"fiscal_year out of range: {fiscal_year}")
+    except Exception as exc:
+        raise InvalidPeriodEnd(f"could not parse fiscal_year from {period_end!r}: {exc}")
+
+    if not period_start:
+        period_start = period_end
     schema_code = company.get("schema_code", "SFJINZ")
 
     logical_key = _build_logical_key(krs, "KRS", "annual", fiscal_year, period_end)
@@ -231,7 +249,24 @@ def ingest_batch(
 
             report_id = document_id
             _upsert_company(pipeline_conn, effective_krs, parsed["company"])
-            _upsert_report(pipeline_conn, report_id, effective_krs, parsed)
+            try:
+                _upsert_report(pipeline_conn, report_id, effective_krs, parsed)
+            except InvalidPeriodEnd as exc:
+                result.docs_failed += 1
+                result.errors.append({
+                    "document_id": document_id,
+                    "error": "invalid_period_end",
+                    "detail": str(exc),
+                })
+                logger.warning(
+                    "pipeline_etl_invalid_period_end",
+                    extra={
+                        "event": "pipeline_etl_invalid_period_end",
+                        "document_id": document_id,
+                        "detail": str(exc),
+                    },
+                )
+                continue
 
             schema_code = parsed["company"].get("schema_code", "SFJINZ")
             bilans = parsed.get("bilans", {})

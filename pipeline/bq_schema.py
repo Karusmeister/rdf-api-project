@@ -49,6 +49,10 @@ PREDICTIONS = [
     _sf("probability", "FLOAT64"),
     _sf("classification", "INT64"),
     _sf("risk_category", "STRING"),
+    # Stored as JSON-serialised STRING to match the PG source columns
+    # verbatim — downstream SQL can use JSON_VALUE / PARSE_JSON over these.
+    _sf("feature_contributions", "STRING"),
+    _sf("feature_snapshot", "STRING"),
     _sf("created_at", "TIMESTAMP"),
 ]
 

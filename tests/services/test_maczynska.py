@@ -8,7 +8,7 @@ from app.config import settings
 from app.db import connection as db_conn
 from app.db import prediction_db
 from app.scraper import db as scraper_db
-from app.services import feature_engine, maczynska
+from app.services import feature_engine, maczynska, predictions
 from scripts.seed_features import FEATURE_DEFINITIONS, FEATURE_SETS
 
 
@@ -52,6 +52,9 @@ def seeded_db(isolated_db):
         prediction_db.upsert_feature_set(set_id, info["name"], info.get("description"))
         for ordinal, member_id in enumerate(info["members"], start=1):
             prediction_db.add_feature_set_member(set_id, member_id, ordinal)
+    # CR-PZN-001: mirror production startup — register built-in models up front
+    # instead of relying on `score_batch` side effects.
+    predictions.register_builtin_models()
     return isolated_db
 
 
@@ -382,3 +385,95 @@ class TestScoreBatch:
         ).fetchall()
         # Should score the v1 completed report, not discover the failed v2
         assert rows == [("auto-ok",)]
+
+
+# ---------------------------------------------------------------------------
+# CR3-REL-004: prediction run finalization on batch failure
+# ---------------------------------------------------------------------------
+
+
+class TestBatchFinalizationOnFailure:
+    """Guards that `score_batch` never leaves a `prediction_runs` row stuck
+    in `running` when a batch-level (pre-loop or bulk-insert) failure occurs.
+    """
+
+    def test_bulk_read_failure_finalizes_run_as_failed(self, seeded_db, monkeypatch):
+        """An exception raised from `get_computed_features_for_reports_batch`
+        happens BEFORE the scoring loop even starts — the old code path
+        would skip `finish_prediction_run` entirely and strand the row."""
+        _create_report_with_tags("0000300900", "cr3-rel-rpt", {
+            "RZiS.I": 200000, "CF.A_II_1": 50000, "Pasywa_B": 500000,
+            "Aktywa": 1000000, "RZiS.A": 2000000, "Aktywa_B_I": 100000,
+        })
+        feature_engine.compute_features_for_report(
+            "cr3-rel-rpt", feature_set_id="maczynska_6"
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated DB outage during bulk-load")
+
+        monkeypatch.setattr(
+            prediction_db, "get_computed_features_for_reports_batch", _boom
+        )
+
+        with pytest.raises(RuntimeError, match="simulated DB outage"):
+            maczynska.score_batch(["cr3-rel-rpt"])
+
+        # The run row must exist and be finalized as `failed`. Fetch the
+        # most recent Maczynska run to identify what `score_batch` created.
+        conn = prediction_db.get_conn()
+        row = conn.execute(
+            """
+            SELECT id, status, error_message
+            FROM prediction_runs
+            WHERE model_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [maczynska.MODEL_ID],
+        ).fetchone()
+        assert row is not None, "Run row was not created"
+        run_id, status, error_message = row
+        assert status == "failed", (
+            f"Run must be finalized as 'failed' after batch-level error, got {status!r}"
+        )
+        assert error_message and error_message.startswith("batch_error:"), (
+            "error_message must carry sanitized batch error code, "
+            f"got {error_message!r}"
+        )
+        # No raw exception text in the persisted error.
+        assert "simulated DB outage" not in (error_message or "")
+
+    def test_bulk_insert_failure_finalizes_run_as_failed(self, seeded_db, monkeypatch):
+        """An exception from `insert_predictions_batch` happens AFTER the
+        scoring loop produced rows. Finalization in the `finally` block
+        must still transition the run to `failed`."""
+        _create_report_with_tags("0000300901", "cr3-rel-rpt-2", {
+            "RZiS.I": 200000, "CF.A_II_1": 50000, "Pasywa_B": 500000,
+            "Aktywa": 1000000, "RZiS.A": 2000000, "Aktywa_B_I": 100000,
+        })
+        feature_engine.compute_features_for_report(
+            "cr3-rel-rpt-2", feature_set_id="maczynska_6"
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated DB outage during bulk-insert")
+
+        monkeypatch.setattr(prediction_db, "insert_predictions_batch", _boom)
+
+        with pytest.raises(RuntimeError, match="simulated DB outage"):
+            maczynska.score_batch(["cr3-rel-rpt-2"])
+
+        conn = prediction_db.get_conn()
+        row = conn.execute(
+            """
+            SELECT status
+            FROM prediction_runs
+            WHERE model_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [maczynska.MODEL_ID],
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "failed"

@@ -26,6 +26,12 @@ def build_training_dataset(
 ) -> pd.DataFrame:
     """Assemble wide-format training data from the EAV feature store.
 
+    CR2-SCALE-005: every join/filter below is scoped to the krs/report set
+    actually present in the working feature slice instead of loading all
+    companies / all reports / all bankruptcy events globally and doing
+    Python-side row filtering. The bankruptcy label is produced in a single
+    vectorized merge + interval check instead of the old row-wise `apply`.
+
     Returns a DataFrame with columns:
     - krs, report_id, fiscal_year
     - one column per feature in the feature set
@@ -51,7 +57,9 @@ def build_training_dataset(
         params.append(max_year)
     year_filter = (" AND " + " AND ".join(year_clauses)) if year_clauses else ""
 
-    # Query computed features for the feature set (EAV format)
+    # Query computed features for the feature set (EAV format). This is the
+    # authoritative row-set: every downstream join must be scoped to the
+    # (krs, report_id) values that land here.
     rows = conn.execute(f"""
         SELECT cf.report_id, cf.krs, cf.fiscal_year, cf.feature_definition_id, cf.value
         FROM latest_computed_features cf
@@ -76,45 +84,96 @@ def build_training_dataset(
     ).reset_index()
     wide_df.columns.name = None
 
-    # Add company metadata
-    company_rows = conn.execute("""
-        SELECT krs, pkd_code, incorporation_date FROM companies
-    """).fetchall()
-    if company_rows:
-        companies_df = pd.DataFrame(company_rows, columns=["krs", "pkd_code", "incorporation_date"])
-        wide_df = wide_df.merge(companies_df, on="krs", how="left")
+    # The exact set of krs / report_id we need metadata for.
+    working_krs = list(wide_df["krs"].unique())
+    working_report_ids = list(wide_df["report_id"].unique())
 
-    # Add bankruptcy labels
+    # CR2-SCALE-005: filter `companies` server-side on the working krs set
+    # instead of loading the whole table and merging everything.
+    if working_krs:
+        company_rows = conn.execute(
+            """
+            SELECT krs, pkd_code, incorporation_date
+            FROM companies
+            WHERE krs = ANY(%s)
+            """,
+            [working_krs],
+        ).fetchall()
+        if company_rows:
+            companies_df = pd.DataFrame(
+                company_rows,
+                columns=["krs", "pkd_code", "incorporation_date"],
+            )
+            wide_df = wide_df.merge(companies_df, on="krs", how="left")
+
+    # Bankruptcy labels
     label_col = f"is_bankrupt_within_{prediction_horizon_years}y"
-    bankruptcy_rows = conn.execute("""
-        SELECT krs, event_date FROM bankruptcy_events
-        WHERE is_confirmed = true OR event_type IN ('bankruptcy', 'restructuring')
-    """).fetchall()
+
+    # CR2-SCALE-005: only pull bankruptcy events for krs values that are in
+    # the working dataset. Previously this query loaded every event in the
+    # table and Python filtered row-by-row.
+    bankruptcy_rows = (
+        conn.execute(
+            """
+            SELECT krs, event_date
+            FROM bankruptcy_events
+            WHERE krs = ANY(%s)
+              AND (is_confirmed = true OR event_type IN ('bankruptcy', 'restructuring'))
+            """,
+            [working_krs],
+        ).fetchall()
+        if working_krs
+        else []
+    )
 
     if bankruptcy_rows:
         events_df = pd.DataFrame(bankruptcy_rows, columns=["krs", "event_date"])
         events_df["event_date"] = pd.to_datetime(events_df["event_date"])
 
-        # For each report row, check if the company went bankrupt within N years of fiscal year end
-        report_dates = conn.execute("""
-            SELECT id, period_end FROM latest_successful_financial_reports
-        """).fetchall()
-        dates_df = pd.DataFrame(report_dates, columns=["report_id", "period_end"])
+        # CR2-SCALE-005: pull period_end dates only for the reports we care
+        # about — not the whole latest_successful_financial_reports view.
+        report_dates_rows = conn.execute(
+            """
+            SELECT id, period_end
+            FROM latest_successful_financial_reports
+            WHERE id = ANY(%s)
+            """,
+            [working_report_ids],
+        ).fetchall()
+        dates_df = pd.DataFrame(report_dates_rows, columns=["report_id", "period_end"])
         dates_df["period_end"] = pd.to_datetime(dates_df["period_end"])
-
         wide_df = wide_df.merge(dates_df, on="report_id", how="left")
 
-        def _has_bankruptcy(row):
-            company_events = events_df[events_df["krs"] == row["krs"]]
-            if company_events.empty or pd.isna(row.get("period_end")):
-                return 0
-            horizon_end = row["period_end"] + pd.DateOffset(years=prediction_horizon_years)
-            return int(any(
-                (row["period_end"] < evt) and (evt <= horizon_end)
-                for evt in company_events["event_date"]
-            ))
+        # CR2-SCALE-005: vectorized label computation.
+        # Old implementation: `wide_df.apply(_has_bankruptcy, axis=1)` — a
+        # Python loop per row with a per-row filter of `events_df` (O(rows *
+        # events)). For N rows and M events that is O(N * M) and the `apply`
+        # overhead dominates for realistic datasets.
+        #
+        # New implementation:
+        #   1. Inner-merge reports with events on krs so every (report, event)
+        #      pair in the same company becomes one row — this is the only
+        #      cartesian fan-out we need.
+        #   2. Filter to events that fall in (period_end, period_end + horizon].
+        #   3. Collapse to the distinct set of report_ids that had a hit.
+        #   4. Left-merge that set back into wide_df as a 0/1 label.
+        # Complexity is dominated by the merge (hash join, ~O(N + M))
+        # regardless of dataset size.
+        horizon = pd.DateOffset(years=prediction_horizon_years)
+        reports_with_dates = wide_df[["report_id", "krs", "period_end"]].dropna(
+            subset=["period_end"]
+        )
+        joined = reports_with_dates.merge(events_df, on="krs", how="inner")
+        if not joined.empty:
+            horizon_end = joined["period_end"] + horizon
+            in_horizon = (joined["period_end"] < joined["event_date"]) & (
+                joined["event_date"] <= horizon_end
+            )
+            positive_reports = set(joined.loc[in_horizon, "report_id"].unique())
+        else:
+            positive_reports = set()
 
-        wide_df[label_col] = wide_df.apply(_has_bankruptcy, axis=1)
+        wide_df[label_col] = wide_df["report_id"].isin(positive_reports).astype(int)
         wide_df.drop(columns=["period_end"], inplace=True, errors="ignore")
     else:
         wide_df[label_col] = 0

@@ -83,6 +83,7 @@ def pg_schema_initialized(pg_dsn):
     from unittest.mock import patch
     from app.config import settings
     from app.db import connection as db_conn
+    from app.db import migrations as db_migrations
     from app.scraper import db as scraper_db
     from app.db import prediction_db
     from app.repositories import krs_repo
@@ -97,6 +98,9 @@ def pg_schema_initialized(pg_dsn):
         scraper_db._ensure_schema()
         prediction_db._ensure_schema()
         krs_repo._ensure_schema()
+        # CR2-OPS-004: apply versioned migrations after bootstrap tables exist
+        # so tests see the same schema shape (columns, FKs) as production.
+        db_migrations.apply_pending(db_conn.get_conn())
         db_conn.close()
         db_conn.reset()
 

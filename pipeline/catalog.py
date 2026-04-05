@@ -1,28 +1,30 @@
-"""Seed feature definitions, feature sets, and model registry into the pipeline DB.
+"""Ensure pipeline DB has the built-in models + feature definitions.
 
-Reuses the FEATURE_DEFINITIONS / FEATURE_SETS constants from seed_features.py
-but writes them to the pipeline database via pipeline_db instead of
-prediction_db.
+The pipeline DB is separate from rdf-postgres, so the standard
+`prediction_db.register_model` path (which writes to rdf-postgres) does not
+populate `model_registry` here. This module provides an idempotent bootstrap
+that mirrors `scripts/seed_pipeline_db.py` but runs inside the pipeline
+runner so a Cloud Run Job on a fresh database still scores correctly.
 
-Usage:
-    python scripts/seed_pipeline_db.py
+Kept intentionally parallel to scripts/seed_pipeline_db.py so the two seed
+paths share the exact same feature/model contents.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
-import os
-import sys
-from pathlib import Path
+import logging
 
-from app.db import pipeline_db
+from app.db.connection import ConnectionWrapper
+
+logger = logging.getLogger(__name__)
 
 
-def _load_seed_features_module():
-    """Load scripts/seed_features.py as a module without requiring `scripts`
-    to be a package. The module top-level imports prediction_db but does not
-    execute any DB writes until seed() is called — so importing is safe."""
-    path = Path(__file__).parent / "seed_features.py"
+def _load_seed_features():
+    """Lazy import of scripts/seed_features.py (not a package)."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "seed_features.py"
     spec = importlib.util.spec_from_file_location("_seed_features", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load {path}")
@@ -31,7 +33,7 @@ def _load_seed_features_module():
     return mod
 
 
-def _upsert_feature_definition(conn, fdef: dict) -> None:
+def _upsert_feature_definition(conn: ConnectionWrapper, fdef: dict) -> None:
     conn.execute(
         """
         INSERT INTO feature_definitions
@@ -61,7 +63,7 @@ def _upsert_feature_definition(conn, fdef: dict) -> None:
     )
 
 
-def _upsert_feature_set(conn, set_id: str, set_info: dict) -> None:
+def _upsert_feature_set(conn: ConnectionWrapper, set_id: str, set_info: dict) -> None:
     conn.execute(
         """
         INSERT INTO feature_sets (id, name, description, created_at)
@@ -84,8 +86,8 @@ def _upsert_feature_set(conn, set_id: str, set_info: dict) -> None:
         )
 
 
-def _register_model(
-    conn,
+def _upsert_model(
+    conn: ConnectionWrapper,
     model_id: str,
     name: str,
     version: str,
@@ -114,9 +116,24 @@ def _register_model(
     )
 
 
-def _register_maczynska(conn) -> None:
-    from app.services.maczynska import COEFFICIENTS
-    _register_model(
+def ensure_builtin_catalog(conn: ConnectionWrapper) -> dict:
+    """Ensure every feature definition, feature set, and built-in model is
+    present in the pipeline DB. Safe to call on every pipeline run.
+
+    Returns counts of rows upserted (for metrics/logging).
+    """
+    seed_features = _load_seed_features()
+    fdefs = getattr(seed_features, "FEATURE_DEFINITIONS", [])
+    fsets = getattr(seed_features, "FEATURE_SETS", {})
+
+    for f in fdefs:
+        _upsert_feature_definition(conn, f)
+    for set_id, set_info in fsets.items():
+        _upsert_feature_set(conn, set_id, set_info)
+
+    # Maczynska
+    from app.services.maczynska import COEFFICIENTS as MACZ_COEFF
+    _upsert_model(
         conn,
         model_id="maczynska_1994_v1",
         name="maczynska",
@@ -124,19 +141,18 @@ def _register_maczynska(conn) -> None:
         feature_set_id="maczynska_6",
         description="Maczynska (1994) 6-variable discriminant model for Polish companies",
         hyperparameters={
-            "coefficients": COEFFICIENTS,
+            "coefficients": MACZ_COEFF,
             "cutoffs": {"critical": 0, "high": 1, "medium": 2},
         },
     )
 
-
-def _register_poznanski(conn) -> None:
+    # Poznanski
     from app.services.poznanski import (
-        COEFFICIENTS,
-        INTERCEPT,
-        NON_LINEAR_LIQUIDITY_THRESHOLD,
+        COEFFICIENTS as POZ_COEFF,
+        INTERCEPT as POZ_INTERCEPT,
+        NON_LINEAR_LIQUIDITY_THRESHOLD as POZ_X2_THRESHOLD,
     )
-    _register_model(
+    _upsert_model(
         conn,
         model_id="poznanski_2004_v1",
         name="poznanski",
@@ -147,36 +163,24 @@ def _register_poznanski(conn) -> None:
             "discriminant model for Polish companies"
         ),
         hyperparameters={
-            "coefficients": COEFFICIENTS,
-            "intercept": INTERCEPT,
+            "coefficients": POZ_COEFF,
+            "intercept": POZ_INTERCEPT,
             "cutoffs": {"critical": 0, "medium": 1},
-            "non_linear_liquidity_threshold": NON_LINEAR_LIQUIDITY_THRESHOLD,
+            "non_linear_liquidity_threshold": POZ_X2_THRESHOLD,
         },
     )
 
-
-def main() -> int:
-    seed_features = _load_seed_features_module()
-    pipeline_db.connect()
-    conn = pipeline_db.get_conn()
-
-    fdefs = getattr(seed_features, "FEATURE_DEFINITIONS", [])
-    fsets = getattr(seed_features, "FEATURE_SETS", {})
-
-    for f in fdefs:
-        _upsert_feature_definition(conn, f)
-    print(f"Seeded {len(fdefs)} feature definitions")
-
-    for set_id, set_info in fsets.items():
-        _upsert_feature_set(conn, set_id, set_info)
-    print(f"Seeded {len(fsets)} feature sets")
-
-    _register_maczynska(conn)
-    print("Registered maczynska_1994_v1 model")
-    _register_poznanski(conn)
-    print("Registered poznanski_2004_v1 model")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    logger.info(
+        "pipeline_catalog_ensured",
+        extra={
+            "event": "pipeline_catalog_ensured",
+            "feature_definitions": len(fdefs),
+            "feature_sets": len(fsets),
+            "models": 2,
+        },
+    )
+    return {
+        "feature_definitions": len(fdefs),
+        "feature_sets": len(fsets),
+        "models": 2,
+    }

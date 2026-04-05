@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "source_repo": "joy-forge-express",
+  "target_repo": "/Users/piotrkraus/piotr/rdf-api-project",
+  "generated_at": "2026-04-05",
+  "changes": [
+    {
+      "id": "jednostkainna-empty-statement-trees",
+      "title": "JednostkaInna schema returns empty RZiS and cash_flow trees from /api/analysis/compare",
+      "severity": "medium",
+      "endpoint": "GET /api/analysis/compare",
+      "observed_on": {
+        "krs": "0000694720",
+        "company": "B-JWK-Management Sp. z o.o.",
+        "schema_type": "JednostkaInna",
+        "pkd": "6810Z",
+        "period_current": "2024-01-01 → 2024-12-31",
+        "period_previous": "2023-01-01 → 2023-12-31"
+      },
+      "problem": "For companies filing under the JednostkaInna reporting schema, the /api/analysis/compare response returns BOTH the 'rzis' field AND the 'cash_flow' field as a root node only — no children, current=null, previous=null. The frontend already has a null-guard for cash_flow (shows an 'unavailable' message when cash_flow === null), but because the backend returns a truthy stub root node instead of null, the guard passes and the empty table renders anyway with '1 pozycji' and a single empty row. The RZiS tab has the same symptom. Bilans/Aktywa+Pasywa render correctly for the same company, so the issue is specific to how the comparison builder assembles the income-statement and cash-flow subtrees for JednostkaInna filings.",
+      "likely_root_cause": "The comparison builder walks a fixed RZiS.* / CF.* taxonomy that exists in JednostkaGN / JednostkaMSR schemas but is absent (or lives under different tag prefixes) in JednostkaInna RDF XMLs. When no child tags match, the builder still emits the root container node instead of either (a) mapping JednostkaInna tags to the common tree, or (b) returning null to signal unavailability. The bug is symmetric across both rzis and cash_flow — same code path, same failure mode.",
+      "required_changes": [
+        {
+          "step": 1,
+          "what": "In the comparison builder for /api/analysis/compare, add a helper that detects 'empty' statement trees: root node with (children empty OR all descendants have null current AND null previous) AND root current=null AND root previous=null.",
+          "where": "Wherever rzis and cash_flow comparison trees are assembled in the RDF service — this is a single shared helper that should apply to both fields (and to any future statement tree)."
+        },
+        {
+          "step": 2,
+          "what": "When that helper reports 'empty', return rzis: null and cash_flow: null in the ComparisonResponse instead of the stub root node. This is the minimum viable fix — the frontend already handles null for cash_flow, and will be updated to handle null for rzis in parallel.",
+          "acceptance": "For KRS 0000694720 comparing 2024 vs 2023, response.rzis === null AND response.cash_flow === null."
+        },
+        {
+          "step": 3,
+          "what": "Preferred longer-term fix: add a JednostkaInna-specific mapping so the income statement and cash flow are actually populated where the source XML contains equivalent line items. Investigate which RDF tags JednostkaInna filings use for revenue / costs / operating result / net profit and for operating/investing/financing cash flows, then map them into the existing RZiS.* and CF.* tree structures the frontend expects.",
+          "acceptance": "For a JednostkaInna filing that contains P&L and/or cash-flow data in its source XML, response.rzis and/or response.cash_flow are populated trees with real line items and non-null values where the XML provides them."
+        },
+        {
+          "step": 4,
+          "what": "Add regression tests covering at least one JednostkaInna filing for both rzis and cash_flow fields, so future changes to the comparison builder cannot silently regress to the empty-root-node behavior.",
+          "acceptance": "Tests assert that rzis and cash_flow are each either null (step 2 fix) OR a populated tree (step 3 fix) — never a root-only stub."
+        }
+      ],
+      "acceptance_criteria": [
+        "GET /api/analysis/compare for KRS 0000694720 no longer returns stub rzis or cash_flow trees (root node with empty children and null values).",
+        "Both fields are either null OR populated trees with real line items.",
+        "Bilans (aktywa/pasywa) behavior for this company is unchanged.",
+        "Automated tests cover both rzis and cash_flow for at least one JednostkaInna filing."
+      ],
+      "frontend_touchpoints": {
+        "note": "Cash flow already has a null-guard at AnalysisTabContent.tsx:139-144 and will start working automatically once the backend returns cash_flow: null. RZiS needs an equivalent null-guard added in parallel.",
+        "files": [
+          "src/components/dossier/AnalysisTabContent.tsx (lines ~136-138: the <TabsContent value=\"rzis\"> block currently renders unconditionally on truthy rzis — needs a null-guard mirroring cash_flow at lines 139-144)",
+          "src/lib/analysis-api.ts (ComparisonResponse.rzis type should become ComparisonNode | null once backend contract changes; cash_flow is already ComparisonNode | null)"
+        ]
+      },
+      "out_of_scope": [
+        "Changing the Bilans comparison logic.",
+        "Changing how JednostkaInna filings are ingested or stored — only how the comparison endpoint assembles the rzis and cash_flow subtrees from already-ingested data.",
+        "Any scoring / prediction pipeline work."
+      ]
+    },
+    {
+      "id": "poznanski-model-registration-and-warning-contract",
+      "title": "Poznanski model should be startup-visible and expose warning codes in predictions API",
+      "severity": "high",
+      "endpoint": "GET /api/predictions/models, GET /api/predictions/{krs}",
+      "observed_on": {
+        "repo": "/Users/piotrkraus/piotr/rdf-api-project",
+        "branch": "claude/add-pozanski-model-8hxML",
+        "commit": "f8459bc",
+        "model_id": "poznanski_2004_v1"
+      },
+      "problem": "The Poznanski model is registered inside score_batch, while predictions caches are warmed at startup. In a fresh environment, /api/predictions/models can omit poznanski until scoring is run and caches are refreshed. Separately, the model's WARNING_NON_LINEAR_LIQUIDITY is computed and persisted under feature_contributions._warnings, but the API response does not surface warnings to clients.",
+      "likely_root_cause": "Model registration currently happens as a scoring side effect rather than deterministic startup bootstrap, and the predictions response assembler maps only numeric feature contributions without extracting reserved _warnings metadata into result payload.",
+      "required_changes": [
+        {
+          "step": 1,
+          "what": "Register built-in models (including poznanski_2004_v1) during startup before warming prediction caches. After registration, invalidate/rebuild model cache.",
+          "where": "App startup lifespan + predictions service cache/bootstrap flow."
+        },
+        {
+          "step": 2,
+          "what": "Extend predictions API contract with warnings: string[] in result payload and map feature_contributions._warnings into that field.",
+          "where": "Predictions response assembler and predictions schemas."
+        },
+        {
+          "step": 3,
+          "what": "Add regression tests for (a) startup discoverability in /api/predictions/models without prior scoring and (b) warning propagation in /api/predictions/{krs} for high X2 cases.",
+          "acceptance": "Tests fail if model is missing after startup or if WARNING_NON_LINEAR_LIQUIDITY is absent from API result when expected."
+        }
+      ],
+      "acceptance_criteria": [
+        "After a fresh startup, /api/predictions/models contains poznanski_2004_v1 without running score_batch first.",
+        "For a prediction with non-linear liquidity warning, /api/predictions/{krs} returns result.warnings including WARNING_NON_LINEAR_LIQUIDITY.",
+        "New regression tests cover both startup model visibility and warning propagation."
+      ],
+      "frontend_touchpoints": {
+        "note": "Frontend can surface warning badges/messages once result.warnings is available.",
+        "files": [
+          "src/lib/predictions-api.ts (ResultDetail type add warnings?: string[])",
+          "src/components/dossier/PredictionScoreCard.tsx (render warning indicator/copy for WARNING_NON_LINEAR_LIQUIDITY)"
+        ]
+      },
+      "out_of_scope": [
+        "Changing Poznanski formula coefficients, cutoffs, or risk categorization logic.",
+        "Introducing new database tables solely for warnings (existing feature_contributions storage is sufficient for now)."
+      ]
+    }
+  ]
+}

@@ -78,6 +78,7 @@ def _init_schema() -> None:
             source_file_path   VARCHAR,
             ingestion_status VARCHAR(20) DEFAULT 'pending',
             ingestion_error  VARCHAR,
+            schema_code     VARCHAR(10),
             created_at       TIMESTAMP DEFAULT current_timestamp,
             UNIQUE(logical_key, report_version)
         )
@@ -105,6 +106,7 @@ def _init_schema() -> None:
             value_current   DOUBLE PRECISION,
             value_previous  DOUBLE PRECISION,
             currency        VARCHAR(3) DEFAULT 'PLN',
+            schema_code     VARCHAR(10),
             PRIMARY KEY(report_id, section, tag_path, extraction_version)
         )
     """)
@@ -210,6 +212,7 @@ def _init_schema() -> None:
             classification  SMALLINT,
             risk_category   VARCHAR(20),
             feature_contributions JSON,
+            feature_snapshot JSON,
             created_at      TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -414,20 +417,25 @@ def _init_schema() -> None:
         ("idx_reset_token_hash",    "CREATE UNIQUE INDEX idx_reset_token_hash ON password_reset_tokens(token_hash) WHERE used_at IS NULL"),
         ("idx_reset_token_lookup",  "CREATE INDEX idx_reset_token_lookup ON password_reset_tokens(token_hash, expires_at, created_at DESC) WHERE used_at IS NULL"),
         ("idx_reset_token_user",    "CREATE INDEX idx_reset_token_user ON password_reset_tokens(user_id, used_at, expires_at)"),
+        # CR-PZN-003: supports `_find_unscored_reports` in model scorers. The
+        # unscored-lookup query filters `computed_features` by
+        # feature_definition_id with `is_valid = true`, so a partial index on
+        # (feature_definition_id, report_id) keyed on the valid rows keeps that
+        # path linear in the number of target features rather than scanning the
+        # whole table.
+        ("idx_features_valid_fid_report",
+         "CREATE INDEX idx_features_valid_fid_report ON computed_features(feature_definition_id, report_id) WHERE is_valid = true"),
     ]
 
     for name, sql in index_defs:
         if name not in existing:
             conn.execute(sql)
 
-    # --- schema_code column migration (multi-schema parser support) ---
-    for tbl in ("financial_reports", "financial_line_items"):
-        try:
-            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN schema_code VARCHAR(10)")
-        except Exception:
-            pass  # column already exists
-    conn.execute("UPDATE financial_reports SET schema_code = 'SFJINZ' WHERE schema_code IS NULL")
-    conn.execute("UPDATE financial_line_items SET schema_code = 'SFJINZ' WHERE schema_code IS NULL")
+    # CR2-OPS-004: ALTER TABLE + UPDATE backfills that used to run here now
+    # live in migrations/prediction/*.sql and are applied via
+    # `app.db.migrations.apply_pending()` after `_init_schema` completes. This
+    # file is responsible only for idempotent CREATE operations that are safe
+    # to re-run on every boot (tables, indexes, views).
     for idx_name, idx_sql in [
         ("idx_reports_schema", "CREATE INDEX idx_reports_schema ON financial_reports(schema_code)"),
         ("idx_line_items_schema", "CREATE INDEX idx_line_items_schema ON financial_line_items(schema_code)"),
@@ -726,6 +734,30 @@ def get_financial_report(report_id: str) -> Optional[dict]:
     return dict(zip(cols, row))
 
 
+def get_financial_reports_batch(report_ids: list[str]) -> dict[str, dict]:
+    """Fetch many financial reports in a single round-trip keyed by id.
+
+    CR-PZN-003: the per-report scoring loop previously issued one SELECT per
+    report (see callers of `get_financial_report`). This helper lets
+    `score_batch` load them in a single query.
+    """
+    if not report_ids:
+        return {}
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT id, logical_key, report_version, supersedes_report_id, krs, data_source_id,
+               report_type, fiscal_year, period_start, period_end,
+               ingestion_status, ingestion_error, source_document_id, schema_code
+        FROM financial_reports WHERE id = ANY(%s)
+    """, [list(report_ids)]).fetchall()
+    cols = [
+        "id", "logical_key", "report_version", "supersedes_report_id", "krs",
+        "data_source_id", "report_type", "fiscal_year", "period_start", "period_end",
+        "ingestion_status", "ingestion_error", "source_document_id", "schema_code",
+    ]
+    return {row[0]: dict(zip(cols, row)) for row in rows}
+
+
 def get_reports_for_krs(krs: str) -> list[dict]:
     conn = get_conn()
     rows = conn.execute("""
@@ -966,6 +998,41 @@ def get_computed_features_for_report(report_id: str, valid_only: bool = True) ->
     return [dict(zip(cols, row)) for row in rows]
 
 
+def get_computed_features_for_reports_batch(
+    report_ids: list[str],
+    valid_only: bool = True,
+) -> dict[str, list[dict]]:
+    """Fetch computed features for many reports in a single query.
+
+    CR-PZN-003: collapses the N+1 `get_computed_features_for_report` loop in
+    model `score_batch` paths. Returns a map `{report_id: [feature_row, ...]}`
+    with the same row shape as `get_computed_features_for_report`.
+    """
+    if not report_ids:
+        return {}
+    conn = get_conn()
+    base_sql = """
+        SELECT report_id, feature_definition_id, krs, fiscal_year, value, is_valid,
+               error_message, source_extraction_version, computation_version
+        FROM latest_computed_features
+        WHERE report_id = ANY(%s)
+    """
+    if valid_only:
+        base_sql += " AND is_valid = true"
+    base_sql += " ORDER BY report_id, feature_definition_id"
+
+    rows = conn.execute(base_sql, [list(report_ids)]).fetchall()
+    cols = [
+        "report_id", "feature_definition_id", "krs", "fiscal_year", "value",
+        "is_valid", "error_message", "source_extraction_version", "computation_version",
+    ]
+    grouped: dict[str, list[dict]] = {rid: [] for rid in report_ids}
+    for row in rows:
+        rec = dict(zip(cols, row))
+        grouped.setdefault(rec["report_id"], []).append(rec)
+    return grouped
+
+
 def get_computed_features(krs: str, fiscal_year: Optional[int] = None) -> list[dict]:
     conn = get_conn()
     if fiscal_year is not None:
@@ -1072,18 +1139,68 @@ def finish_prediction_run(run_id: str, status: str, companies_scored: int = 0,
 def insert_prediction(prediction_id: str, prediction_run_id: str, krs: str, report_id: str,
                       raw_score: Optional[float], probability: Optional[float],
                       classification: Optional[int], risk_category: Optional[str],
-                      feature_contributions: Optional[dict] = None) -> None:
+                      feature_contributions: Optional[dict] = None,
+                      feature_snapshot: Optional[dict] = None) -> None:
+    """Persist a prediction row.
+
+    `feature_snapshot` is an immutable map {feature_definition_id: computation_version}
+    captured at scoring time. Read path uses it to fetch the exact feature values
+    that fed the score, avoiding timestamp-based heuristics.
+    """
     conn = get_conn()
     now = datetime.now(timezone.utc)
     conn.execute("""
         INSERT INTO predictions
             (id, prediction_run_id, krs, report_id, raw_score, probability,
-             classification, risk_category, feature_contributions, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             classification, risk_category, feature_contributions, feature_snapshot, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (id) DO NOTHING
     """, [prediction_id, prediction_run_id, krs, report_id, raw_score, probability,
           classification, risk_category,
-          json.dumps(feature_contributions) if feature_contributions else None, now])
+          json.dumps(feature_contributions) if feature_contributions else None,
+          json.dumps(feature_snapshot) if feature_snapshot else None,
+          now])
+
+
+def insert_predictions_batch(rows: list[dict]) -> int:
+    """Bulk-insert prediction rows.
+
+    CR-PZN-003: replaces the per-row `insert_prediction` loop in `score_batch`
+    with a single `executemany`. Each row dict must carry the same keys as
+    `insert_prediction`'s kwargs (prediction_id, prediction_run_id, krs,
+    report_id, raw_score, probability, classification, risk_category,
+    feature_contributions, feature_snapshot). Returns the count of rows queued
+    (not strictly the count inserted — rows conflicting on id are skipped).
+    """
+    if not rows:
+        return 0
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    payload = [
+        (
+            r["prediction_id"],
+            r["prediction_run_id"],
+            r["krs"],
+            r["report_id"],
+            r.get("raw_score"),
+            r.get("probability"),
+            r.get("classification"),
+            r.get("risk_category"),
+            json.dumps(r["feature_contributions"]) if r.get("feature_contributions") else None,
+            json.dumps(r["feature_snapshot"]) if r.get("feature_snapshot") else None,
+            now,
+        )
+        for r in rows
+    ]
+    with conn.raw.cursor() as cur:  # psycopg2 executemany is fine for moderate batches
+        cur.executemany("""
+            INSERT INTO predictions
+                (id, prediction_run_id, krs, report_id, raw_score, probability,
+                 classification, risk_category, feature_contributions, feature_snapshot, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+        """, payload)
+    return len(rows)
 
 
 def get_latest_prediction(krs: str) -> Optional[dict]:
@@ -1143,12 +1260,13 @@ def get_predictions_fat(krs: str) -> list[dict]:
     cur = conn.execute("""
         SELECT
             p.raw_score, p.probability, p.classification, p.risk_category,
-            p.feature_contributions, p.created_at AS scored_at,
+            p.feature_contributions, p.feature_snapshot, p.created_at AS scored_at,
             mr.id AS model_id, mr.name AS model_name, mr.model_type,
             mr.version AS model_version, mr.is_baseline, mr.description AS model_description,
             mr.hyperparameters, mr.feature_set_id,
             fr.id AS report_id, fr.fiscal_year, fr.period_start, fr.period_end,
-            fr.report_version, fr.data_source_id, fr.created_at AS ingested_at
+            fr.report_version, fr.data_source_id, fr.created_at AS ingested_at,
+            fr.schema_code
         FROM predictions p
         JOIN prediction_runs pr ON pr.id = p.prediction_run_id
         JOIN model_registry mr ON mr.id = pr.model_id
@@ -1162,6 +1280,8 @@ def get_predictions_fat(krs: str) -> list[dict]:
             d[key] = str(d[key]) if d[key] else None
         if isinstance(d["feature_contributions"], str):
             d["feature_contributions"] = json.loads(d["feature_contributions"])
+        if isinstance(d.get("feature_snapshot"), str):
+            d["feature_snapshot"] = json.loads(d["feature_snapshot"])
         if isinstance(d["hyperparameters"], str):
             d["hyperparameters"] = json.loads(d["hyperparameters"])
     return results
@@ -1188,17 +1308,475 @@ def get_features_for_report(report_id: str, feature_set_id: str) -> list[dict]:
     return results
 
 
+# Bounded batch size for large VALUES lists to stay well under PostgreSQL's
+# 32767-parameter limit even for multi-column tuples.
+_BATCH_CHUNK_SIZE = 800
+
+
+def _chunks(seq: list, size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def get_features_for_predictions_batch(
+    requests: list[dict],
+) -> dict[str, list[dict]]:
+    """Batched feature loader: O(1) round-trips for many predictions.
+
+    Each request dict must include a caller-supplied `request_id` that uniquely
+    identifies the prediction (not the report/feature_set pair) — two distinct
+    predictions using the same (report_id, feature_set_id) but different
+    snapshots / scored_at must carry different request_ids. Shape:
+
+        {"request_id": str,            # REQUIRED, unique per prediction
+         "report_id": str,
+         "feature_set_id": str,
+         "feature_snapshot": dict | None,  # {feature_id: computation_version}
+         "scored_at": str | None,
+         # Optional metadata for warning logs on partial-snapshot fallback:
+         "model_id": str | None,
+         "fiscal_year": int | None}
+
+    Returns `{request_id: [feature_row, ...]}`.
+
+    Resolution:
+      1. Exact snapshot — rows are fetched at the immutable
+         (report_id, feature_definition_id, computation_version) triple,
+         constrained to `is_valid = true` and membership in the requested
+         feature_set_id. If any expected snapshot key is missing from the
+         returned rows (partial/corrupted snapshot), the request is demoted
+         to the batched fallback and a structured warning is emitted.
+      2. Fallback — a single SQL round-trip using a request CTE and window
+         function picks the latest valid computed value per feature in the
+         requested feature_set for that request, with `computed_at <= scored_at`
+         when scored_at is provided, else the latest overall. The window
+         partitions by request_id so two requests with the same report and
+         feature_set but different scored_at are resolved independently.
+    """
+    if not requests:
+        return {}
+
+    # Defensive: enforce unique request_ids and require them to be present.
+    seen_ids: set[str] = set()
+    for req in requests:
+        rid = req.get("request_id")
+        if not rid:
+            raise ValueError("get_features_for_predictions_batch: every request must carry a request_id")
+        if rid in seen_ids:
+            raise ValueError(f"get_features_for_predictions_batch: duplicate request_id {rid!r}")
+        seen_ids.add(rid)
+
+    conn = get_conn()
+    result_map: dict[str, list[dict]] = {}
+
+    # ---- Phase 1: exact snapshot ----
+    exact_requests: list[dict] = []
+    fallback_requests: list[dict] = []
+    for req in requests:
+        snap = req.get("feature_snapshot")
+        if isinstance(snap, dict) and snap and all(isinstance(v, int) for v in snap.values()):
+            exact_requests.append(req)
+        else:
+            fallback_requests.append(req)
+
+    if exact_requests:
+        # Tuples: (request_id, report_id, feature_set_id, feature_definition_id, computation_version)
+        # Dedupe within a single request's snapshot in case the caller passed
+        # duplicate feature ids. Different requests keep distinct rows because
+        # request_id is part of the tuple.
+        quad_set: set[tuple[str, str, str, str, int]] = set()
+        for req in exact_requests:
+            for fid, version in req["feature_snapshot"].items():
+                quad_set.add((
+                    req["request_id"], req["report_id"], req["feature_set_id"],
+                    fid, version,
+                ))
+        quads = list(quad_set)
+
+        exact_rows_by_request: dict[str, list[dict]] = {}
+        for chunk in _chunks(quads, _BATCH_CHUNK_SIZE):
+            placeholders = ", ".join(["(%s, %s, %s, %s, %s)"] * len(chunk))
+            flat: list = []
+            for t in chunk:
+                flat.extend(t)
+            cur = conn.execute(f"""
+                WITH requested(request_id, report_id, feature_set_id,
+                               feature_definition_id, computation_version)
+                AS (VALUES {placeholders})
+                SELECT
+                    r.request_id, r.report_id, r.feature_set_id,
+                    cf.feature_definition_id, cf.value, cf.computation_version,
+                    cf.source_extraction_version,
+                    fd.name, fd.category, fd.formula_description, fd.required_tags,
+                    fd.computation_logic, fsm.ordinal
+                FROM requested r
+                JOIN computed_features cf
+                    ON cf.report_id = r.report_id
+                   AND cf.feature_definition_id = r.feature_definition_id
+                   AND cf.computation_version = r.computation_version
+                   AND cf.is_valid = true
+                JOIN feature_set_members fsm
+                    ON fsm.feature_set_id = r.feature_set_id
+                   AND fsm.feature_definition_id = r.feature_definition_id
+                JOIN feature_definitions fd
+                    ON fd.id = cf.feature_definition_id
+            """, flat)
+            for d in _cursor_to_dicts(cur):
+                if isinstance(d["required_tags"], str):
+                    d["required_tags"] = json.loads(d["required_tags"])
+                exact_rows_by_request.setdefault(d["request_id"], []).append(d)
+
+        # Validate completeness — every snapshot key must have a returned row.
+        for req in exact_requests:
+            rid = req["request_id"]
+            expected = set(req["feature_snapshot"].keys())
+            returned = {r["feature_definition_id"] for r in exact_rows_by_request.get(rid, [])}
+            missing = expected - returned
+            if not missing and returned:
+                rows = sorted(exact_rows_by_request[rid], key=lambda r: (r.get("ordinal") or 0))
+                # Drop the request_id marker from output rows.
+                for r in rows:
+                    r.pop("request_id", None)
+                result_map[rid] = rows
+            else:
+                logger.warning(
+                    "feature_snapshot_incomplete_fallback",
+                    extra={
+                        "event": "feature_snapshot_incomplete_fallback",
+                        "request_id": rid,
+                        "report_id": req["report_id"],
+                        "feature_set_id": req["feature_set_id"],
+                        "model_id": req.get("model_id"),
+                        "fiscal_year": req.get("fiscal_year"),
+                        "expected": sorted(expected),
+                        "missing": sorted(missing),
+                    },
+                )
+                fallback_requests.append(req)
+
+    # ---- Phase 2: batched fallback ----
+    unresolved = [req for req in fallback_requests if req["request_id"] not in result_map]
+    if unresolved:
+        fallback_rows = _load_features_fallback_batch(conn, unresolved)
+        for rid, rows in fallback_rows.items():
+            result_map[rid] = rows
+        for req in unresolved:
+            result_map.setdefault(req["request_id"], [])
+
+    return result_map
+
+
+def _load_features_fallback_batch(
+    conn,
+    requests: list[dict],
+) -> dict[str, list[dict]]:
+    """Single batched SQL fallback for predictions without a usable snapshot.
+
+    Keyed by `request_id` (not by report_id/feature_set_id), so two requests
+    with the same report and feature set but different scored_at are resolved
+    independently and never share rows. Picks the latest valid computed feature
+    per request+feature_definition_id where computed_at <= scored_at (NULL
+    scored_at resolves to the latest overall). Chunked to stay under the
+    PostgreSQL parameter limit.
+    """
+    if not requests:
+        return {}
+
+    rows_by_request: dict[str, list[dict]] = {}
+    for chunk in _chunks(requests, _BATCH_CHUNK_SIZE):
+        placeholders = ", ".join(["(%s, %s, %s, %s::timestamptz)"] * len(chunk))
+        flat: list = []
+        for req in chunk:
+            flat.extend([
+                req["request_id"], req["report_id"], req["feature_set_id"],
+                req.get("scored_at"),
+            ])
+        cur = conn.execute(f"""
+            WITH requested(request_id, report_id, feature_set_id, scored_at) AS (
+                VALUES {placeholders}
+            ),
+            ranked AS (
+                SELECT
+                    r.request_id,
+                    r.report_id,
+                    r.feature_set_id,
+                    cf.feature_definition_id,
+                    cf.value,
+                    cf.source_extraction_version,
+                    cf.computation_version,
+                    fsm.ordinal,
+                    row_number() OVER (
+                        PARTITION BY r.request_id, cf.feature_definition_id
+                        ORDER BY cf.computed_at DESC, cf.computation_version DESC
+                    ) AS rn
+                FROM requested r
+                JOIN feature_set_members fsm
+                    ON fsm.feature_set_id = r.feature_set_id
+                JOIN computed_features cf
+                    ON cf.report_id = r.report_id
+                   AND cf.feature_definition_id = fsm.feature_definition_id
+                   AND cf.is_valid = true
+                   AND cf.computed_at <= coalesce(r.scored_at, 'infinity'::timestamptz)
+            )
+            SELECT
+                ranked.request_id,
+                ranked.feature_definition_id, ranked.value,
+                ranked.source_extraction_version, ranked.computation_version,
+                ranked.ordinal,
+                fd.name, fd.category, fd.formula_description, fd.required_tags,
+                fd.computation_logic
+            FROM ranked
+            JOIN feature_definitions fd ON fd.id = ranked.feature_definition_id
+            WHERE ranked.rn = 1
+            ORDER BY ranked.request_id, ranked.ordinal
+        """, flat)
+        for d in _cursor_to_dicts(cur):
+            if isinstance(d["required_tags"], str):
+                d["required_tags"] = json.loads(d["required_tags"])
+            req_id = d.pop("request_id")
+            rows_by_request.setdefault(req_id, []).append(d)
+
+    # Second pass: if the "computed_at <= scored_at" window returned nothing
+    # for a request but scored_at was set, retry that request with scored_at=None.
+    # This mirrors the legacy per-request two-phase behavior for pre-computed_at rows.
+    retry_requests = [
+        req for req in requests
+        if req.get("scored_at") is not None and not rows_by_request.get(req["request_id"])
+    ]
+    if retry_requests:
+        retry_rows = _load_features_fallback_batch(
+            conn,
+            [{**req, "scored_at": None} for req in retry_requests],
+        )
+        for req_id, rows in retry_rows.items():
+            rows_by_request[req_id] = rows
+
+    return rows_by_request
+
+
+def get_features_for_prediction(
+    report_id: str,
+    feature_set_id: str,
+    scored_at: Optional[str] = None,
+) -> list[dict]:
+    """Get feature snapshot valid at scoring time for a prediction.
+
+    For each feature in the model's feature set, picks the latest valid
+    computed value where computed_at <= scored_at. If scored_at is None,
+    this resolves to the latest valid computed value overall.
+    """
+    conn = get_conn()
+    cur = conn.execute("""
+        SELECT
+            ranked.feature_definition_id, ranked.value, ranked.source_extraction_version,
+            fd.name, fd.category, fd.formula_description, fd.required_tags,
+            fd.computation_logic
+        FROM (
+            SELECT
+                cf.feature_definition_id,
+                cf.value,
+                cf.source_extraction_version,
+                fsm.ordinal,
+                row_number() OVER (
+                    PARTITION BY cf.feature_definition_id
+                    ORDER BY cf.computed_at DESC, cf.computation_version DESC
+                ) AS rn
+            FROM computed_features cf
+            JOIN feature_set_members fsm
+                ON fsm.feature_definition_id = cf.feature_definition_id
+               AND fsm.feature_set_id = %s
+            WHERE cf.report_id = %s
+              AND cf.is_valid = true
+              AND cf.computed_at <= coalesce(%s::timestamptz, 'infinity'::timestamptz)
+        ) ranked
+        JOIN feature_definitions fd ON fd.id = ranked.feature_definition_id
+        WHERE ranked.rn = 1
+        ORDER BY ranked.ordinal
+    """, [feature_set_id, report_id, scored_at])
+    results = _cursor_to_dicts(cur)
+    for d in results:
+        if isinstance(d["required_tags"], str):
+            d["required_tags"] = json.loads(d["required_tags"])
+    return results
+
+
+def get_source_line_items_for_reports_batch(
+    requests: list[tuple[str, list[str]]],
+) -> dict[str, list[dict]]:
+    """Batched source-item loader: one DB round-trip for many (report_id, tags) pairs.
+
+    Returns {report_id: [source_item, ...]} with label_pl / value_current /
+    value_previous / section / schema_code per tag_path. value_previous is
+    resolved from the immediately prior fiscal year's latest completed report
+    for the same company, constrained by data_source_id and report_type.
+    """
+    if not requests:
+        return {}
+
+    # Build a single CTE that unions all report/tag pairs then joins line items.
+    report_ids = [r[0] for r in requests]
+    report_ids_unique = list(dict.fromkeys(report_ids))
+
+    # De-dup (report_id, tag_path) request pairs.
+    pairs: list[tuple[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for report_id, tags in requests:
+        for tp in tags:
+            key = (report_id, tp)
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                pairs.append(key)
+
+    if not pairs:
+        return {rid: [] for rid in report_ids_unique}
+
+    conn = get_conn()
+    result: dict[str, list[dict]] = {rid: [] for rid in report_ids_unique}
+
+    # Group pairs by report_id so each chunk stays self-contained and its
+    # report_ids_unique slice is small.
+    pairs_by_rid: dict[str, list[str]] = {}
+    for rid, tp in pairs:
+        pairs_by_rid.setdefault(rid, []).append(tp)
+
+    # Chunk reports to bound both pair and report_id parameter counts.
+    chunk_reports: list[str] = []
+    chunk_pairs: list[tuple[str, str]] = []
+    chunks: list[tuple[list[str], list[tuple[str, str]]]] = []
+    for rid in report_ids_unique:
+        tags = pairs_by_rid.get(rid, [])
+        if chunk_pairs and (len(chunk_pairs) + len(tags) > _BATCH_CHUNK_SIZE):
+            chunks.append((chunk_reports, chunk_pairs))
+            chunk_reports, chunk_pairs = [], []
+        chunk_reports.append(rid)
+        chunk_pairs.extend((rid, tp) for tp in tags)
+    if chunk_pairs:
+        chunks.append((chunk_reports, chunk_pairs))
+
+    for rids_chunk, pairs_chunk in chunks:
+        pair_placeholders = ", ".join(["(%s, %s)"] * len(pairs_chunk))
+        rid_placeholders = ", ".join(["%s"] * len(rids_chunk))
+        flat_pairs: list = []
+        for pair in pairs_chunk:
+            flat_pairs.extend(pair)
+
+        cur = conn.execute(f"""
+            WITH requested(report_id, tag_path) AS (
+                VALUES {pair_placeholders}
+            ),
+            current_reports AS (
+                SELECT id, krs, fiscal_year, data_source_id, report_type, schema_code
+                FROM financial_reports
+                WHERE id IN ({rid_placeholders})
+            ),
+            previous_reports AS (
+                SELECT DISTINCT ON (cr.id)
+                    cr.id AS current_report_id,
+                    fr_prev.id AS previous_report_id
+                FROM current_reports cr
+                JOIN financial_reports fr_prev
+                  ON fr_prev.krs = cr.krs
+                 AND fr_prev.fiscal_year = cr.fiscal_year - 1
+                 AND fr_prev.data_source_id = cr.data_source_id
+                 AND fr_prev.report_type = cr.report_type
+                 AND fr_prev.ingestion_status = 'completed'
+                ORDER BY cr.id, fr_prev.report_version DESC, fr_prev.created_at DESC, fr_prev.id DESC
+            ),
+            current_items AS (
+                SELECT li.report_id, li.tag_path, li.label_pl, li.value_current,
+                       li.section, li.schema_code
+                FROM latest_financial_line_items li
+                WHERE li.report_id IN ({rid_placeholders})
+            ),
+            previous_items AS (
+                SELECT pr.current_report_id AS report_id, li.tag_path, li.label_pl,
+                       li.value_current AS value_previous, li.section
+                FROM previous_reports pr
+                JOIN latest_financial_line_items li ON li.report_id = pr.previous_report_id
+            )
+            SELECT
+                r.report_id,
+                r.tag_path,
+                coalesce(ci.label_pl, pi.label_pl) AS label_pl,
+                ci.value_current AS value_current,
+                pi.value_previous AS value_previous,
+                coalesce(ci.section, pi.section) AS section,
+                coalesce(ci.schema_code, cr.schema_code) AS schema_code
+            FROM requested r
+            LEFT JOIN current_items ci ON ci.report_id = r.report_id AND ci.tag_path = r.tag_path
+            LEFT JOIN previous_items pi ON pi.report_id = r.report_id AND pi.tag_path = r.tag_path
+            LEFT JOIN current_reports cr ON cr.id = r.report_id
+        """, flat_pairs + rids_chunk + rids_chunk)
+
+        for row in _cursor_to_dicts(cur):
+            result.setdefault(row["report_id"], []).append(row)
+
+    if len(chunks) > 1:
+        logger.info(
+            "source_items_batch_chunked",
+            extra={
+                "event": "source_items_batch_chunked",
+                "chunks": len(chunks),
+                "reports": len(report_ids_unique),
+                "pairs": len(pairs),
+            },
+        )
+
+    return result
+
+
 def get_source_line_items_for_report(report_id: str, tag_paths: list[str]) -> list[dict]:
-    """Get financial line items for specific tag paths from a report."""
+    """Get financial line items for specific tags with prior-year values.
+
+    Returns one row per requested tag_path. value_previous is resolved from the
+    immediately prior fiscal year's latest completed report for the same company.
+    """
     if not tag_paths:
         return []
+    unique_tag_paths = list(dict.fromkeys(tag_paths))
     conn = get_conn()
-    placeholders = ",".join(["%s"] * len(tag_paths))
+    placeholders = ", ".join(["(%s)"] * len(unique_tag_paths))
     cur = conn.execute(f"""
-        SELECT tag_path, label_pl, value_current, value_previous, section
-        FROM latest_financial_line_items
-        WHERE report_id = %s AND tag_path IN ({placeholders})
-    """, [report_id] + tag_paths)
+        WITH requested_tags(tag_path) AS (
+            VALUES {placeholders}
+        ),
+        current_report AS (
+            SELECT id, krs, fiscal_year, data_source_id, report_type
+            FROM financial_reports
+            WHERE id = %s
+            LIMIT 1
+        ),
+        previous_report AS (
+            SELECT fr_prev.id
+            FROM financial_reports fr_prev
+            JOIN current_report cr ON fr_prev.krs = cr.krs
+            WHERE fr_prev.fiscal_year = cr.fiscal_year - 1
+              AND fr_prev.data_source_id = cr.data_source_id
+              AND fr_prev.report_type = cr.report_type
+              AND fr_prev.ingestion_status = 'completed'
+            ORDER BY fr_prev.report_version DESC, fr_prev.created_at DESC, fr_prev.id DESC
+            LIMIT 1
+        ),
+        current_items AS (
+            SELECT tag_path, label_pl, value_current, section
+            FROM latest_financial_line_items
+            WHERE report_id = %s
+        ),
+        previous_items AS (
+            SELECT li.tag_path, li.label_pl, li.value_current AS value_previous, li.section
+            FROM latest_financial_line_items li
+            JOIN previous_report pr ON pr.id = li.report_id
+        )
+        SELECT
+            rt.tag_path,
+            coalesce(ci.label_pl, pi.label_pl) AS label_pl,
+            ci.value_current AS value_current,
+            pi.value_previous AS value_previous,
+            coalesce(ci.section, pi.section) AS section
+        FROM requested_tags rt
+        LEFT JOIN current_items ci ON ci.tag_path = rt.tag_path
+        LEFT JOIN previous_items pi ON pi.tag_path = rt.tag_path
+    """, unique_tag_paths + [report_id, report_id])
     return _cursor_to_dicts(cur)
 
 

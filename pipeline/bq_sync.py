@@ -134,10 +134,21 @@ def sync_run(
         result.gcs_uris.append(uri)
 
     # ---- predictions ----
+    #
+    # Parity contract with the pipeline Postgres DB: BQ mirrors every column
+    # that feeds the API response — raw_score/risk_category/classification
+    # (the numbers), feature_contributions + feature_snapshot (why the
+    # score came out that way), and the JSON-serialised contributions carry
+    # the `_warnings` reserved key so nothing is lost in the PG → BQ hop.
+    # BigQuery PARQUET loader accepts JSON as STRING, so we cast both JSON
+    # columns on the SELECT side.
     pr_sql = f"""
         SELECT p.id, p.prediction_run_id, p.krs, p.report_id, fr.fiscal_year,
                pr.model_id, p.raw_score, p.probability, p.classification,
-               p.risk_category, p.created_at
+               p.risk_category,
+               p.feature_contributions::text AS feature_contributions,
+               p.feature_snapshot::text AS feature_snapshot,
+               p.created_at
         FROM predictions p
         JOIN prediction_runs pr ON pr.id = p.prediction_run_id
         JOIN financial_reports fr ON fr.id = p.report_id

@@ -182,24 +182,58 @@ def ingest_document(document_id: str, storage: Optional[LocalStorage] = None) ->
         xml_string = xml_bytes.decode("utf-8", errors="replace")
         parsed = xml_parser.parse_statement(xml_string)
     except Exception as e:
+        # CR3-SEC-002: keep raw exception text only in structured logs and the
+        # etl_attempts audit row. The public return contract is a stable
+        # error code ("parse_error"); callers / API clients never see the
+        # underlying ElementTree / schema-validator message, which would leak
+        # file paths, line numbers, and tag fragments.
+        logger.warning(
+            "etl_parse_error",
+            extra={
+                "event": "etl_parse_error",
+                "document_id": document_id,
+                "attempt_id": attempt_id,
+                "xml_path": xml_path,
+                "error_type": type(e).__name__,
+            },
+            exc_info=True,
+        )
         _finish_etl_attempt(
             attempt_id, status="failed",
             reason_code="parse_error", error_message=str(e),
             xml_path=xml_path,
         )
-        return {"report_id": document_id, "status": "failed", "error": str(e)}
+        return {"report_id": document_id, "status": "failed", "error": "parse_error"}
 
     # Steps 4-8 are wrapped so that any unexpected error still finalises the attempt.
     xml_path_for_attempt = xml_path
     try:
         company = parsed["company"]
-        period_start = company.get("period_start") or "1970-01-01"
-        period_end = company.get("period_end") or "1970-01-01"
+        period_start = company.get("period_start")
+        period_end = company.get("period_end")
+
+        if not period_end:
+            _finish_etl_attempt(
+                attempt_id, status="failed",
+                reason_code="invalid_period_end",
+                error_message="period_end is missing from parsed XML",
+                xml_path=xml_path,
+            )
+            return {"report_id": document_id, "status": "failed", "error": "invalid_period_end"}
 
         try:
             fiscal_year = _determine_fiscal_year(period_end)
-        except ValueError:
-            fiscal_year = 0
+        except ValueError as e:
+            _finish_etl_attempt(
+                attempt_id, status="failed",
+                reason_code="invalid_period_end",
+                error_message=str(e),
+                xml_path=xml_path,
+            )
+            return {"report_id": document_id, "status": "failed", "error": "invalid_period_end"}
+
+        if not period_start:
+            period_start = period_end
 
         # 4. Upsert company
         prediction_db.upsert_company(
@@ -362,14 +396,33 @@ def ingest_all_pending(storage: Optional[LocalStorage] = None) -> dict:
             if result["status"] == "completed":
                 results["completed"] += 1
             else:
+                # Per-document failures from `ingest_document` already return
+                # stable error codes (no_xml_found / parse_error /
+                # invalid_period_end / …) via CR3-SEC-002, so it is safe to
+                # bubble them up untouched.
                 results["failed"] += 1
-                results["errors"].append({"document_id": doc_id, "error": result.get("error")})
+                results["errors"].append({
+                    "document_id": doc_id,
+                    "error": result.get("error") or "unknown_error",
+                })
         except Exception as e:
+            # CR3-SEC-002: never expose raw exception text in the aggregated
+            # result payload — the `/api/etl/ingest` route returns this
+            # object directly to clients. Log the full exception server-side
+            # and emit a stable code in the response body.
             results["failed"] += 1
-            results["errors"].append({"document_id": doc_id, "error": str(e)})
+            results["errors"].append({
+                "document_id": doc_id,
+                "error": "unexpected_error",
+                "error_type": type(e).__name__,
+            })
             logger.error(
                 "ingest_failed",
-                extra={"event": "ingest_failed", "document_id": doc_id, "error": str(e)},
+                extra={
+                    "event": "ingest_failed",
+                    "document_id": doc_id,
+                    "error_type": type(e).__name__,
+                },
                 exc_info=True,
             )
 

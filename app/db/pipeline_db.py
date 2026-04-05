@@ -317,8 +317,16 @@ def _init_schema() -> None:
             classification  SMALLINT,
             risk_category   VARCHAR(20),
             feature_contributions JSON,
+            feature_snapshot JSON,
             created_at      TIMESTAMP DEFAULT current_timestamp
         )
+    """)
+    # Parity with app/db/prediction_db.py on main (CR-PZN / multi-year
+    # predictions): feature_snapshot was added after the initial pipeline_db
+    # schema. Backfill the column for any pre-existing pipeline DB.
+    conn.execute("""
+        ALTER TABLE predictions
+            ADD COLUMN IF NOT EXISTS feature_snapshot JSON
     """)
 
     # ---- Layer 5: Ground Truth ----

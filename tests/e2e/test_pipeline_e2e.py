@@ -346,6 +346,80 @@ class TestE2EPipeline:
         assert result["computed"] >= 4, \
             f"Expected at least 4/6 Maczynska features, got {result['computed']}"
 
+    def test_10b_poznanski_set_computable(self, downloaded_doc):
+        """All 4 Poznanski features can be computed from real data."""
+        result = feature_engine.compute_features_for_report(
+            downloaded_doc["document_id"],
+            feature_set_id="poznanski_4",
+        )
+
+        print(f"\n  Poznanski features: {result['computed']} computed, {result['failed']} failed")
+        for fid in ["x1_poznanski", "x2_poznanski", "x3_poznanski", "x4_poznanski"]:
+            val = result["features"].get(fid)
+            status = f"{val:.6f}" if val is not None else "NULL"
+            print(f"    {fid} = {status}")
+
+        # All 4 should compute — Poznanski only needs common Bilans/RZiS tags.
+        assert result["computed"] >= 4, \
+            f"Expected all 4 Poznanski features, got {result['computed']}"
+
+    def test_10c_poznanski_scores_report(self, downloaded_doc):
+        """End-to-end Poznanski scoring: run score_batch and verify persistence."""
+        from app.services import poznanski
+
+        # Ensure features are computed for the set
+        feature_engine.compute_features_for_report(
+            downloaded_doc["document_id"],
+            feature_set_id="poznanski_4",
+        )
+
+        # Single-report scoring
+        score = poznanski.score_report(downloaded_doc["document_id"])
+        assert score is not None, "Poznanski should produce a score on real data"
+        assert score["raw_score"] is not None
+        assert score["classification"] in (0, 1)
+        assert score["risk_category"] in ("critical", "medium", "low")
+        assert "_intercept" in score["feature_contributions"]
+        print(
+            f"\n  Poznanski Z={score['raw_score']:.4f} "
+            f"class={score['classification']} "
+            f"risk={score['risk_category']} "
+            f"warnings={score['warnings']}"
+        )
+
+        # Batch scoring + persistence
+        batch_result = poznanski.score_batch([downloaded_doc["document_id"]])
+        assert batch_result["scored"] == 1
+        assert batch_result["errors"] == 0
+        run_id = batch_result["run_id"]
+        assert run_id is not None, "Batch should issue a prediction_run when scoring happened"
+
+        # Verify model registered + prediction persisted under this run.
+        models = prediction_db.get_active_models()
+        assert any(m["id"] == poznanski.MODEL_ID for m in models), \
+            "Poznanski model should be registered after score_batch"
+
+        # CR-PZN-005: scope the persistence assertion to the run we just created
+        # and the Poznanski model specifically. `get_latest_prediction(krs)` returns
+        # the latest row across *all* models — a Maczynska-only write would have
+        # false-passed the old assertion and masked a Poznanski persistence regression.
+        conn = prediction_db.get_conn()
+        row = conn.execute(
+            """
+            SELECT p.id, p.raw_score, pr.model_id
+            FROM predictions p
+            JOIN prediction_runs pr ON pr.id = p.prediction_run_id
+            WHERE p.prediction_run_id = %s
+              AND pr.model_id = %s
+              AND p.krs = %s
+            """,
+            [run_id, poznanski.MODEL_ID, KRS],
+        ).fetchone()
+        assert row is not None, (
+            f"No Poznanski prediction persisted for run_id={run_id} krs={KRS}"
+        )
+        assert row[1] is not None, "Persisted prediction should carry a raw_score"
+
     def test_11_idempotent_reingest(self, downloaded_doc):
         """Re-ingesting the same document doesn't break anything."""
         items_before = prediction_db.get_line_items(downloaded_doc["document_id"])

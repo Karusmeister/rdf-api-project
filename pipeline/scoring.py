@@ -19,6 +19,23 @@ from app.services.predictions import SCORERS
 logger = logging.getLogger(__name__)
 
 
+def _feature_ids_for_set(
+    conn: ConnectionWrapper, feature_set_id: Optional[str]
+) -> list[str]:
+    if not feature_set_id:
+        return []
+    rows = conn.execute(
+        """
+        SELECT feature_definition_id
+        FROM feature_set_members
+        WHERE feature_set_id = %s
+        ORDER BY ordinal
+        """,
+        [feature_set_id],
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def _get_active_models(conn: ConnectionWrapper) -> list[dict]:
     rows = conn.execute(
         """
@@ -34,11 +51,18 @@ def _fetch_feature_matrix(
     conn: ConnectionWrapper,
     report_ids: list[str],
 ) -> dict[str, dict]:
-    """{report_id: {'krs':..., 'features': {fid: val}}}."""
+    """{report_id: {'krs':..., 'features': {fid: val}, 'snapshot': {fid: version}}}.
+
+    The `snapshot` sub-dict maps every feature we used when scoring to the
+    computation_version that produced it. It gets persisted verbatim into
+    predictions.feature_snapshot so downstream consumers can tell exactly
+    which feature vector was used for each prediction (matching the CR-PZN
+    behaviour added in prediction_db on main).
+    """
     if not report_ids:
         return {}
     meta = {
-        r[0]: {"krs": r[1], "features": {}}
+        r[0]: {"krs": r[1], "features": {}, "snapshot": {}}
         for r in conn.execute(
             "SELECT id, krs FROM financial_reports WHERE id = ANY(%s)",
             [report_ids],
@@ -46,15 +70,16 @@ def _fetch_feature_matrix(
     }
     rows = conn.execute(
         """
-        SELECT report_id, feature_definition_id, value
+        SELECT report_id, feature_definition_id, value, computation_version
         FROM latest_computed_features
         WHERE report_id = ANY(%s) AND is_valid = true
         """,
         [report_ids],
     ).fetchall()
-    for rid, fid, val in rows:
+    for rid, fid, val, ver in rows:
         if rid in meta:
             meta[rid]["features"][fid] = val
+            meta[rid]["snapshot"][fid] = int(ver or 1)
     return meta
 
 
@@ -114,6 +139,12 @@ def score_reports(
             )
             continue
 
+        # Which feature defs does this model need? We scope the snapshot we
+        # persist to JUST those, mirroring `poznanski.score_batch` /
+        # `maczynska.score_batch` on main so the recorded snapshot is
+        # meaningful instead of being "every feature in the matrix".
+        model_feature_ids = _feature_ids_for_set(conn, model.get("feature_set_id"))
+
         run_id = _create_prediction_run(conn, model_id)
         rows: list[tuple] = []
 
@@ -121,6 +152,33 @@ def score_reports(
             result = scorer(data["features"])
             if result is None:
                 continue
+
+            # Merge `contributions` (SCORERS convention) or
+            # `feature_contributions` (batch scorer convention). Poznanski
+            # additionally nests `_warnings` inside contributions so they
+            # persist without a schema change.
+            contributions = (
+                result.get("contributions")
+                or result.get("feature_contributions")
+                or {}
+            )
+            # If the scorer returned standalone warnings, fold them into the
+            # persisted contributions under the reserved `_warnings` key so
+            # the API layer can extract them later (parity with main's
+            # `_extract_warnings` contract).
+            warnings = result.get("warnings") or []
+            if warnings and "_warnings" not in contributions:
+                contributions = {**contributions, "_warnings": list(warnings)}
+
+            if model_feature_ids:
+                snapshot = {
+                    fid: data["snapshot"].get(fid, 1)
+                    for fid in model_feature_ids
+                    if fid in data["snapshot"]
+                }
+            else:
+                snapshot = dict(data["snapshot"])
+
             rows.append((
                 str(uuid.uuid4()),
                 run_id,
@@ -130,7 +188,8 @@ def score_reports(
                 result.get("probability"),
                 result.get("classification"),
                 result.get("risk_category"),
-                json.dumps(result.get("contributions") or result.get("feature_contributions") or {}),
+                json.dumps(contributions),
+                json.dumps(snapshot),
             ))
 
         if rows:
@@ -140,7 +199,8 @@ def score_reports(
                 """
                 INSERT INTO predictions
                     (id, prediction_run_id, krs, report_id, raw_score, probability,
-                     classification, risk_category, feature_contributions)
+                     classification, risk_category, feature_contributions,
+                     feature_snapshot)
                 VALUES %s
                 ON CONFLICT (id) DO NOTHING
                 """,

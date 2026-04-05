@@ -115,6 +115,7 @@ app/
     etl.py             - XML-to-PostgreSQL ingestion pipeline
     feature_engine.py  - Computes financial ratios from line items (incl. x1_maczynska custom)
     maczynska.py       - Maczynska 1994 discriminant model (baseline bankruptcy predictor)
+    poznanski.py       - Poznanski 2004 (Hamrol/Czajka/Piechocki) 4-variable discriminant model with U-shape liquidity warning
     training_data.py   - EAV-to-wide pivot, bankruptcy label joining, dataset stats
     predictions.py     - Predictions service: scoring, caching, response assembly
   monitoring/
@@ -214,7 +215,7 @@ Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
 **Layer 4 - Models & Predictions:**
 - `model_registry` - Trained model metadata + artifact paths.
 - `prediction_runs` - Batch scoring runs.
-- `predictions` - Individual scores with risk_category and SHAP explanations.
+- `predictions` - Individual scores with risk_category, feature_contributions, and `feature_snapshot` (JSON map `{feature_id: computation_version}` captured at scoring time so the read path can fetch the exact feature values that fed the score — immutable reference, no timestamp heuristics).
 
 **Layer 5 - Ground Truth:**
 - `bankruptcy_events` - Historical bankruptcy/restructuring events (training labels).
@@ -251,6 +252,21 @@ The ETL flattens these trees into financial_line_items using tag paths such as `
 Features are defined as metadata rows in feature_definitions, not hardcoded columns.
 Adding a new feature = INSERT into feature_definitions + re-run compute. No schema changes.
 computation_logic types: 'ratio' (num/denom), 'difference', 'raw_value', 'custom' (Python function).
+Each `computed_features` row has a `(report_id, feature_definition_id, computation_version)` PK so scoring can pin an immutable snapshot — see the Predictions response assembly section.
+
+### Predictions response assembly
+`/api/predictions/{krs}` returns one `PredictionDetail` per `(model_id, fiscal_year)`, each with its own `features[]`, `source_tags[]`, and `scored_at`. Hot-path assembly lives in `app/services/predictions.py::get_predictions` and uses two batched DB round-trips regardless of the number of rows:
+
+- `prediction_db.get_features_for_predictions_batch(requests)` — keyed by a caller-supplied unique `request_id` per prediction (the service uses `f"{model_id}::{fiscal_year}::{report_id}"`). Enforces `request_id` uniqueness; raises `ValueError` on duplicates. Exact-snapshot path joins `computed_features` by the immutable `(report_id, feature_definition_id, computation_version)` triple with `cf.is_valid = true` and `feature_set_members` membership. Partial/corrupted snapshots demote the request to a batched window-function fallback partitioned by `(request_id, feature_definition_id)` and emit a structured `feature_snapshot_incomplete_fallback` warning. Chunked at `_BATCH_CHUNK_SIZE = 800` tuples to stay under PostgreSQL's parameter limit.
+- `prediction_db.get_source_line_items_for_reports_batch(requests)` — one query per N reports using a single CTE. `value_previous` is resolved from the immediately prior fiscal year's latest completed report for the same KRS, **constrained by `data_source_id` AND `report_type`** so deltas never cross filing types. Returns `schema_code` per item for label fallback.
+
+`_assemble_features()` stitches pre-loaded data, resolves `label_pl` against the item's own `schema_code` first (then report-level, then global registry), and stamps `higher_is_better` from the explicit per-tag registry in `predictions.py::_TAG_SEMANTIC_REGISTRY` (exact tag matches only, unknowns → `None` — no prefix inheritance).
+
+`history[]` on the response is a backwards-compatible subset of `predictions[]`. New consumers can ignore it.
+
+Scoring writes `feature_snapshot = {feature_id: computation_version}` on the `predictions` row so reads stay deterministic after rescoring or feature-definition edits. The Mączyńska scorer (`app/services/maczynska.py::score_report`) captures it from `get_computed_features_for_report`.
+
+Feature-definition drift: an idempotent migration in `_init_schema()` backfills `x1_maczynska.required_tags` to include `CF.A_II_1` (covers NULL and stale rows). Re-run `scripts/seed_features.py` on deploy to keep the seed authoritative.
 
 ## Commands
 
@@ -391,7 +407,11 @@ bash scripts/pull_cloud_data.sh
 18. `batch/connections.py` has shared `validate_vpn_config()` — used by both `rdf_runner` and `metadata_runner`
 19. Cloud DB password is stored in GCP Secret Manager (`cloud-db-password`). Never hardcode it — always fetch via `gcloud secrets versions access latest --secret=cloud-db-password --project=rdf-api-project`
 20. GCP secrets: `database-url` (full Cloud SQL connection string), `cloud-db-password` (postgres password only), `jwt-secret`, `nordvpn-username`, `nordvpn-password`
-21. **Proxy pool configuration** — three env vars control proxy behavior:
+21. `/api/predictions/{krs}` returns N `PredictionDetail` rows (one per `(model_id, fiscal_year)`), not the latest year only. Each row carries its own `features[]` and `source_tags[]`. `history[]` is backwards-compat only.
+22. Every request to `get_features_for_predictions_batch` must carry a unique `request_id` — sharing report+feature_set across different snapshots or scored_at would collapse rows. Service uses `f"{model_id}::{fiscal_year}::{report_id}"`.
+23. ETL fails with `reason_code=invalid_period_end` when `period_end` is missing or unparseable — never coerces `fiscal_year` to 0.
+24. `SourceTag.higher_is_better` uses an **exact-match** per-tag registry in `app/services/predictions.py::_TAG_SEMANTIC_REGISTRY`. Adding a tag is a deliberate domain decision; unknowns resolve to `None` (neutral). No prefix inheritance — sibling tags do not auto-inherit.
+25. **Proxy pool configuration** — three env vars control proxy behavior:
     - `BATCH_USE_VPN=true` — enables proxy pool (NordVPN + public proxies)
     - `BATCH_USE_PUBLIC_PROXIES=true` — loads `proxies.json` into the pool (opt-in, default off)
     - `BATCH_REQUIRE_VPN_ONLY=true` — strict mode: no direct egress fallback. Job fails if all proxies are dead.
