@@ -275,6 +275,54 @@ FEATURE_DEFINITIONS = [
         "required_tags": ["RZiS.A", "Aktywa"],
         "computation_logic": "ratio",
     },
+
+    # --- Poznanski Model (Hamrol, Czajka, Piechocki 2004) X1-X4 ---
+    # Reference: Hamrol M., Czajka B., Piechocki M., 2004.
+    # Z = 3.562*X1 + 1.588*X2 + 4.288*X3 + 6.719*X4 - 2.368
+    {
+        "id": "x1_poznanski",
+        "name": "Poznanski X1: return on assets",
+        "description": "Net profit / Total assets",
+        "category": "poznanski",
+        "formula_description": "RZiS.L / Aktywa",
+        "formula_numerator": "RZiS.L",
+        "formula_denominator": "Aktywa",
+        "required_tags": ["RZiS.L", "Aktywa"],
+        "computation_logic": "ratio",
+    },
+    {
+        "id": "x2_poznanski",
+        "name": "Poznanski X2: quick ratio",
+        "description": "(Current assets - Inventory) / Short-term liabilities",
+        "category": "poznanski",
+        "formula_description": "(Aktywa_B - Aktywa_B_I) / Pasywa_B_III",
+        "formula_numerator": "Aktywa_B",
+        "formula_denominator": "Pasywa_B_III",
+        "required_tags": ["Aktywa_B", "Aktywa_B_I", "Pasywa_B_III"],
+        "computation_logic": "custom",
+    },
+    {
+        "id": "x3_poznanski",
+        "name": "Poznanski X3: fixed capital ratio",
+        "description": "(Equity + Long-term liabilities) / Total assets",
+        "category": "poznanski",
+        "formula_description": "(Pasywa_A + Pasywa_B_II) / Aktywa",
+        "formula_numerator": "Pasywa_A",
+        "formula_denominator": "Aktywa",
+        "required_tags": ["Pasywa_A", "Pasywa_B_II", "Aktywa"],
+        "computation_logic": "custom",
+    },
+    {
+        "id": "x4_poznanski",
+        "name": "Poznanski X4: sales profitability",
+        "description": "Profit on sales / Net revenue from sales",
+        "category": "poznanski",
+        "formula_description": "RZiS.C / RZiS.A",
+        "formula_numerator": "RZiS.C",
+        "formula_denominator": "RZiS.A",
+        "required_tags": ["RZiS.C", "RZiS.A"],
+        "computation_logic": "ratio",
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -300,6 +348,13 @@ FEATURE_SETS = {
         "members": [
             "x1_maczynska", "x2_maczynska", "x3_maczynska",
             "x4_maczynska", "x5_maczynska", "x6_maczynska",
+        ],
+    },
+    "poznanski_4": {
+        "name": "Poznanski MDA Model (4 features)",
+        "description": "Four features for the Poznanski (Hamrol/Czajka/Piechocki 2004) discriminant bankruptcy model",
+        "members": [
+            "x1_poznanski", "x2_poznanski", "x3_poznanski", "x4_poznanski",
         ],
     },
 }

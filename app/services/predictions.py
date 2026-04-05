@@ -14,6 +14,13 @@ from typing import Callable
 from app.db import prediction_db
 from app.services.maczynska import COEFFICIENTS as MACZYNSKA_COEFFICIENTS
 from app.services.maczynska import classify as maczynska_classify
+from app.services.poznanski import (
+    COEFFICIENTS as POZNANSKI_COEFFICIENTS,
+    INTERCEPT as POZNANSKI_INTERCEPT,
+    NON_LINEAR_LIQUIDITY_THRESHOLD as POZNANSKI_X2_THRESHOLD,
+    WARNING_NON_LINEAR_LIQUIDITY,
+    classify as poznanski_classify,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +43,16 @@ INTERPRETATION: dict[str, dict] = {
             {"label": "medium", "min": 1, "max": 2, "summary": "Acceptable."},
             {"label": "low", "min": 2, "summary": "Good condition."},
         ],
-    }
+    },
+    "poznanski_2004_v1": {
+        "score_name": "Z-score (Poznanski)",
+        "higher_is_better": True,
+        "thresholds": [
+            {"label": "critical", "max": 0, "summary": "Bankruptcy risk zone."},
+            {"label": "medium", "min": 0, "max": 1, "summary": "Stable but monitor."},
+            {"label": "low", "min": 1, "summary": "Good condition."},
+        ],
+    },
 }
 
 
@@ -92,6 +108,39 @@ def register_scorer(model_id: str, fn: Callable) -> None:
 
 
 register_scorer("maczynska_1994_v1", score_maczynska)
+
+
+def score_poznanski(features: dict[str, float | None]) -> dict | None:
+    missing = [k for k in POZNANSKI_COEFFICIENTS if features.get(k) is None]
+    if missing:
+        return None
+    z = float(POZNANSKI_INTERCEPT) + sum(
+        POZNANSKI_COEFFICIENTS[k] * features[k] for k in POZNANSKI_COEFFICIENTS
+    )
+    z = round(z, 6)
+    classification, risk_category = poznanski_classify(z)
+    contributions: dict = {"_intercept": round(float(POZNANSKI_INTERCEPT), 6)}
+    for k in POZNANSKI_COEFFICIENTS:
+        contributions[k] = round(POZNANSKI_COEFFICIENTS[k] * features[k], 6)
+
+    warnings: list[str] = []
+    x2 = features.get("x2_poznanski")
+    if x2 is not None and x2 > POZNANSKI_X2_THRESHOLD:
+        warnings.append(WARNING_NON_LINEAR_LIQUIDITY)
+        if risk_category == "low":
+            risk_category = "medium"
+    if warnings:
+        contributions["_warnings"] = warnings
+
+    return {
+        "raw_score": z,
+        "classification": classification,
+        "risk_category": risk_category,
+        "contributions": contributions,
+    }
+
+
+register_scorer("poznanski_2004_v1", score_poznanski)
 
 
 # ---------------------------------------------------------------------------

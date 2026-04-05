@@ -115,6 +115,7 @@ app/
     etl.py             - XML-to-PostgreSQL ingestion pipeline
     feature_engine.py  - Computes financial ratios from line items (incl. x1_maczynska custom)
     maczynska.py       - Maczynska 1994 discriminant model (baseline bankruptcy predictor)
+    poznanski.py       - Poznanski 2004 (Hamrol/Czajka/Piechocki) 4-variable discriminant model with U-shape liquidity warning
     training_data.py   - EAV-to-wide pivot, bankruptcy label joining, dataset stats
     predictions.py     - Predictions service: scoring, caching, response assembly
   monitoring/
