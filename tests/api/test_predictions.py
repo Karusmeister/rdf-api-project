@@ -64,6 +64,7 @@ _FAKE_PREDICTION_FAT = [{
     "report_version": 1,
     "data_source_id": "KRS",
     "ingested_at": "2026-02-01 10:00:00",
+    "schema_code": "SFJINZ",
 }]
 
 
@@ -111,15 +112,55 @@ class TestGetPredictions:
     @patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_USER)
     @patch("app.db.prediction_db.get_predictions_fat", return_value=_FAKE_PREDICTION_FAT)
     @patch("app.db.prediction_db.get_company", return_value=_FAKE_COMPANY)
-    @patch("app.db.prediction_db.get_features_for_report", return_value=[])
+    @patch("app.db.prediction_db.get_features_for_predictions_batch", return_value={})
+    @patch("app.db.prediction_db.get_source_line_items_for_reports_batch", return_value={})
     @patch("app.db.prediction_db.get_prediction_history_fat", return_value=[])
-    def test_returns_predictions(self, mock_hist, mock_feat, mock_company, mock_preds, mock_user, mock_access):
+    def test_returns_predictions(self, mock_hist, mock_sources, mock_feat, mock_company, mock_preds, mock_user, mock_access):
         resp = client.get("/api/predictions/0000694720", headers=_auth_header())
         assert resp.status_code == 200
         data = resp.json()
         assert data["company"]["krs"] == "0000694720"
         assert len(data["predictions"]) == 1
         assert data["predictions"][0]["result"]["risk_category"] == "low"
+
+    @patch("app.db.prediction_db.check_krs_access", return_value=True)
+    @patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_USER)
+    @patch(
+        "app.db.prediction_db.get_predictions_fat",
+        return_value=[
+            _FAKE_PREDICTION_FAT[0],
+            {
+                **_FAKE_PREDICTION_FAT[0],
+                "report_id": "rpt-0",
+                "fiscal_year": 2023,
+                "period_start": "2023-01-01",
+                "period_end": "2023-12-31",
+                "raw_score": 1.1,
+                "risk_category": "medium",
+                "scored_at": "2025-03-01 12:00:00",
+            },
+        ],
+    )
+    @patch("app.db.prediction_db.get_company", return_value=_FAKE_COMPANY)
+    @patch("app.db.prediction_db.get_features_for_predictions_batch", return_value={})
+    @patch("app.db.prediction_db.get_source_line_items_for_reports_batch", return_value={})
+    @patch("app.db.prediction_db.get_prediction_history_fat", return_value=[])
+    def test_returns_multi_year_predictions_per_model(
+        self,
+        mock_hist,
+        mock_sources,
+        mock_feat,
+        mock_company,
+        mock_preds,
+        mock_user,
+        mock_access,
+    ):
+        resp = client.get("/api/predictions/0000694720", headers=_auth_header())
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["predictions"]) == 2
+        years = {p["data_source"]["fiscal_year"] for p in data["predictions"]}
+        assert years == {2023, 2024}
 
     def test_401_without_token(self):
         resp = client.get("/api/predictions/0000694720")

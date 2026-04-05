@@ -85,6 +85,7 @@ app/
     xml_parser.py         Statement parsing and comparison logic
     etl.py                XML -> PostgreSQL ingestion
     feature_engine.py     Ratio and feature computation
+    maczynska.py          Mączyńska 1994 discriminant model (baseline bankruptcy predictor)
     predictions.py        Scoring, caching, response assembly for predictions API
 batch/
   connections.py          Connection pool + shared VPN validation
@@ -368,6 +369,13 @@ curl 'http://localhost:8000/api/predictions/0000694720/history?model_id=maczynsk
   -H 'Authorization: Bearer <token>'
 ```
 
+#### Response shape notes
+
+- `predictions[]` contains **one `PredictionDetail` per `(model_id, fiscal_year)`**. Every entry carries its own `features[]`, `data_source.fiscal_year`, `data_source.period_start/end`, and `scored_at` — historical years render the full per-year calculation view, not a summary fallback. Rescored years are deduped: the most recent scoring wins.
+- `history[]` is returned for backwards compatibility with clients that index scores for timeline charting. It is a strict subset of `predictions[]` and can be ignored by new consumers.
+- `features[].source_tags[]` lists every line item referenced by the feature's `formula_description`, including `value_current`, `value_previous` (raw prior-year value from the same `(data_source_id, report_type)`), `label_pl`, and `section`.
+- **Additive field (2026-04):** `SourceTag.higher_is_better: bool | null` — semantic direction of the tag, sourced from an explicit per-tag registry in `app/services/predictions.py`. `true` = higher values indicate better financial health, `false` = higher values are a negative signal, `null` (default) = the backend has no opinion. Registry currently covers the Mączyńska feature tags (`RZiS.A/C/F/I/L`, `CF.A_II_1`, `Pasywa_A/B`, `Aktywa_B_I`); other tags fall through to `null`. Clients treating the response as strict should mark this field optional.
+
 ## Bulk Scraping Workflow
 
 The scraper is CLI-driven. Typical flow:
@@ -454,7 +462,7 @@ Current pipeline after documents are on disk:
 2. [`scripts/seed_features.py`](/Users/piotrkraus/piotr/rdf-api-project/scripts/seed_features.py) seeds feature metadata
 3. [`app/services/feature_engine.py`](/Users/piotrkraus/piotr/rdf-api-project/app/services/feature_engine.py) computes ratios and derived features
 
-Prediction scores are exposed via `/api/predictions/{krs}` (see Auth and Predictions sections above). Scores are pre-computed by `app/services/maczynska.py` and stored in the `predictions` table.
+Prediction scores are exposed via `/api/predictions/{krs}` (see Auth and Predictions sections above). Scores are pre-computed by `app/services/maczynska.py` and persisted to the `predictions` table, which carries a `feature_snapshot` JSON column mapping each feature to the immutable `computation_version` that fed the score. The API read path (`app/services/predictions.py`) assembles every response in exactly two batched DB round-trips — one for features (keyed by a unique `request_id` per prediction so distinct predictions sharing a report + feature set never collapse), one for source line items across all reports (with `value_previous` resolved from the prior fiscal year constrained by `data_source_id` + `report_type`). Historical years return the full per-year calculation view, including `source_tags[]` with `label_pl`, `value_current`, `value_previous`, `section`, and the optional `higher_is_better` semantic flag.
 
 ## Testing
 

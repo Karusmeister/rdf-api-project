@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Callable
 
 from app.db import prediction_db
@@ -21,10 +22,12 @@ from app.services.poznanski import (
     WARNING_NON_LINEAR_LIQUIDITY,
     classify as poznanski_classify,
 )
+from app.services.schema_labels import SCHEMA_REGISTRY
 
 logger = logging.getLogger(__name__)
 
 SCORERS: dict[str, Callable] = {}
+FORMULA_TAG_PATTERN = re.compile(r"[A-Z][A-Za-z0-9]*(?:[._][A-Za-z0-9]+)+")
 
 # ---------------------------------------------------------------------------
 # Caches (populated at startup, invalidated on seed/deploy)
@@ -164,46 +167,172 @@ def _build_interpretation(model_id: str, risk_category: str | None) -> dict | No
     }
 
 
-def _build_features(report_id: str, feature_set_id: str, contributions: dict | None) -> list[dict]:
-    features_data = prediction_db.get_features_for_report(report_id, feature_set_id)
+def _extract_formula_tags(formula_description: str | None) -> list[str]:
+    if not formula_description:
+        return []
+    return [match.group(0) for match in FORMULA_TAG_PATTERN.finditer(formula_description)]
+
+
+def _collect_feature_tags(feature_row: dict) -> list[str]:
+    ordered_tags: list[str] = []
+    seen: set[str] = set()
+
+    for tag in _extract_formula_tags(feature_row.get("formula_description")):
+        if tag not in seen:
+            ordered_tags.append(tag)
+            seen.add(tag)
+
+    required_tags = feature_row.get("required_tags")
+    if isinstance(required_tags, str):
+        required_tags = json.loads(required_tags)
+    if isinstance(required_tags, list):
+        for tag in required_tags:
+            if isinstance(tag, str) and tag not in seen:
+                ordered_tags.append(tag)
+                seen.add(tag)
+
+    return ordered_tags
+
+
+def _infer_section_from_tag(tag_path: str) -> str:
+    if tag_path.startswith("CF."):
+        return "CF"
+    if tag_path.startswith("RZiS."):
+        return "RZiS"
+    return "Bilans"
+
+
+# BE-PRED-010: semantic direction per source tag.
+#
+# Explicit, per-tag registry at full-tag-path granularity (no prefix
+# inheritance). Adding a new entry is a deliberate domain decision — every row
+# has been reviewed against the canonical Polish financial-statement taxonomy
+# and tracks "does a higher value indicate better financial health?". Tags
+# outside this registry resolve to `None` and the frontend renders them with
+# neutral coloring; we do NOT guess for unknowns because prefix-based rules
+# can silently miscolor siblings that happen to carry opposite business
+# meaning (e.g. a `Pasywa_B_*` bucket where one child is equity-like).
+#
+# Scope: covers every tag used by the Mączyńska model's features
+# (x1..x6 → RZiS.I, RZiS.A, CF.A_II_1, Pasywa_B, Aktywa, Aktywa_B_I) plus the
+# nearest-neighbor tags the frontend exposes in the expanded detail panel.
+# Extend deliberately and paired with a test in
+# tests/services/test_predictions_service.py.
+_TAG_SEMANTIC_REGISTRY: dict[str, bool] = {
+    # --- Profit & loss statement (RZiS) — higher is generally better. ---
+    "RZiS.A": True,    # Przychody netto ze sprzedaży (net revenue)
+    "RZiS.C": True,    # Zysk brutto ze sprzedaży (gross profit on sales)
+    "RZiS.F": True,    # Zysk z działalności operacyjnej (operating profit)
+    "RZiS.I": True,    # Zysk brutto (pre-tax profit)
+    "RZiS.L": True,    # Zysk netto (net profit)
+    # --- Cash flow statement (CF) — operating cash + depreciation. ---
+    "CF.A_II_1": True,  # Amortyzacja (depreciation add-back in CF)
+    # --- Balance sheet: equity (Pasywa_A) — higher is better. ---
+    "Pasywa_A": True,   # Kapitał (fundusz) własny (equity)
+    # --- Balance sheet: liabilities (Pasywa_B) — higher is worse. ---
+    "Pasywa_B": False,  # Zobowiązania i rezerwy na zobowiązania (total liabilities)
+    # --- Balance sheet: current inventory (Aktywa_B_I) — bloating is negative. ---
+    "Aktywa_B_I": False,  # Zapasy (inventories)
+    # --- Neutral tags: intentionally omitted (resolve to None). ---
+    # "Aktywa"       — size proxy, neither good nor bad alone.
+    # "Aktywa_B_II"  — short-term receivables: direction is context-dependent.
+    # "Aktywa_B_III" — cash & short-term investments: context-dependent.
+    # "Aktywa_A"     — fixed assets: neutral.
+    # "Pasywa_B_III" — short-term liabilities: already covered by Pasywa_B when exposed.
+}
+
+
+def _resolve_higher_is_better(tag_path: str) -> bool | None:
+    """Look up the semantic direction of a tag.
+
+    Returns True if higher values indicate better financial health, False if
+    higher values are a negative signal, None if the tag is not in the
+    registry (neutral — frontend colors it muted). Matching is exact on the
+    full `tag_path` by design — see `_TAG_SEMANTIC_REGISTRY` docstring for
+    rationale.
+    """
+    return _TAG_SEMANTIC_REGISTRY.get(tag_path)
+
+
+def _resolve_tag_label(tag_path: str, schema_code: str | None) -> str | None:
+    schema = SCHEMA_REGISTRY.get(schema_code or "SFJINZ")
+    labels = schema["tag_labels"] if schema else {}
+    raw = tag_path.split(".")[-1] if "." in tag_path else tag_path
+    return labels.get(tag_path) or labels.get(raw)
+
+
+def _build_features(
+    report_id: str,
+    feature_set_id: str,
+    contributions: dict | None,
+    scored_at: str | None = None,
+    schema_code: str | None = None,
+) -> list[dict]:
+    """Single-prediction feature builder (kept for legacy callers and tests).
+
+    Hot path uses `get_features_for_predictions_batch` via `get_predictions`;
+    this helper issues one query per report and must not be used in loops.
+    """
+    features_data = prediction_db.get_features_for_prediction(
+        report_id,
+        feature_set_id,
+        scored_at=scored_at,
+    )
+    if not features_data and scored_at is not None:
+        features_data = prediction_db.get_features_for_prediction(
+            report_id,
+            feature_set_id,
+            scored_at=None,
+        )
     if not features_data:
         return []
 
-    # Collect all required tags across features
-    all_tags = set()
+    all_tags: set[str] = set()
     for f in features_data:
-        tags = f.get("required_tags")
-        if tags:
-            if isinstance(tags, str):
-                tags = json.loads(tags)
-            if isinstance(tags, list):
-                all_tags.update(tags)
+        all_tags.update(_collect_feature_tags(f))
 
-    # Fetch source line items in one query
-    source_items = {}
+    source_items_by_tag: dict[str, dict] = {}
     if all_tags:
-        items = prediction_db.get_source_line_items_for_report(report_id, list(all_tags))
-        for item in items:
-            source_items[item["tag_path"]] = item
+        items = prediction_db.get_source_line_items_for_report(report_id, sorted(all_tags))
+        source_items_by_tag = {it["tag_path"]: it for it in items}
 
+    return _assemble_features(
+        features_data=features_data,
+        source_items_by_tag=source_items_by_tag,
+        contributions=contributions,
+        schema_code=schema_code,
+    )
+
+
+def _assemble_features(
+    features_data: list[dict],
+    source_items_by_tag: dict[str, dict],
+    contributions: dict | None,
+    schema_code: str | None,
+) -> list[dict]:
+    """Assemble the per-feature response shape from pre-loaded data.
+
+    `source_items_by_tag` is the map of already-fetched source items for the
+    report. `schema_code` is the report-level schema used only as a last-ditch
+    fallback when an item has no schema_code of its own.
+    """
     result = []
     for f in features_data:
-        tags = f.get("required_tags")
-        if isinstance(tags, str):
-            tags = json.loads(tags)
-
+        tags = _collect_feature_tags(f)
         source_tags = []
-        if tags and isinstance(tags, list):
-            for tp in tags:
-                si = source_items.get(tp)
-                if si:
-                    source_tags.append({
-                        "tag_path": tp,
-                        "label_pl": si.get("label_pl"),
-                        "value_current": si.get("value_current"),
-                        "value_previous": si.get("value_previous"),
-                        "section": si.get("section"),
-                    })
+        for tp in tags:
+            si = source_items_by_tag.get(tp, {})
+            # CR-005: resolve label against the item's own schema first, then
+            # the report-level schema, then global fallback.
+            item_schema = si.get("schema_code") or schema_code
+            source_tags.append({
+                "tag_path": tp,
+                "label_pl": si.get("label_pl") or _resolve_tag_label(tp, item_schema),
+                "value_current": si.get("value_current"),
+                "value_previous": si.get("value_previous"),
+                "section": si.get("section") or _infer_section_from_tag(tp),
+                "higher_is_better": _resolve_higher_is_better(tp),
+            })
 
         contribution = None
         if contributions and f["feature_definition_id"] in contributions:
@@ -258,21 +387,66 @@ def get_predictions(krs: str) -> dict:
             "history": history_entries,
         }
 
-    # Group by model, take latest prediction per model
-    seen_models: dict[str, dict] = {}
+    # Return one entry per (model_id, fiscal_year). When a fiscal year has
+    # been rescored, keep the first row — `get_predictions_fat` already orders
+    # by scored_at DESC, report_version DESC within the same (model, year).
+    # Assign a stable per-prediction request_id so feature-loader keys never
+    # collapse across distinct predictions that happen to share a report +
+    # feature set (R3-001/002/003).
+    seen_rows: dict[tuple[str, int], dict] = {}
     for p in raw_predictions:
-        mid = p["model_id"]
-        if mid not in seen_models:
-            seen_models[mid] = p
+        key = (p["model_id"], p["fiscal_year"])
+        if key not in seen_rows:
+            p = dict(p)
+            p["_request_id"] = f"{p['model_id']}::{p['fiscal_year']}::{p['report_id']}"
+            seen_rows[key] = p
+
+    # Batch-load features per prediction (keyed by request_id) and source items
+    # per report in two DB round-trips regardless of the prediction count.
+    feature_requests = [
+        {
+            "request_id": p["_request_id"],
+            "report_id": p["report_id"],
+            "feature_set_id": p["feature_set_id"],
+            "feature_snapshot": p.get("feature_snapshot"),
+            "scored_at": p.get("scored_at"),
+            "model_id": p.get("model_id"),
+            "fiscal_year": p.get("fiscal_year"),
+        }
+        for p in seen_rows.values()
+        if p.get("feature_set_id")
+    ]
+    features_by_request = prediction_db.get_features_for_predictions_batch(feature_requests)
+
+    # Gather all tags per report for the source-items batch.
+    tags_by_report: dict[str, set[str]] = {}
+    for p in seen_rows.values():
+        if not p.get("feature_set_id"):
+            continue
+        for f in features_by_request.get(p["_request_id"], []):
+            tags_by_report.setdefault(p["report_id"], set()).update(_collect_feature_tags(f))
+
+    source_requests = [
+        (report_id, sorted(tags)) for report_id, tags in tags_by_report.items() if tags
+    ]
+    source_items_by_report = prediction_db.get_source_line_items_for_reports_batch(source_requests)
 
     predictions = []
-    for p in seen_models.values():
+    for p in seen_rows.values():
         contributions = p.get("feature_contributions")
-        features = _build_features(
-            p["report_id"],
-            p["feature_set_id"],
-            contributions,
-        ) if p["feature_set_id"] else []
+        fs_id = p.get("feature_set_id")
+        if fs_id:
+            features_data = features_by_request.get(p["_request_id"], [])
+            items_list = source_items_by_report.get(p["report_id"], [])
+            items_by_tag = {it["tag_path"]: it for it in items_list}
+            features = _assemble_features(
+                features_data=features_data,
+                source_items_by_tag=items_by_tag,
+                contributions=contributions,
+                schema_code=p.get("schema_code"),
+            )
+        else:
+            features = []
 
         predictions.append({
             "model": {

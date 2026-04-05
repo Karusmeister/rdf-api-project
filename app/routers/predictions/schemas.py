@@ -11,6 +11,15 @@ class SourceTag(BaseModel):
     value_current: float | None = Field(default=None, description="Value for the current reporting period")
     value_previous: float | None = Field(default=None, description="Value for the previous reporting period")
     section: str | None = Field(default=None, description="Statement section: Bilans, RZiS, or CF")
+    higher_is_better: bool | None = Field(
+        default=None,
+        description=(
+            "Semantic direction of the tag: true if higher values indicate better "
+            "financial health, false if higher values are a negative signal, null "
+            "if the tag is neutral or the backend has no opinion. The frontend uses "
+            "this to color year-over-year change indicators."
+        ),
+    )
 
 
 class FeatureDetail(BaseModel):
@@ -115,7 +124,12 @@ class PredictionResponse(BaseModel):
     company: CompanyInfo
     predictions: list[PredictionDetail] = Field(
         default_factory=list,
-        description="Latest prediction per active model — one entry per model, picked by most recent fiscal year",
+        description=(
+            "All scored predictions — one entry per (model, fiscal_year). "
+            "Each entry carries its own features[] and data_source.fiscal_year, "
+            "so historical years light up the full per-year calculation view. "
+            "Rescored years are deduped: the latest scoring wins."
+        ),
     )
     history: list[HistoryEntry] = Field(
         default_factory=list,

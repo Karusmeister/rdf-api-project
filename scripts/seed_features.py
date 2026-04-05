@@ -217,7 +217,7 @@ FEATURE_DEFINITIONS = [
         "formula_description": "(RZiS.I + CF.A_II_1) / Pasywa_B",
         "formula_numerator": "RZiS.I",
         "formula_denominator": "Pasywa_B",
-        "required_tags": ["RZiS.I", "Pasywa_B"],
+        "required_tags": ["RZiS.I", "CF.A_II_1", "Pasywa_B"],
         "computation_logic": "custom",
     },
     {

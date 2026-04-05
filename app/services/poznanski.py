@@ -98,6 +98,7 @@ def score_report(report_id: str) -> Optional[dict]:
     """
     features = prediction_db.get_computed_features_for_report(report_id, valid_only=True)
     feature_map = {f["feature_definition_id"]: f["value"] for f in features}
+    version_map = {f["feature_definition_id"]: f["computation_version"] for f in features}
 
     missing = [
         fid for fid in REQUIRED_FEATURES
@@ -138,11 +139,14 @@ def score_report(report_id: str) -> Optional[dict]:
     if warnings:
         contributions["_warnings"] = warnings
 
+    feature_snapshot = {fid: version_map[fid] for fid in REQUIRED_FEATURES}
+
     return {
         "raw_score": z_score,
         "classification": classification,
         "risk_category": risk_category,
         "feature_contributions": contributions,
+        "feature_snapshot": feature_snapshot,
         "warnings": warnings,
     }
 
@@ -188,6 +192,7 @@ def score_batch(report_ids: Optional[list[str]] = None) -> dict:
                 classification=result["classification"],
                 risk_category=result["risk_category"],
                 feature_contributions=result["feature_contributions"],
+                feature_snapshot=result.get("feature_snapshot"),
             )
             scored += 1
 
