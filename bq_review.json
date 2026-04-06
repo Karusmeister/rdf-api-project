@@ -1,0 +1,175 @@
+{
+  "review_date": "2026-04-06",
+  "branch": "etl_pipeline",
+  "categories": {
+    "must_fix": [
+      {
+        "id": "BQ-001",
+        "title": "BQ duplicate rows on re-sync",
+        "severity": "high",
+        "file": "pipeline/bq_sync.py",
+        "lines": "61-78",
+        "problem": "WRITE_APPEND disposition for line_items, features, and predictions means re-runs or scheduler retries produce duplicate rows in BigQuery. PostgreSQL is protected by ON CONFLICT; BigQuery has no equivalent on append.",
+        "fix": "Option A: Switch to MERGE after loading to a staging table, deduplicating on (id) for predictions, (report_id, feature_definition_id, computation_version) for features. Option B: Use partition-level WRITE_TRUNCATE scoped to the run's fiscal_year values. Option C: At minimum, scope the export queries by prediction_run_id = run_id instead of WHERE TRUE to limit exposure.",
+        "effort": "medium"
+      },
+      {
+        "id": "BQ-002",
+        "title": "Non-atomic DELETE + COPY operations",
+        "severity": "high",
+        "files": [
+          {"path": "pipeline/etl_batch.py", "lines": "323-330"},
+          {"path": "pipeline/feature_compute.py", "lines": "146-153"}
+        ],
+        "problem": "autocommit=True means DELETE FROM financial_line_items and the subsequent COPY FROM are separate transactions. A crash between them loses data with no recovery path.",
+        "fix": "Wrap each DELETE+COPY pair in an explicit transaction: pipeline_conn.raw.autocommit = False; try: DELETE; COPY; conn.raw.commit(); finally: conn.raw.autocommit = True. Apply to both etl_batch._copy_line_items and feature_compute.compute_features_for_reports.",
+        "effort": "small"
+      },
+      {
+        "id": "BQ-003",
+        "title": "BQ export queries are unscoped — export entire tables",
+        "severity": "high",
+        "file": "pipeline/bq_sync.py",
+        "lines": "106-162",
+        "problem": "line_items, features, and predictions queries use WHERE TRUE with an optional KRS filter. This exports the entire latest view on every run rather than just the current run's data. Combined with WRITE_APPEND, this guarantees duplicates after the second run.",
+        "fix": "Filter predictions by prediction_run_id = run_id (already available as parameter). Filter line_items and features by report_id IN (SELECT report_id FROM predictions WHERE prediction_run_id = run_id). This scopes each export to only new data.",
+        "effort": "small"
+      }
+    ],
+    "should_fix": [
+      {
+        "id": "BQ-004",
+        "title": "GCS staging bucket has no lifecycle policy",
+        "severity": "medium",
+        "file": "docs/PIPELINE_GCP_SETUP.md",
+        "problem": "Parquet files accumulate at line_items/run={run_id}/data.parquet paths. After a year of daily runs: ~1500 files. No cleanup mechanism exists.",
+        "fix": "Add a 7-day lifecycle rule: gsutil lifecycle set '{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"age\":7}}]}' gs://rdf-pipeline-staging. Document this in PIPELINE_GCP_SETUP.md Phase 0.",
+        "effort": "trivial"
+      },
+      {
+        "id": "BQ-005",
+        "title": "export_training_data hardcodes Maczynska features only",
+        "severity": "medium",
+        "file": "pipeline/bq_compute.py",
+        "lines": "89-94",
+        "problem": "The training data export pivot hardcodes x1_maczynska through x6_maczynska. Poznanski features (x1-x4_poznanski) are missing. The feature_set_id parameter is accepted but never used in the query. PostgreSQL equivalent in app/services/training_data.py dynamically pivots by feature_set.",
+        "fix": "Query feature_set_members for the requested feature_set_id to get the list of feature IDs, then dynamically build MAX(IF(cf.feature_definition_id='...', cf.value, NULL)) AS ... clauses in the SQL. Alternatively, add a second hardcoded block for Poznanski features as a quick fix.",
+        "effort": "medium"
+      },
+      {
+        "id": "BQ-006",
+        "title": "compute_population_stats scans all partitions",
+        "severity": "medium",
+        "file": "pipeline/bq_compute.py",
+        "lines": "24-57",
+        "problem": "The CREATE OR REPLACE TABLE query joins predictions and companies with no partition filter on fiscal_year. Tables are range-partitioned by fiscal_year but this query scans all partitions. At scale (10M+ predictions), each scan costs ~$5/TB.",
+        "fix": "Add WHERE p.fiscal_year >= EXTRACT(YEAR FROM CURRENT_DATE()) - 5 to prune partitions if historical scores are not needed for population stats. Or parameterize the lookback window.",
+        "effort": "trivial"
+      },
+      {
+        "id": "BQ-007",
+        "title": "BigQuery IAM is project-scoped, not dataset-scoped",
+        "severity": "medium",
+        "file": "security_improvement.md",
+        "lines": "45-56",
+        "problem": "Pipeline service account has roles/bigquery.dataEditor at project level. This grants write access to any dataset in the project, not just rdf_analytics.",
+        "fix": "Scope to dataset: bq add-iam-policy-binding --role=roles/bigquery.dataEditor rdf-api-project:rdf_analytics --member=serviceAccount:pipeline-runner@rdf-api-project.iam.gserviceaccount.com. Keep roles/bigquery.jobUser at project level (required for running queries).",
+        "effort": "small"
+      }
+    ],
+    "nice_to_have": [
+      {
+        "id": "BQ-008",
+        "title": "Row-by-row queue inserts in enqueue_changed_since",
+        "severity": "low",
+        "file": "pipeline/queue.py",
+        "lines": "67-69",
+        "problem": "Loops over discovered rows and calls enqueue_krs() one at a time. For large backlogs (thousands of new docs), this issues thousands of individual INSERT statements.",
+        "fix": "Use psycopg2.extras.execute_values with the ON CONFLICT clause to batch all inserts into a single round-trip. Or use a temp table + INSERT INTO ... SELECT pattern.",
+        "effort": "small"
+      },
+      {
+        "id": "BQ-009",
+        "title": "GCS storage.Client created per upload call",
+        "severity": "low",
+        "file": "pipeline/bq_sync.py",
+        "lines": "52-58",
+        "problem": "_upload_to_gcs creates a new storage.Client() on every call. For 4 uploads per run this is negligible, but it instantiates credentials, HTTP sessions, and metadata lookups each time.",
+        "fix": "Create the client once in sync_run() and pass it as a parameter to _upload_to_gcs. Signature becomes _upload_to_gcs(storage_client, bucket, path, blob).",
+        "effort": "trivial"
+      },
+      {
+        "id": "BQ-010",
+        "title": "Missing report metadata columns in BQ export",
+        "severity": "low",
+        "file": "pipeline/bq_sync.py",
+        "lines": "106-113",
+        "problem": "PG financial_reports has data_source_id, report_type, logical_key, and ingestion_status. None are exported to BQ. Analytics queries that need to filter by report type or data source cannot do so.",
+        "fix": "Add data_source_id STRING and report_type STRING to bq_schema.FINANCIAL_LINE_ITEMS (or create a separate financial_reports table in BQ). Update the li_sql query to include fr.data_source_id and fr.report_type.",
+        "effort": "small"
+      },
+      {
+        "id": "BQ-011",
+        "title": "BQ classification column type may diverge",
+        "severity": "low",
+        "file": "pipeline/bq_schema.py",
+        "lines": "50",
+        "problem": "BQ schema defines classification as INT64. Current discriminant models return integer classifications (0/1/2/3). If a future ML model returns string classifications, the parquet export will fail or type-coerce silently.",
+        "fix": "Change classification to STRING in bq_schema.py to match the PG column type (which accepts any value). Cast to string in the export query: p.classification::text AS classification.",
+        "effort": "trivial"
+      },
+      {
+        "id": "BQ-012",
+        "title": "Population stats tenure bucket uses DATE_DIFF not age()",
+        "severity": "low",
+        "file": "pipeline/bq_compute.py",
+        "lines": "32-36",
+        "problem": "DATE_DIFF(CURRENT_DATE(), incorporation_date, YEAR) counts calendar year boundaries, not complete years. A company incorporated Dec 31 2024 shows tenure=2 on Jan 1 2026 (2 boundaries crossed) vs 1 complete year. Not a divergence since this only runs in BQ, but could surprise analysts.",
+        "fix": "Use DATE_DIFF(CURRENT_DATE(), incorporation_date, DAY) / 365 for approximate complete years, or document the boundary-counting behavior in the query comment.",
+        "effort": "trivial"
+      }
+    ]
+  },
+  "cost_summary": {
+    "current_monthly_estimate_usd": "80-95",
+    "breakdown": {
+      "cloud_sql_pipeline": {"spec": "db-custom-2-4096, 50GB SSD", "monthly_usd": 70},
+      "bigquery_on_demand": {"spec": "rdf_analytics dataset", "monthly_usd": "5-15"},
+      "gcs_staging": {"spec": "rdf-pipeline-staging bucket", "monthly_usd": "2-3"},
+      "cloud_run_job": {"spec": "2 vCPU / 4 GiB, daily ~1h", "monthly_usd": "3-5"},
+      "cloud_scheduler": {"spec": "1 cron job", "monthly_usd": 0},
+      "secret_manager": {"spec": "2 secrets", "monthly_usd": 0}
+    },
+    "optimizations": [
+      {
+        "action": "GCS lifecycle 7-day TTL on staging bucket",
+        "savings_usd": "1-2/month, prevents unbounded growth",
+        "priority": "high"
+      },
+      {
+        "action": "BQ partition pruning in compute_population_stats (fiscal_year filter)",
+        "savings_usd": "prevents cost spikes at scale (>$5/scan at 10M+ rows)",
+        "priority": "medium"
+      },
+      {
+        "action": "Consider BQ flat-rate slots if analytics scans exceed $20/month",
+        "savings_usd": "variable",
+        "priority": "low"
+      }
+    ]
+  },
+  "scaling_thresholds": {
+    "under_10k_reports": "Current single Cloud Run Job works fine",
+    "10k_to_100k_reports": "Filter BQ export by prediction_run_id to avoid full-table exports",
+    "100k_to_1m_reports": "Parallel Cloud Run Jobs (queue supports SKIP LOCKED) + MERGE for BQ dedup",
+    "over_1m_reports": "Chunked processing, consider Dataflow for BQ load, read replicas for Cloud SQL"
+  },
+  "parity_status": {
+    "scoring_logic": "consistent — shared SCORERS dict and _compute_single_feature",
+    "feature_definitions": "consistent — single source in scripts/seed_features.py",
+    "model_coefficients": "consistent — imported from app.services.maczynska/poznanski",
+    "json_columns": "consistent — explicit ::text cast, tested in parity suite",
+    "training_data_export": "INCONSISTENT — BQ hardcodes Maczynska only, PG is dynamic",
+    "tenure_calculation": "acceptable — BQ-only computation, no PG equivalent to diverge from"
+  }
+}
