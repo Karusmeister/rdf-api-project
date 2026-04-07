@@ -1921,6 +1921,49 @@ def get_assessment_job(job_id: str) -> Optional[dict]:
     return result
 
 
+def get_running_assessment_for_krs(krs: str) -> Optional[dict]:
+    """Find an in-progress assessment job for deduplication."""
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT id, krs, status, stage, error_message, result_json, created_at, updated_at
+        FROM assessment_jobs
+        WHERE krs = %s AND status IN ('pending', 'running')
+        ORDER BY created_at DESC LIMIT 1
+    """, [krs]).fetchone()
+    if row is None:
+        return None
+    cols = ["id", "krs", "status", "stage", "error_message", "result_json", "created_at", "updated_at"]
+    result = dict(zip(cols, row))
+    result["created_at"] = str(result["created_at"])
+    result["updated_at"] = str(result["updated_at"])
+    return result
+
+
+def update_assessment_progress(job_id: str, progress: dict) -> None:
+    """Update only the progress portion of result_json without overwriting other keys."""
+    conn = get_conn()
+    now = datetime.now(timezone.utc)
+    # Read existing result_json, merge progress, write back
+    row = conn.execute(
+        "SELECT result_json FROM assessment_jobs WHERE id = %s", [job_id]
+    ).fetchone()
+    existing = json.loads(row[0]) if row and row[0] else {}
+    existing["progress"] = progress
+    conn.execute("""
+        UPDATE assessment_jobs SET result_json = %s, updated_at = %s WHERE id = %s
+    """, [json.dumps(existing), now, job_id])
+
+
+def get_ingested_report_ids_for_krs(krs: str) -> set[str]:
+    """Return set of source_document_ids that have been ingested for this KRS."""
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT source_document_id FROM financial_reports
+        WHERE krs = %s AND ingestion_status = 'completed'
+    """, [krs]).fetchall()
+    return {row[0] for row in rows if row[0]}
+
+
 # --- users ---
 
 _USER_COLS = ["id", "email", "name", "auth_method", "password_hash", "is_verified",

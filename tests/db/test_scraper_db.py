@@ -98,7 +98,7 @@ def test_mark_downloaded():
 
     conn = scraper_db.get_conn()
     row = conn.execute(
-        "SELECT is_downloaded, storage_path, file_count, file_types FROM krs_documents WHERE document_id = 'docXYZ'"
+        "SELECT is_downloaded, storage_path, file_count, file_types FROM krs_document_versions WHERE document_id = 'docXYZ' AND is_current = true"
     ).fetchone()
     assert row[0] is True
     assert row[1] == "krs/0000000001/docXYZ"
@@ -206,18 +206,14 @@ def test_stats():
     assert stats["total_downloaded"] >= 2
 
 
-def test_startup_guardrail_fails_fast_when_legacy_without_versions():
-    """connect() should fail fast on legacy docs without append-only backfill."""
+def test_db003_legacy_tables_removed():
+    """DB-003: Legacy krs_documents table no longer created."""
     conn = scraper_db.get_conn()
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute("DELETE FROM krs_document_versions")
-    conn.execute("""
-        INSERT INTO krs_documents (
-            document_id, krs, rodzaj, status, discovered_at
-        ) VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (document_id) DO NOTHING
-    """, ["legacy-doc-guard", "0000099998", "18", "NIEUSUNIETY", now])
-
-    scraper_db._schema_initialized = False
-    with pytest.raises(RuntimeError, match="Cutover blocked: krs_document_versions is empty"):
-        scraper_db.connect()
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+        ).fetchall()
+    }
+    assert "krs_document_versions" in tables
+    # Legacy table should not be created by _init_schema anymore
+    # (may still exist in production until DROP TABLE is run)

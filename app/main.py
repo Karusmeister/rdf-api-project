@@ -32,6 +32,7 @@ from app.routers.jobs.routes import router as jobs_router
 from app.routers.predictions import router as predictions_router
 from app.routers.auth import router as auth_router
 from app.routers.admin import router as admin_router
+from app.routers.assessment import router as assessment_router
 from app.rate_limit import limiter
 from app.services import predictions as predictions_service
 
@@ -108,6 +109,7 @@ tags_metadata = [
     {"name": "predictions", "description": "Bankruptcy prediction scores, feature detail, and model catalog."},
     {"name": "admin", "description": "Admin-only operations (cache flush, access grants)."},
     {"name": "admin-dashboard", "description": "Admin dashboard: pipeline stats, KRS management, user activity."},
+    {"name": "assessment", "description": "On-demand KRS assessment: data readiness check and pipeline trigger."},
 ]
 
 app = FastAPI(
@@ -188,6 +190,7 @@ app.include_router(jobs_router)
 app.include_router(predictions_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(assessment_router)
 
 
 @app.exception_handler(httpx.HTTPStatusError)
@@ -204,11 +207,7 @@ async def upstream_error_handler(request: Request, exc: httpx.HTTPStatusError):
     )
     return JSONResponse(
         status_code=502,
-        content={
-            "detail": "Upstream API error",
-            "upstream_status": exc.response.status_code,
-            "upstream_url": str(exc.request.url),
-        },
+        content={"detail": "Upstream API error"},
     )
 
 
@@ -226,11 +225,7 @@ async def upstream_request_error_handler(request: Request, exc: httpx.RequestErr
     )
     return JSONResponse(
         status_code=502,
-        content={
-            "detail": "Upstream connection error",
-            "error_type": type(exc).__name__,
-            "upstream_url": str(exc.request.url) if exc.request else None,
-        },
+        content={"detail": "Upstream connection error"},
     )
 
 

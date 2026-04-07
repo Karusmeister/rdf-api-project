@@ -1,15 +1,13 @@
+# Production dependencies (used in Dockerfile)
 fastapi>=0.115
 uvicorn[standard]>=0.34
 httpx[socks]>=0.28
 pycryptodome>=3.21
 pydantic>=2.10
 pydantic-settings>=2.7
-pytest>=8.0
-pytest-asyncio>=0.24
 psycopg2-binary>=2.9
 aiofiles>=24.1
 click>=8.1
-respx>=0.22
 apscheduler>=3.10,<4
 pandas>=2.2
 google-cloud-storage>=2.18

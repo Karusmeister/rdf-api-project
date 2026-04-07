@@ -203,7 +203,10 @@ async def test_transport_error_returns_502(client, monkeypatch):
     assert resp.status_code == 502
     body = resp.json()
     assert body["detail"] == "Upstream connection error"
-    assert body["error_type"] == "ConnectTimeout"
+    # error_type and upstream_url are intentionally omitted from client responses
+    # to avoid leaking internal service topology (security hardening)
+    assert "error_type" not in body
+    assert "upstream_url" not in body
 
 
 # ---------------------------------------------------------------------------

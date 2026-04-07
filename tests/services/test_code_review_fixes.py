@@ -203,23 +203,46 @@ class TestETLRouteAfterStartup:
         scraper_db._schema_initialized = False
         prediction_db._schema_initialized = False
 
+    def _admin_headers(self):
+        from app.auth import create_token
+        token = create_token("admin-1", "admin@test.com")
+        return {"Authorization": f"Bearer {token}"}
+
     @pytest.mark.asyncio
-    async def test_etl_ingest_after_clean_startup(self, api_client):
+    @patch("app.db.prediction_db.get_user_by_id", return_value={
+        "id": "admin-1", "email": "admin@test.com", "name": "Admin",
+        "auth_method": "local", "password_hash": None, "is_verified": True,
+        "has_full_access": True, "is_active": True, "created_at": "2026-01-01",
+        "last_login_at": None,
+    })
+    async def test_etl_ingest_after_clean_startup(self, mock_user, api_client):
         """POST /api/etl/ingest returns a domain response (not 500 from missing connection)."""
-        resp = await api_client.post("/api/etl/ingest", json={})
+        resp = await api_client.post("/api/etl/ingest", json={}, headers=self._admin_headers())
         body = resp.json()
         assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {body}"
         # No pending docs — should return summary with total=0
         assert body["total"] == 0
 
     @pytest.mark.asyncio
-    async def test_etl_ingest_missing_doc_returns_404(self, api_client):
+    @patch("app.db.prediction_db.get_user_by_id", return_value={
+        "id": "admin-1", "email": "admin@test.com", "name": "Admin",
+        "auth_method": "local", "password_hash": None, "is_verified": True,
+        "has_full_access": True, "is_active": True, "created_at": "2026-01-01",
+        "last_login_at": None,
+    })
+    async def test_etl_ingest_missing_doc_returns_404(self, mock_user, api_client):
         """POST /api/etl/ingest with unknown document_id returns 404, not 500."""
-        resp = await api_client.post("/api/etl/ingest", json={"document_id": "nonexistent"})
+        resp = await api_client.post("/api/etl/ingest", json={"document_id": "nonexistent"}, headers=self._admin_headers())
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_etl_ingest_error_does_not_leak_exception_text(self, api_client, monkeypatch):
+    @patch("app.db.prediction_db.get_user_by_id", return_value={
+        "id": "admin-1", "email": "admin@test.com", "name": "Admin",
+        "auth_method": "local", "password_hash": None, "is_verified": True,
+        "has_full_access": True, "is_active": True, "created_at": "2026-01-01",
+        "last_login_at": None,
+    })
+    async def test_etl_ingest_error_does_not_leak_exception_text(self, mock_user, api_client, monkeypatch):
         """CR2-SEC-002: an unexpected ETL failure must surface a stable public
         error message to the client — raw exception text (file paths, DB
         errors, stack snippets) stays in logs only.
@@ -238,6 +261,7 @@ class TestETLRouteAfterStartup:
         resp = await api_client.post(
             "/api/etl/ingest",
             json={"document_id": "any-id"},
+            headers=self._admin_headers(),
         )
         assert resp.status_code == 500
         body = resp.json()

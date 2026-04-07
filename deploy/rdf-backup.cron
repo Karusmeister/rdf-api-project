@@ -1,2 +1,0 @@
-# Back up DuckDB to GCS every 6 hours
-0 */6 * * * root CLOUDSDK_ACTIVE_CONFIG=rdf-project gsutil cp /data/scraper.duckdb gs://rdf-project-data/backups/scraper-$(date +\%Y\%m\%d-\%H\%M).duckdb && CLOUDSDK_ACTIVE_CONFIG=rdf-project gsutil cp /data/scraper.duckdb gs://rdf-project-data/backups/scraper-latest.duckdb

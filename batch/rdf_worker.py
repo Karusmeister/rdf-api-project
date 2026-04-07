@@ -475,6 +475,7 @@ async def _worker_loop(
     dsn: str,
     skip_metadata: bool = False,
     proxy_pool: list[Connection] | None = None,
+    legal_forms: list[str] | None = None,
 ) -> None:
     """Main async loop for a single RDF document discovery + download worker."""
     progress = RdfProgressStore(dsn)
@@ -506,7 +507,7 @@ async def _worker_loop(
                 )
 
     # Pre-fetch our partition: new KRS numbers + already-discovered but undownloaded
-    new_krs = progress.get_pending_krs(worker_id, total_workers)
+    new_krs = progress.get_pending_krs(worker_id, total_workers, legal_forms=legal_forms)
     needs_download = progress.get_needs_download_krs(worker_id, total_workers)
     # Deduplicate, new first (they need discovery + download), then download-only
     seen = set(new_krs)
@@ -705,6 +706,7 @@ def run_rdf_worker(
     dsn: str,
     skip_metadata: bool = False,
     proxy_pool: list[Connection] | None = None,
+    legal_forms: list[str] | None = None,
 ) -> None:
     """Entrypoint for multiprocessing.Process."""
     logging.basicConfig(
@@ -714,10 +716,11 @@ def run_rdf_worker(
     logger.info(
         "rdf_worker=%d starting total_workers=%d connection=%s concurrency=%d "
         "delay=%.1f download_delay=%.1f page_size=%d storage_backend=%s "
-        "skip_metadata=%s proxy_pool_size=%d",
+        "skip_metadata=%s proxy_pool_size=%d legal_forms=%s",
         worker_id, total_workers, connection.name, concurrency, delay,
         download_delay, page_size, settings.storage_backend, skip_metadata,
         len(proxy_pool) if proxy_pool else 0,
+        legal_forms,
     )
     asyncio.run(
         _worker_loop(
@@ -731,5 +734,6 @@ def run_rdf_worker(
             dsn=dsn,
             skip_metadata=skip_metadata,
             proxy_pool=proxy_pool,
+            legal_forms=legal_forms,
         )
     )

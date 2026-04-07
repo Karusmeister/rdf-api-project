@@ -1,0 +1,90 @@
+{
+  "title": "FastAPI Best Practice Fixes",
+  "description": "Issues found during /fastapi skill review. Each fix includes the problem, why it matters, and how to fix it.",
+  "fixes": [
+    {
+      "id": "FIX-001",
+      "severity": "critical",
+      "title": "Blocking DB calls inside async function _do_refresh()",
+      "file": "app/routers/admin/routes.py",
+      "lines": "312-381",
+      "problem": "_do_refresh() is declared as 'async def' but calls conn.execute() synchronously at line 344. conn.execute() uses psycopg2 which is a blocking driver. When FastAPI's BackgroundTasks runs this coroutine, the blocking DB calls monopolize the event loop thread, stalling ALL concurrent HTTP request handling (including health checks) for the entire duration of the refresh.",
+      "impact": "During a KRS refresh (which paginates upstream + writes docs), every other request in the process is frozen. Under moderate load this causes cascading timeouts.",
+      "fix": "Option A (recommended): Change 'async def _do_refresh' to plain 'def _do_refresh'. BackgroundTasks will run it in a threadpool automatically, so the await calls to rdf_client need to be replaced with synchronous httpx calls or wrapped in asyncio.run(). Option B: Keep async def but wrap every conn.execute() block in 'await asyncio.get_running_loop().run_in_executor(None, ...)' — matches the pattern already used in app/routers/etl/routes.py:31-32. Option B preserves the existing async rdf_client calls and is the smaller diff.",
+      "example_before": "async def _do_refresh(krs: str) -> None:\n    ...\n    with get_db() as conn:\n        conn.execute(\"INSERT INTO krs_registry ...\")",
+      "example_after": "async def _do_refresh(krs: str) -> None:\n    ...\n    loop = asyncio.get_running_loop()\n    def _persist():\n        with get_db() as conn:\n            conn.execute(\"INSERT INTO krs_registry ...\")\n    await loop.run_in_executor(None, _persist)"
+    },
+    {
+      "id": "FIX-002",
+      "severity": "medium",
+      "title": "Non-Annotated Query parameter in ETL dataset_stats()",
+      "file": "app/routers/etl/routes.py",
+      "lines": "61-65",
+      "problem": "Parameters use the legacy 'param: type = Query(...)' style instead of the recommended 'Annotated[type, Query()]' style. The Ellipsis '...' as default is also explicitly discouraged by FastAPI best practices — required params should simply omit a default.",
+      "impact": "Function signature is not usable outside FastAPI context (e.g. in tests or direct calls) because the default value is a Query() descriptor, not a real value. Also inconsistent with the Annotated style already used in admin/routes.py and predictions/routes.py.",
+      "fix": "Change to Annotated style. Remove Ellipsis from required params.",
+      "example_before": "async def dataset_stats(\n    feature_set: str = Query(..., description=\"Feature set ID\"),\n    min_year: Optional[int] = Query(None),\n    max_year: Optional[int] = Query(None),\n):",
+      "example_after": "from typing import Annotated\n\nasync def dataset_stats(\n    feature_set: Annotated[str, Query(description=\"Feature set ID\")],\n    min_year: Annotated[int | None, Query()] = None,\n    max_year: Annotated[int | None, Query()] = None,\n):"
+    },
+    {
+      "id": "FIX-003",
+      "severity": "low",
+      "title": "Missing return type on scraper_status()",
+      "file": "app/routers/scraper/routes.py",
+      "lines": "12-21",
+      "problem": "Endpoint 'async def scraper_status()' has no return type annotation. FastAPI uses the return type to validate, filter, and document the response in the OpenAPI schema. Without it, the schema shows 'Successful Response' with no body definition.",
+      "impact": "OpenAPI docs are incomplete — frontend devs and API consumers cannot see the response shape without reading source code. No automatic response serialization/filtering by Pydantic.",
+      "fix": "Add a return type. For a dict response, use 'dict' as the return type. For better docs, define a Pydantic response model.",
+      "example_before": "@router.get(\"/status\", summary=\"Scraper dashboard stats\")\nasync def scraper_status():",
+      "example_after": "@router.get(\"/status\", summary=\"Scraper dashboard stats\")\nasync def scraper_status() -> dict:"
+    },
+    {
+      "id": "FIX-004",
+      "severity": "low",
+      "title": "Missing return types on jobs endpoints",
+      "file": "app/routers/jobs/routes.py",
+      "lines": "24-25, 63-64",
+      "problem": "sync_status() and scan_status() lack return type annotations. Same issue as FIX-003 — OpenAPI schema is incomplete.",
+      "impact": "Consumers of /jobs/krs-sync/status and /jobs/krs-scan/status cannot discover the response shape from the API docs.",
+      "fix": "Add '-> dict' return type to both endpoints. For richer docs, define SyncStatusResponse and ScanStatusResponse Pydantic models.",
+      "example_before": "@sync_router.get(\"/status\", summary=\"Last KRS sync run\")\nasync def sync_status():",
+      "example_after": "@sync_router.get(\"/status\", summary=\"Last KRS sync run\")\nasync def sync_status() -> dict:"
+    },
+    {
+      "id": "FIX-005",
+      "severity": "low",
+      "title": "Missing return type on dataset_stats()",
+      "file": "app/routers/etl/routes.py",
+      "lines": "60-61",
+      "problem": "dataset_stats() has no return type annotation. Same pattern as FIX-003/FIX-004.",
+      "impact": "OpenAPI schema for /api/etl/training/dataset-stats lacks response body definition.",
+      "fix": "Add '-> dict' return type.",
+      "example_before": "@router.get(\"/training/dataset-stats\", summary=\"Training dataset statistics\")\nasync def dataset_stats(",
+      "example_after": "@router.get(\"/training/dataset-stats\", summary=\"Training dataset statistics\")\nasync def dataset_stats("
+    },
+    {
+      "id": "FIX-006",
+      "severity": "medium",
+      "title": "Blocking DB calls inside async scraper_status()",
+      "file": "app/routers/scraper/routes.py",
+      "lines": "13-21",
+      "problem": "scraper_status() is 'async def' but calls db.get_stats() and db.get_last_run() which are synchronous psycopg2 calls. These block the event loop during query execution.",
+      "impact": "Under concurrent load, scraper status queries (which hit multiple tables with aggregations) block all other async coroutines. Less severe than FIX-001 because the queries are fast, but still violates the async/sync contract.",
+      "fix": "Either change to plain 'def scraper_status()' (FastAPI will auto-threadpool it) or wrap calls in run_in_executor. Plain 'def' is simpler and sufficient here.",
+      "example_before": "@router.get(\"/status\", summary=\"Scraper dashboard stats\")\nasync def scraper_status():\n    stats = db.get_stats()",
+      "example_after": "@router.get(\"/status\", summary=\"Scraper dashboard stats\")\ndef scraper_status() -> dict:\n    stats = db.get_stats()"
+    },
+    {
+      "id": "FIX-007",
+      "severity": "medium",
+      "title": "Blocking DB calls inside async sync_status() and scan_status()",
+      "file": "app/routers/jobs/routes.py",
+      "lines": "24-30, 63-74",
+      "problem": "Both sync_status() and scan_status() are 'async def' but call synchronous krs_repo functions (get_last_sync, get_cursor, get_last_scan_run, count_entities). These are blocking psycopg2 queries inside an async context.",
+      "impact": "Same class of issue as FIX-006 — event loop blocked during DB queries.",
+      "fix": "Change both to plain 'def' so FastAPI runs them in a threadpool automatically. This is the simplest fix and matches the pattern used in admin/routes.py for similar read-only endpoints.",
+      "example_before": "@sync_router.get(\"/status\", summary=\"Last KRS sync run\")\nasync def sync_status():\n    last = krs_repo.get_last_sync(source=\"ms_gov\")",
+      "example_after": "@sync_router.get(\"/status\", summary=\"Last KRS sync run\")\ndef sync_status() -> dict:\n    last = krs_repo.get_last_sync(source=\"ms_gov\")"
+    }
+  ]
+}

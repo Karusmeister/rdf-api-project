@@ -1,0 +1,173 @@
+{
+  "title": "GCP Database Tasks — Run directly on Cloud SQL",
+  "created_at": "2026-04-06",
+  "context": "These tasks must be run directly on the Cloud SQL production instance (rdf-postgres) via psql or gcloud sql connect. They complement the code changes already applied locally (DB-002..005, DB-012 view/index changes, DB-003 legacy table removal).",
+  "connection": {
+    "proxy_command": "cloud-sql-proxy rdf-api-project:europe-central2:rdf-postgres --port 15432",
+    "psql_command": "PGPASSWORD=$(gcloud secrets versions access latest --secret=cloud-db-password --project=rdf-api-project) psql -h 127.0.0.1 -p 15432 -U postgres -d rdf"
+  },
+
+  "tasks": [
+    {
+      "id": "GCP-DB-001",
+      "source": "DB-001",
+      "title": "Set random_page_cost = 1.1 (SSD-correct planner setting)",
+      "phase": "Phase 1 — immediate",
+      "depends_on": null,
+      "risk": "ZERO",
+      "sql": [
+        "ALTER DATABASE rdf SET random_page_cost = 1.1;"
+      ],
+      "verification": "SELECT name, setting FROM pg_settings WHERE name = 'random_page_cost';",
+      "rollback": "ALTER DATABASE rdf SET random_page_cost = 4.0;",
+      "note": "Takes effect for new connections only. Redeploy Cloud Run or restart batch VM services to pick up."
+    },
+
+    {
+      "id": "GCP-DB-002",
+      "source": "DB-002 + DB-005",
+      "title": "Validate is_current invariant before deploying view changes",
+      "phase": "Phase 2 — before code deploy",
+      "depends_on": null,
+      "risk": "ZERO (read-only queries)",
+      "sql": [
+        "-- Must return 0 rows. If any rows appear, fix duplicates before deploying.",
+        "SELECT document_id, COUNT(*) AS c FROM krs_document_versions WHERE is_current = true GROUP BY document_id HAVING COUNT(*) > 1;",
+        "SELECT krs, COUNT(*) AS c FROM krs_entity_versions WHERE is_current = true GROUP BY krs HAVING COUNT(*) > 1;"
+      ],
+      "note": "If either query returns rows, the is_current flag has duplicates that must be resolved first. Run: UPDATE krs_document_versions SET is_current = false WHERE version_id NOT IN (SELECT MAX(version_id) FROM krs_document_versions WHERE is_current = true GROUP BY document_id);"
+    },
+
+    {
+      "id": "GCP-DB-003",
+      "source": "DB-004",
+      "title": "Drop unused indexes (39 MB saved + faster writes)",
+      "phase": "Phase 1 — immediate",
+      "depends_on": null,
+      "risk": "LOW",
+      "sql": [
+        "-- Large unused indexes on entity versioning (39 MB, 0 scans)",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_krs_entity_versions_current;",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_krs_entity_versions_valid_from;",
+        "",
+        "-- Old non-partial index on documents (replaced by idx_doc_versions_current_krs in code)",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_krs_doc_versions_krs_current;",
+        "",
+        "-- Old valid_from index (replaced by idx_doc_versions_observed in code)",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_krs_doc_versions_valid_from;",
+        "",
+        "-- Legacy table indexes (will fail harmlessly if tables already dropped)",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_documents_krs;",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_documents_not_downloaded;",
+        "",
+        "-- Small unused indexes on prediction tables (0 scans, <100 rows each)",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_features_krs;",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_features_year;",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_reports_year;",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_reports_logical;",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_companies_pkd;",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_companies_nip;"
+      ],
+      "rollback": "Recreate any needed index with CREATE INDEX CONCURRENTLY."
+    },
+
+    {
+      "id": "GCP-DB-004",
+      "source": "DB-005",
+      "title": "Create new partial indexes for current-row lookups",
+      "phase": "Phase 2 — after code deploy",
+      "depends_on": "GCP-DB-002 (validation passed), code deployed",
+      "risk": "ZERO (CONCURRENTLY = no lock)",
+      "sql": [
+        "-- Partial index: only ~857K current rows indexed instead of all 1.9M",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_doc_versions_current_krs ON krs_document_versions (krs) WHERE is_current = true;",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entity_versions_current_krs ON krs_entity_versions (krs) WHERE is_current = true;",
+        "",
+        "-- Covering index for pipeline discovery queries",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_doc_versions_observed ON krs_document_versions (observed_at DESC) WHERE is_current = true;"
+      ],
+      "verification": [
+        "EXPLAIN SELECT * FROM krs_documents_current WHERE krs = '0000694720';",
+        "-- Should show: Index Scan using idx_doc_versions_current_krs",
+        "-- Should NOT show: Parallel Seq Scan on krs_document_versions"
+      ]
+    },
+
+    {
+      "id": "GCP-DB-005",
+      "source": "DB-003",
+      "title": "Drop legacy tables (krs_entities + krs_documents) — 514 MB saved",
+      "phase": "Phase 3 — 1 week after code deploy",
+      "depends_on": "Code deployed with legacy writes removed. Run for 1 week to verify nothing breaks.",
+      "risk": "MEDIUM — take a backup first",
+      "sql": [
+        "-- BACKUP FIRST!",
+        "-- pg_dump -h 127.0.0.1 -p 15432 -U postgres -d rdf -t krs_entities -t krs_documents > /tmp/legacy_backup.sql",
+        "",
+        "DROP TABLE IF EXISTS krs_documents CASCADE;",
+        "DROP TABLE IF EXISTS krs_entities CASCADE;"
+      ],
+      "rollback": "Restore from backup: psql ... < /tmp/legacy_backup.sql",
+      "savings": "514 MB"
+    },
+
+    {
+      "id": "GCP-DB-006",
+      "source": "DB-006",
+      "title": "Raise work_mem to 16 MB (or 8 MB for db-f1-micro)",
+      "phase": "Phase 4 — after Phase 1-3",
+      "depends_on": null,
+      "risk": "LOW",
+      "sql": [
+        "-- For db-g1-small (1.7 GB RAM):",
+        "ALTER DATABASE rdf SET work_mem = '16MB';",
+        "",
+        "-- For db-f1-micro (614 MB RAM) — safer option:",
+        "-- ALTER DATABASE rdf SET work_mem = '8MB';"
+      ],
+      "rollback": "ALTER DATABASE rdf SET work_mem = '4MB';"
+    },
+
+    {
+      "id": "GCP-DB-007",
+      "source": "DB-011",
+      "title": "Configure pipeline DB (rdf-pipeline) at creation time",
+      "phase": "Phase 5 — when pipeline DB is created",
+      "depends_on": "Pipeline Cloud SQL instance created",
+      "risk": "ZERO",
+      "sql": [
+        "ALTER DATABASE pipeline SET random_page_cost = 1.1;",
+        "ALTER DATABASE pipeline SET work_mem = '16MB';"
+      ],
+      "note": "Run these immediately after creating the pipeline Cloud SQL instance. Add to docs/PIPELINE_GCP_SETUP.md."
+    }
+  ],
+
+  "execution_order": [
+    {
+      "phase": "Phase 1 — Immediate (no code deploy needed)",
+      "tasks": ["GCP-DB-001", "GCP-DB-003"],
+      "note": "Can be run right now. GCP-DB-001 fixes planner. GCP-DB-003 drops unused indexes."
+    },
+    {
+      "phase": "Phase 2 — Validate + deploy code + create indexes",
+      "tasks": ["GCP-DB-002", "then deploy code", "GCP-DB-004"],
+      "note": "First validate is_current invariant (GCP-DB-002). Then deploy the code with simplified views. Then create the new partial indexes (GCP-DB-004). After this, EXPLAIN should show index scans."
+    },
+    {
+      "phase": "Phase 3 — Drop legacy tables (1 week after Phase 2)",
+      "tasks": ["GCP-DB-005"],
+      "note": "Wait 1 week after code deploy to confirm nothing reads legacy tables. Then backup + drop."
+    },
+    {
+      "phase": "Phase 4 — Tuning",
+      "tasks": ["GCP-DB-006"],
+      "note": "Raise work_mem after confirming DB is stable."
+    },
+    {
+      "phase": "Phase 5 — Pipeline DB setup",
+      "tasks": ["GCP-DB-007"],
+      "note": "Run when the pipeline Cloud SQL instance is created."
+    }
+  ]
+}

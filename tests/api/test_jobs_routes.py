@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -10,6 +12,25 @@ from app.db import prediction_db
 from app.main import app
 from app.repositories import krs_repo
 from app.scraper import db as scraper_db
+
+_FAKE_ADMIN = {
+    "id": "admin-1",
+    "email": "admin@test.com",
+    "name": "Admin",
+    "auth_method": "local",
+    "password_hash": None,
+    "is_verified": True,
+    "has_full_access": True,
+    "is_active": True,
+    "created_at": "2026-01-01",
+    "last_login_at": None,
+}
+
+
+def _admin_headers():
+    from app.auth import create_token
+    token = create_token(_FAKE_ADMIN["id"], _FAKE_ADMIN["email"])
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _reset_app_state() -> None:
@@ -37,7 +58,8 @@ async def client(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_trigger_returns_202_when_job_is_scheduled(client, monkeypatch):
+@patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_ADMIN)
+async def test_trigger_returns_202_when_job_is_scheduled(mock_user, client, monkeypatch):
     from app.jobs import krs_sync
 
     async def fake_start_sync_task():
@@ -45,14 +67,15 @@ async def test_trigger_returns_202_when_job_is_scheduled(client, monkeypatch):
 
     monkeypatch.setattr(krs_sync, "start_sync_task", fake_start_sync_task)
 
-    response = await client.post("/jobs/krs-sync/trigger")
+    response = await client.post("/jobs/krs-sync/trigger", headers=_admin_headers())
 
     assert response.status_code == 202
     assert response.json() == {"status": "scheduled"}
 
 
 @pytest.mark.asyncio
-async def test_trigger_returns_409_when_job_is_already_running(client, monkeypatch):
+@patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_ADMIN)
+async def test_trigger_returns_409_when_job_is_already_running(mock_user, client, monkeypatch):
     from app.jobs import krs_sync
 
     async def fake_start_sync_task():
@@ -60,7 +83,7 @@ async def test_trigger_returns_409_when_job_is_already_running(client, monkeypat
 
     monkeypatch.setattr(krs_sync, "start_sync_task", fake_start_sync_task)
 
-    response = await client.post("/jobs/krs-sync/trigger")
+    response = await client.post("/jobs/krs-sync/trigger", headers=_admin_headers())
 
     assert response.status_code == 409
     assert response.json() == {"status": "skipped", "reason": "already_running"}
@@ -72,7 +95,8 @@ async def test_trigger_returns_409_when_job_is_already_running(client, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_scan_trigger_returns_202(client, monkeypatch):
+@patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_ADMIN)
+async def test_scan_trigger_returns_202(mock_user, client, monkeypatch):
     from app.jobs import krs_scanner
 
     async def fake_start():
@@ -80,13 +104,14 @@ async def test_scan_trigger_returns_202(client, monkeypatch):
 
     monkeypatch.setattr(krs_scanner, "start_scan_task", fake_start)
 
-    response = await client.post("/jobs/krs-scan/trigger")
+    response = await client.post("/jobs/krs-scan/trigger", headers=_admin_headers())
     assert response.status_code == 202
     assert response.json() == {"status": "scheduled"}
 
 
 @pytest.mark.asyncio
-async def test_scan_trigger_409_when_running(client, monkeypatch):
+@patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_ADMIN)
+async def test_scan_trigger_409_when_running(mock_user, client, monkeypatch):
     from app.jobs import krs_scanner
 
     async def fake_start():
@@ -94,19 +119,20 @@ async def test_scan_trigger_409_when_running(client, monkeypatch):
 
     monkeypatch.setattr(krs_scanner, "start_scan_task", fake_start)
 
-    response = await client.post("/jobs/krs-scan/trigger")
+    response = await client.post("/jobs/krs-scan/trigger", headers=_admin_headers())
     assert response.status_code == 409
     assert response.json() == {"status": "skipped", "reason": "already_running"}
 
 
 @pytest.mark.asyncio
-async def test_scan_stop_sets_event(client, monkeypatch):
+@patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_ADMIN)
+async def test_scan_stop_sets_event(mock_user, client, monkeypatch):
     from app.jobs import krs_scanner
     import asyncio
 
     krs_scanner._stop_event = asyncio.Event()
 
-    response = await client.post("/jobs/krs-scan/stop")
+    response = await client.post("/jobs/krs-scan/stop", headers=_admin_headers())
     assert response.status_code == 200
     assert response.json() == {"status": "stop_requested"}
     assert krs_scanner._stop_event.is_set()
@@ -134,18 +160,20 @@ async def test_scan_status_returns_cursor_and_last_run(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reset_cursor_rejected_when_running(client, monkeypatch):
+@patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_ADMIN)
+async def test_reset_cursor_rejected_when_running(mock_user, client, monkeypatch):
     from app.jobs import krs_scanner
 
     monkeypatch.setattr(krs_scanner, "is_scan_running", lambda: True)
 
-    response = await client.post("/jobs/krs-scan/reset-cursor", json={"next_krs_int": 1})
+    response = await client.post("/jobs/krs-scan/reset-cursor", json={"next_krs_int": 1}, headers=_admin_headers())
     assert response.status_code == 409
     assert response.json()["reason"] == "scan_running"
 
 
 @pytest.mark.asyncio
-async def test_reset_cursor_accepted(client, monkeypatch):
+@patch("app.db.prediction_db.get_user_by_id", return_value=_FAKE_ADMIN)
+async def test_reset_cursor_accepted(mock_user, client, monkeypatch):
     from app.jobs import krs_scanner
 
     monkeypatch.setattr(krs_scanner, "is_scan_running", lambda: False)
@@ -158,7 +186,7 @@ async def test_reset_cursor_accepted(client, monkeypatch):
 
     monkeypatch.setattr(krs_repo, "advance_cursor", fake_advance)
 
-    response = await client.post("/jobs/krs-scan/reset-cursor", json={"next_krs_int": 500})
+    response = await client.post("/jobs/krs-scan/reset-cursor", json={"next_krs_int": 500}, headers=_admin_headers())
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "cursor": 500}
     assert advanced_to == 500

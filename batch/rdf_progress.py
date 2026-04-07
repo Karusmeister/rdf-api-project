@@ -60,23 +60,47 @@ class RdfProgressStore:
             """, [krs, status, documents_found, worker_id])
         self._with_conn(_do)
 
-    def get_pending_krs(self, worker_id: int, total_workers: int) -> list[str]:
+    def get_pending_krs(
+        self,
+        worker_id: int,
+        total_workers: int,
+        legal_forms: list[str] | None = None,
+    ) -> list[str]:
         """Fetch KRS numbers from batch_progress (status='found') that haven't
         been processed yet, partitioned by worker_id modulo total_workers.
+
+        If *legal_forms* is provided, only KRS numbers whose entity has a
+        matching legal_form in krs_entity_versions are returned.
 
         Returns zero-padded 10-char KRS strings.
         """
         def _do(conn):
-            rows = conn.execute("""
-                SELECT LPAD(CAST(bp.krs AS VARCHAR), 10, '0') AS krs_str
-                FROM batch_progress bp
-                LEFT JOIN batch_rdf_progress rp
-                    ON LPAD(CAST(bp.krs AS VARCHAR), 10, '0') = rp.krs
-                WHERE bp.status = 'found'
-                  AND rp.krs IS NULL
-                  AND bp.krs %% %s = %s
-                ORDER BY bp.krs
-            """, [total_workers, worker_id]).fetchall()
+            if legal_forms:
+                rows = conn.execute("""
+                    SELECT LPAD(CAST(bp.krs AS VARCHAR), 10, '0') AS krs_str
+                    FROM batch_progress bp
+                    JOIN krs_entity_versions ev
+                        ON LPAD(CAST(bp.krs AS VARCHAR), 10, '0') = ev.krs
+                        AND ev.is_current = true
+                    LEFT JOIN batch_rdf_progress rp
+                        ON LPAD(CAST(bp.krs AS VARCHAR), 10, '0') = rp.krs
+                    WHERE bp.status = 'found'
+                      AND rp.krs IS NULL
+                      AND bp.krs %% %s = %s
+                      AND ev.legal_form = ANY(%s)
+                    ORDER BY bp.krs
+                """, [total_workers, worker_id, legal_forms]).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT LPAD(CAST(bp.krs AS VARCHAR), 10, '0') AS krs_str
+                    FROM batch_progress bp
+                    LEFT JOIN batch_rdf_progress rp
+                        ON LPAD(CAST(bp.krs AS VARCHAR), 10, '0') = rp.krs
+                    WHERE bp.status = 'found'
+                      AND rp.krs IS NULL
+                      AND bp.krs %% %s = %s
+                    ORDER BY bp.krs
+                """, [total_workers, worker_id]).fetchall()
             return [row[0] for row in rows]
         return self._with_conn(_do)
 

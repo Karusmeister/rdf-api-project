@@ -632,7 +632,7 @@ async def test_download_one_document_full_flow(rdf_base, pg_dsn, clean_pg, tmp_p
     # Verify DB updated
     wrapper = make_connection(pg_dsn)
     row = wrapper.execute(
-        "SELECT is_downloaded, storage_path, file_count FROM krs_documents WHERE document_id = %s",
+        "SELECT is_downloaded, storage_path, file_count FROM krs_document_versions WHERE document_id = %s AND is_current = true",
         ["abc123=="],
     ).fetchone()
     wrapper.close()
@@ -679,7 +679,7 @@ async def test_download_one_document_zip_failure(rdf_base, pg_dsn, clean_pg, tmp
     # Verify error recorded in DB
     wrapper = make_connection(pg_dsn)
     row = wrapper.execute(
-        "SELECT is_downloaded, download_error FROM krs_documents WHERE document_id = %s",
+        "SELECT is_downloaded, download_error FROM krs_document_versions WHERE document_id = %s AND is_current = true",
         ["abc123=="],
     ).fetchone()
     wrapper.close()
@@ -698,7 +698,7 @@ def test_document_store_insert(pg_dsn, clean_pg):
 
     wrapper = make_connection(pg_dsn)
     row = wrapper.execute(
-        "SELECT document_id, krs, rodzaj, status, nazwa FROM krs_documents WHERE document_id = %s",
+        "SELECT document_id, krs, rodzaj, status, nazwa FROM krs_document_versions WHERE document_id = %s AND is_current = true",
         ["abc123=="],
     ).fetchone()
     wrapper.close()
@@ -746,7 +746,7 @@ def test_document_store_mark_downloaded(pg_dsn, clean_pg):
 
     wrapper = make_connection(pg_dsn)
     row = wrapper.execute(
-        "SELECT is_downloaded, storage_path, file_size_bytes FROM krs_documents WHERE document_id = %s",
+        "SELECT is_downloaded, storage_path, file_size_bytes FROM krs_document_versions WHERE document_id = %s AND is_current = true",
         ["abc123=="],
     ).fetchone()
     wrapper.close()
@@ -791,7 +791,7 @@ async def test_download_one_document_skip_metadata(rdf_base, pg_dsn, clean_pg, t
     # Verify DB: downloaded but no metadata
     wrapper = make_connection(pg_dsn)
     row = wrapper.execute(
-        "SELECT is_downloaded, metadata_fetched_at, file_count FROM krs_documents WHERE document_id = %s",
+        "SELECT is_downloaded, metadata_fetched_at, file_count FROM krs_document_versions WHERE document_id = %s AND is_current = true",
         ["abc123=="],
     ).fetchone()
     wrapper.close()
@@ -832,7 +832,7 @@ def test_document_store_update_metadata(pg_dsn, clean_pg):
 
     wrapper = make_connection(pg_dsn)
     row = wrapper.execute(
-        "SELECT filename, is_ifrs, metadata_fetched_at FROM krs_documents WHERE document_id = %s",
+        "SELECT filename, is_ifrs, metadata_fetched_at FROM krs_document_versions WHERE document_id = %s AND is_current = true",
         ["abc123=="],
     ).fetchone()
     wrapper.close()

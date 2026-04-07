@@ -1,8 +1,7 @@
-"""Scraper control-plane database: krs_registry, krs_documents, scraper_runs.
+"""Scraper control-plane database: krs_registry, krs_document_versions, scraper_runs.
 
 Document writes use an append-only pattern via ``krs_document_versions``.
-The legacy ``krs_documents`` table is kept as a cache for backward compat;
-reads migrate to the ``krs_documents_current`` view.
+Reads go through the ``krs_documents_current`` view.
 """
 from __future__ import annotations
 
@@ -31,7 +30,6 @@ def connect() -> None:
     """Ensure shared connection is open and scraper schema exists."""
     shared_conn.connect()
     _ensure_schema()
-    _check_backfill_needed()
 
 
 def close() -> None:
@@ -75,41 +73,8 @@ def _init_schema() -> None:
         )
     """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS krs_documents (
-            document_id         VARCHAR PRIMARY KEY,
-            krs                 VARCHAR(10) NOT NULL,
-
-            rodzaj              VARCHAR NOT NULL,
-            status              VARCHAR NOT NULL,
-            nazwa               VARCHAR,
-            okres_start         VARCHAR,
-            okres_end           VARCHAR,
-
-            filename            VARCHAR,
-            is_ifrs             BOOLEAN,
-            is_correction       BOOLEAN,
-            date_filed          VARCHAR,
-            date_prepared       VARCHAR,
-
-            is_downloaded       BOOLEAN DEFAULT false,
-            downloaded_at       TIMESTAMP,
-            storage_path        VARCHAR,
-            storage_backend     VARCHAR,
-            file_size_bytes     BIGINT,
-            zip_size_bytes      BIGINT,
-            file_count          INTEGER,
-            file_types          VARCHAR,
-
-            discovered_at       TIMESTAMP NOT NULL,
-            metadata_fetched_at TIMESTAMP,
-            download_error      VARCHAR
-
-            -- NOTE: No FK to krs_registry. Referential integrity is enforced
-            -- by application logic: scraper job always upserts krs_registry
-            -- before inserting documents.
-        )
-    """)
+    # DB-003: Legacy krs_documents table removed.
+    # All reads go through krs_documents_current view on krs_document_versions.
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scraper_runs (
@@ -179,6 +144,11 @@ def _init_schema() -> None:
         )
     """)
 
+    # DB-002: Simplified view — is_current is already maintained by the
+    # application (exactly one row per document_id).  Removing the
+    # ROW_NUMBER() window function lets PostgreSQL push WHERE krs = ...
+    # filters into the base table, using an index scan instead of a
+    # full-table sequential scan of all 1.9M rows.
     conn.execute("""
         CREATE OR REPLACE VIEW krs_documents_current AS
         SELECT
@@ -187,17 +157,8 @@ def _init_schema() -> None:
             is_downloaded, downloaded_at, storage_path, storage_backend,
             file_size_bytes, zip_size_bytes, file_count, file_types,
             discovered_at, metadata_fetched_at, download_error
-        FROM (
-            SELECT
-                kdv.*,
-                row_number() OVER (
-                    PARTITION BY kdv.document_id
-                    ORDER BY kdv.version_no DESC, kdv.version_id DESC
-                ) AS rn
-            FROM krs_document_versions kdv
-            WHERE kdv.is_current = true
-        ) ranked
-        WHERE rn = 1
+        FROM krs_document_versions
+        WHERE is_current = true
     """)
 
     # Indexes (check existence before creating to be idempotent)
@@ -211,40 +172,18 @@ def _init_schema() -> None:
     index_defs = [
         ("idx_registry_last_checked", "CREATE INDEX idx_registry_last_checked ON krs_registry(last_checked_at)"),
         ("idx_registry_priority", "CREATE INDEX idx_registry_priority ON krs_registry(check_priority DESC, last_checked_at ASC)"),
-        ("idx_documents_krs", "CREATE INDEX idx_documents_krs ON krs_documents(krs)"),
-        ("idx_documents_not_downloaded", "CREATE INDEX idx_documents_not_downloaded ON krs_documents(is_downloaded)"),
+        # DB-003: idx_documents_krs and idx_documents_not_downloaded removed (legacy krs_documents table dropped)
         ("idx_runs_started", "CREATE INDEX idx_runs_started ON scraper_runs(started_at DESC)"),
         ("idx_krs_doc_versions_doc_current", "CREATE INDEX idx_krs_doc_versions_doc_current ON krs_document_versions(document_id, is_current)"),
-        ("idx_krs_doc_versions_krs_current", "CREATE INDEX idx_krs_doc_versions_krs_current ON krs_document_versions(krs, is_current)"),
-        ("idx_krs_doc_versions_valid_from", "CREATE INDEX idx_krs_doc_versions_valid_from ON krs_document_versions(valid_from)"),
+        # DB-005: Partial index — only indexes ~857K current rows instead of all 1.9M
+        ("idx_doc_versions_current_krs", "CREATE INDEX idx_doc_versions_current_krs ON krs_document_versions(krs) WHERE is_current = true"),
+        # DB-012: Covering index for pipeline discovery (changed-since queries)
+        ("idx_doc_versions_observed", "CREATE INDEX idx_doc_versions_observed ON krs_document_versions(observed_at DESC) WHERE is_current = true"),
     ]
 
     for name, sql in index_defs:
         if name not in existing:
             conn.execute(sql)
-
-
-def _check_backfill_needed() -> None:
-    """Fail fast when legacy cache has rows but version table is empty."""
-    conn = get_conn()
-    legacy = conn.execute("SELECT count(*) FROM krs_documents").fetchone()[0]
-    versions = conn.execute("SELECT count(*) FROM krs_document_versions").fetchone()[0]
-    if legacy > 0 and versions == 0:
-        msg = (
-            "Cutover blocked: krs_document_versions is empty while legacy "
-            f"krs_documents has {legacy} rows. "
-            "Run the append-only backfill migration against PostgreSQL before startup."
-        )
-        logger.error(
-            "krs_document_backfill_required",
-            extra={
-                "event": "backfill_required",
-                "legacy_count": legacy,
-                "versions_count": versions,
-                "hint": msg,
-            },
-        )
-        raise RuntimeError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -481,17 +420,7 @@ def insert_documents(docs: list[dict]) -> None:
             change_reason="discovery",
         )
 
-        # Legacy cache
-        conn.execute("""
-            INSERT INTO krs_documents
-                (document_id, krs, rodzaj, status, nazwa, okres_start, okres_end, discovered_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (document_id) DO NOTHING
-        """, [
-            doc_id, krs, doc["rodzaj"], doc["status"],
-            doc.get("nazwa"), doc.get("okres_start"), doc.get("okres_end"),
-            doc["discovered_at"],
-        ])
+        # DB-003: Legacy krs_documents write removed.
 
 
 def _resolve_krs(conn, document_id: str) -> str:
@@ -499,12 +428,7 @@ def _resolve_krs(conn, document_id: str) -> str:
     current = _get_current_document_snapshot(conn, document_id)
     if current is not None:
         return current["krs"]
-    legacy = conn.execute(
-        "SELECT krs FROM krs_documents WHERE document_id = %s", [document_id]
-    ).fetchone()
-    if legacy is not None:
-        return legacy[0]
-    raise ValueError(f"Document {document_id} has no version history and no legacy record")
+    raise ValueError(f"Document {document_id} has no version history")
 
 
 def update_document_metadata(document_id: str, meta: dict) -> None:
@@ -527,25 +451,7 @@ def update_document_metadata(document_id: str, meta: dict) -> None:
         change_reason="metadata_update",
     )
 
-    # Legacy cache
-    conn.execute("""
-        UPDATE krs_documents SET
-            filename            = %s,
-            is_ifrs             = %s,
-            is_correction       = %s,
-            date_filed          = %s,
-            date_prepared       = %s,
-            metadata_fetched_at = %s
-        WHERE document_id = %s
-    """, [
-        meta.get("filename"),
-        meta.get("is_ifrs"),
-        meta.get("is_correction"),
-        meta.get("date_filed"),
-        meta.get("date_prepared"),
-        now,
-        document_id,
-    ])
+    # DB-003: Legacy krs_documents write removed.
 
 
 def update_document_error(document_id: str, error: str) -> None:
@@ -560,11 +466,7 @@ def update_document_error(document_id: str, error: str) -> None:
         change_reason="download_error",
     )
 
-    # Legacy cache
-    conn.execute(
-        "UPDATE krs_documents SET download_error = %s WHERE document_id = %s",
-        [error, document_id],
-    )
+    # DB-003: Legacy krs_documents write removed.
 
 
 def mark_downloaded(
@@ -598,20 +500,7 @@ def mark_downloaded(
         change_reason="downloaded",
     )
 
-    # Legacy cache
-    conn.execute("""
-        UPDATE krs_documents SET
-            is_downloaded    = true,
-            downloaded_at    = %s,
-            storage_path     = %s,
-            storage_backend  = %s,
-            file_size_bytes  = %s,
-            zip_size_bytes   = %s,
-            file_count       = %s,
-            file_types       = %s,
-            download_error   = NULL
-        WHERE document_id = %s
-    """, [now, storage_path, storage_backend, file_size, zip_size, file_count, file_types, document_id])
+    # DB-003: Legacy krs_documents write removed.
 
 
 def update_krs_checked(krs: str, total_docs: int, total_downloaded: int, error: Optional[str] = None) -> None:

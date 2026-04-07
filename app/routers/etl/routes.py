@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.auth import CurrentUser, require_admin
 from app.services import etl, training_data
 
 logger = logging.getLogger(__name__)
@@ -20,8 +21,9 @@ class IngestRequest(BaseModel):
 
 
 @router.post("/ingest", summary="Trigger ETL ingestion")
-async def ingest(body: IngestRequest):
-    """Ingest a specific downloaded document or all pending documents into the prediction tables."""
+async def ingest(body: IngestRequest, user: CurrentUser):
+    """Ingest a specific downloaded document or all pending documents into the prediction tables. Admin only."""
+    require_admin(user)
     logger.info("etl_ingest", extra={"event": "etl_ingest", "document_id": body.document_id})
     loop = asyncio.get_running_loop()
     try:

@@ -1,0 +1,526 @@
+{
+  "title": "GCP Security Review — RDF API Project",
+  "reviewed_at": "2026-04-06",
+  "project": "rdf-api-project",
+  "region": "europe-central2",
+  "summary": "14 findings across CRITICAL / HIGH / MEDIUM severity. 4 already fixed in code. 10 require infrastructure changes via gcloud CLI.",
+
+  "findings": [
+    {
+      "id": "SEC-001",
+      "severity": "CRITICAL",
+      "title": "Default Compute Engine SA has roles/editor",
+      "status": "open",
+      "description": "The default compute service account (448201086881-compute@developer.gserviceaccount.com) has roles/editor, granting project-wide write access to nearly all GCP resources. If any service (Cloud Run, batch VM) is compromised, the attacker inherits full project write permissions.",
+      "affected_resources": [
+        "Cloud Run service: rdf-api",
+        "GCE VM: rdf-batch-vm",
+        "Service account: 448201086881-compute@developer.gserviceaccount.com"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Create a dedicated Cloud Run service account with least-privilege roles",
+            "commands": [
+              "gcloud iam service-accounts create rdf-api-sa --display-name='RDF API Cloud Run'",
+              "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-api-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/cloudsql.client'",
+              "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-api-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/secretmanager.secretAccessor'",
+              "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-api-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/logging.logWriter'"
+            ]
+          },
+          {
+            "order": 2,
+            "description": "Create a dedicated batch VM service account with least-privilege roles",
+            "commands": [
+              "gcloud iam service-accounts create rdf-batch-sa --display-name='RDF Batch VM'",
+              "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/cloudsql.client'",
+              "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/storage.objectAdmin' --condition=\"expression=resource.name.startsWith('projects/_/buckets/rdf-project-documents'),title=rdf-docs-bucket-only\"",
+              "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/logging.logWriter'",
+              "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/secretmanager.secretAccessor'"
+            ]
+          },
+          {
+            "order": 3,
+            "description": "Attach dedicated SA to Cloud Run",
+            "commands": [
+              "gcloud run services update rdf-api --region europe-central2 --service-account=rdf-api-sa@rdf-api-project.iam.gserviceaccount.com"
+            ]
+          },
+          {
+            "order": 4,
+            "description": "Attach dedicated SA to batch VM (requires VM stop/start)",
+            "commands": [
+              "gcloud compute instances stop rdf-batch-vm --zone=europe-central2-a",
+              "gcloud compute instances set-service-account rdf-batch-vm --zone=europe-central2-a --service-account=rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com --scopes=cloud-platform",
+              "gcloud compute instances start rdf-batch-vm --zone=europe-central2-a"
+            ]
+          },
+          {
+            "order": 5,
+            "description": "Remove roles/editor from the default compute SA",
+            "commands": [
+              "gcloud projects remove-iam-policy-binding rdf-api-project --member='serviceAccount:448201086881-compute@developer.gserviceaccount.com' --role='roles/editor'"
+            ]
+          }
+        ],
+        "rollback": "Re-add roles/editor to default SA if services break: gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:448201086881-compute@developer.gserviceaccount.com' --role='roles/editor'",
+        "verification": [
+          "gcloud run services describe rdf-api --region europe-central2 --format='value(spec.template.spec.serviceAccountName)'",
+          "gcloud compute instances describe rdf-batch-vm --zone=europe-central2-a --format='value(serviceAccounts[0].email)'",
+          "curl https://rdf-api-448201086881.europe-central2.run.app/health"
+        ]
+      }
+    },
+
+    {
+      "id": "SEC-002",
+      "severity": "CRITICAL",
+      "title": "Unauthenticated mutation endpoints exposed to the internet",
+      "status": "fixed",
+      "description": "POST endpoints for ETL ingestion and job management (sync trigger, scan trigger/stop/reset-cursor) had no authentication guards. Anyone on the internet could trigger ETL runs, start/stop scanners, or reset the scan cursor.",
+      "affected_resources": [
+        "POST /api/etl/ingest",
+        "POST /jobs/krs-sync/trigger",
+        "POST /jobs/krs-scan/trigger",
+        "POST /jobs/krs-scan/stop",
+        "POST /jobs/krs-scan/reset-cursor"
+      ],
+      "remediation": {
+        "applied_in_code": true,
+        "files_changed": [
+          "app/routers/etl/routes.py — added CurrentUser + require_admin to /ingest",
+          "app/routers/jobs/routes.py — added CurrentUser + require_admin to all POST endpoints",
+          "tests/api/test_jobs_routes.py — updated all tests with admin JWT auth",
+          "tests/services/test_code_review_fixes.py — updated ETL tests with admin JWT auth"
+        ],
+        "deploy_required": true,
+        "deploy_command": "gcloud run deploy rdf-api --source . --region europe-central2"
+      }
+    },
+
+    {
+      "id": "SEC-003",
+      "severity": "CRITICAL",
+      "title": "Docker container runs as root",
+      "status": "fixed",
+      "description": "The main Dockerfile had no USER directive. The FastAPI application ran as root inside the container, meaning a container escape or RCE would grant root privileges.",
+      "affected_resources": [
+        "Dockerfile"
+      ],
+      "remediation": {
+        "applied_in_code": true,
+        "files_changed": [
+          "Dockerfile — added 'useradd appuser' and 'USER appuser' directive"
+        ],
+        "deploy_required": true,
+        "deploy_command": "gcloud run deploy rdf-api --source . --region europe-central2"
+      }
+    },
+
+    {
+      "id": "SEC-004",
+      "severity": "CRITICAL",
+      "title": "Internal upstream URLs leaked in 502 error responses",
+      "status": "fixed",
+      "description": "The upstream_error_handler and upstream_request_error_handler in main.py returned upstream_url and error_type fields to clients, exposing internal service topology and implementation details.",
+      "affected_resources": [
+        "app/main.py — upstream_error_handler",
+        "app/main.py — upstream_request_error_handler"
+      ],
+      "remediation": {
+        "applied_in_code": true,
+        "files_changed": [
+          "app/main.py — stripped upstream_url and error_type from 502 JSON responses",
+          "tests/api/test_endpoints.py — updated test to verify fields are NOT present"
+        ],
+        "deploy_required": true,
+        "deploy_command": "gcloud run deploy rdf-api --source . --region europe-central2"
+      }
+    },
+
+    {
+      "id": "SEC-005",
+      "severity": "HIGH",
+      "title": "Cloud SQL instance has a public IP",
+      "status": "open",
+      "description": "Cloud SQL instance rdf-postgres has public IP 34.118.73.120 reachable from the internet. The batch VM connects via this public IP with a password in a plaintext .env file. Although authorized networks may restrict access, the public IP is an unnecessary attack surface.",
+      "affected_resources": [
+        "Cloud SQL instance: rdf-postgres (34.118.73.120)",
+        "Batch VM .env: DATABASE_URL contains password in plaintext"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Install Cloud SQL Auth Proxy on the batch VM",
+            "commands": [
+              "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --project=rdf-api-project -- 'curl -o /usr/local/bin/cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.3/cloud-sql-proxy.linux.amd64 && chmod +x /usr/local/bin/cloud-sql-proxy'"
+            ]
+          },
+          {
+            "order": 2,
+            "description": "Create a systemd service for Cloud SQL Auth Proxy on the batch VM",
+            "commands": [
+              "cat > /tmp/cloud-sql-proxy.service << 'EOF'\n[Unit]\nDescription=Cloud SQL Auth Proxy\nAfter=network.target\n\n[Service]\nType=simple\nUser=worker\nExecStart=/usr/local/bin/cloud-sql-proxy rdf-api-project:europe-central2:rdf-postgres --port 5432\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\nEOF",
+              "gcloud compute scp /tmp/cloud-sql-proxy.service rdf-batch-vm:/tmp/ --zone=europe-central2-a",
+              "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo cp /tmp/cloud-sql-proxy.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now cloud-sql-proxy'"
+            ]
+          },
+          {
+            "order": 3,
+            "description": "Update batch VM .env to use localhost instead of public IP",
+            "note": "Change DATABASE_URL from postgresql://postgres:<pw>@34.118.73.120:5432/rdf to postgresql://postgres:<pw>@127.0.0.1:5432/rdf"
+          },
+          {
+            "order": 4,
+            "description": "Remove the public IP from Cloud SQL after verifying proxy works",
+            "commands": [
+              "gcloud sql instances patch rdf-postgres --no-assign-ip"
+            ]
+          }
+        ],
+        "rollback": "Re-enable public IP: gcloud sql instances patch rdf-postgres --assign-ip",
+        "verification": [
+          "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo systemctl status cloud-sql-proxy'",
+          "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'PGPASSWORD=<pw> psql -h 127.0.0.1 -U postgres -d rdf -c \"SELECT 1\"'",
+          "gcloud sql instances describe rdf-postgres --format='value(ipAddresses)'"
+        ]
+      }
+    },
+
+    {
+      "id": "SEC-006",
+      "severity": "HIGH",
+      "title": "CORS set to wildcard in production",
+      "status": "open",
+      "description": "CORS_ORIGINS is set to [\"*\"] on the production Cloud Run service, allowing any website to make credentialed cross-origin requests to the API. This enables CSRF-style attacks where a malicious site can make API calls using a victim's JWT token.",
+      "affected_resources": [
+        "Cloud Run service: rdf-api",
+        "Environment variable: CORS_ORIGINS"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Set CORS_ORIGINS to your actual frontend domains only",
+            "commands": [
+              "gcloud run services update rdf-api --region europe-central2 --set-env-vars 'CORS_ORIGINS=[\"https://joy-forge-express.lovable.app\",\"https://aaed77c9-b864-4814-8747-ad97402d1f70.lovableproject.com\"]'"
+            ]
+          }
+        ],
+        "verification": [
+          "curl -H 'Origin: https://evil.com' -I https://rdf-api-448201086881.europe-central2.run.app/health | grep -i access-control",
+          "curl -H 'Origin: https://joy-forge-express.lovable.app' -I https://rdf-api-448201086881.europe-central2.run.app/health | grep -i access-control"
+        ]
+      }
+    },
+
+    {
+      "id": "SEC-007",
+      "severity": "HIGH",
+      "title": "Batch VM has external IP — direct SSH target",
+      "status": "open",
+      "description": "The batch VM rdf-batch-vm has external IP 34.116.141.233, making it directly reachable from the internet. SSH brute-force attacks are a constant risk. IAP tunneling provides the same access without exposing a public IP.",
+      "affected_resources": [
+        "GCE VM: rdf-batch-vm (34.116.141.233)"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Enable IAP for SSH access",
+            "commands": [
+              "gcloud services enable iap.googleapis.com --project=rdf-api-project"
+            ]
+          },
+          {
+            "order": 2,
+            "description": "Create a firewall rule allowing IAP TCP forwarding",
+            "commands": [
+              "gcloud compute firewall-rules create allow-iap-ssh --direction=INGRESS --action=ALLOW --rules=tcp:22 --source-ranges=35.235.240.0/20 --target-tags=iap-ssh --project=rdf-api-project",
+              "gcloud compute instances add-tags rdf-batch-vm --tags=iap-ssh --zone=europe-central2-a"
+            ]
+          },
+          {
+            "order": 3,
+            "description": "Grant IAP tunnel user role to your account",
+            "commands": [
+              "gcloud projects add-iam-policy-binding rdf-api-project --member='user:piotr.kraus01@gmail.com' --role='roles/iap.tunnelResourceAccessor'"
+            ]
+          },
+          {
+            "order": 4,
+            "description": "Remove the external IP from the VM",
+            "commands": [
+              "gcloud compute instances delete-access-config rdf-batch-vm --zone=europe-central2-a --access-config-name='External NAT'"
+            ]
+          },
+          {
+            "order": 5,
+            "description": "Add Cloud NAT for outbound internet access (batch workers need to reach ms.gov.pl)",
+            "commands": [
+              "gcloud compute routers create rdf-router --network=default --region=europe-central2",
+              "gcloud compute routers nats create rdf-nat --router=rdf-router --region=europe-central2 --nat-all-subnet-ip-ranges --auto-allocate-nat-external-ips"
+            ]
+          }
+        ],
+        "rollback": "Re-add external IP: gcloud compute instances add-access-config rdf-batch-vm --zone=europe-central2-a",
+        "verification": [
+          "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --tunnel-through-iap",
+          "gcloud compute instances describe rdf-batch-vm --zone=europe-central2-a --format='value(networkInterfaces[0].accessConfigs)'"
+        ],
+        "note": "After removing external IP, always SSH via: gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --tunnel-through-iap"
+      }
+    },
+
+    {
+      "id": "SEC-008",
+      "severity": "HIGH",
+      "title": "Secrets stored as plaintext .env on batch VM",
+      "status": "open",
+      "description": "NordVPN credentials and the database password are stored in plaintext in /opt/rdf-api-project/.env on the batch VM. Any user or process with file read access can extract them.",
+      "affected_resources": [
+        "File: /opt/rdf-api-project/.env on rdf-batch-vm",
+        "Secrets: DATABASE_URL (contains password), NORDVPN_USERNAME, NORDVPN_PASSWORD"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Update systemd services to fetch secrets from Secret Manager at startup instead of reading from .env",
+            "note": "Modify the ExecStart in krs-scanner.service and rdf-worker.service to wrap the command with a script that fetches secrets: export DATABASE_URL=$(gcloud secrets versions access latest --secret=database-url) etc."
+          },
+          {
+            "order": 2,
+            "description": "Create a wrapper script on the VM that fetches secrets and exec's the worker",
+            "commands": [
+              "cat > /opt/rdf-api-project/run-with-secrets.sh << 'SCRIPT'\n#!/bin/bash\nexport DATABASE_URL=$(gcloud secrets versions access latest --secret=database-url --project=rdf-api-project)\nexport NORDVPN_USERNAME=$(gcloud secrets versions access latest --secret=nordvpn-username --project=rdf-api-project)\nexport NORDVPN_PASSWORD=$(gcloud secrets versions access latest --secret=nordvpn-password --project=rdf-api-project)\nexec \"$@\"\nSCRIPT",
+              "chmod +x /opt/rdf-api-project/run-with-secrets.sh"
+            ]
+          },
+          {
+            "order": 3,
+            "description": "Update systemd ExecStart to use the wrapper",
+            "note": "Change ExecStart in krs-scanner.service to: ExecStart=/opt/rdf-api-project/run-with-secrets.sh /opt/rdf-api-project/.venv/bin/python -m batch.runner"
+          },
+          {
+            "order": 4,
+            "description": "Remove secrets from .env on the VM (keep only non-sensitive vars)",
+            "note": "Remove DATABASE_URL, NORDVPN_USERNAME, NORDVPN_PASSWORD from /opt/rdf-api-project/.env"
+          }
+        ],
+        "prerequisite": "SEC-001 must be completed first (batch VM SA needs roles/secretmanager.secretAccessor)"
+      }
+    },
+
+    {
+      "id": "SEC-009",
+      "severity": "HIGH",
+      "title": "GCS buckets lack public access prevention",
+      "status": "open",
+      "description": "The GCS buckets rdf-project-documents and rdf-project-data were created without public access prevention. If an IAM policy accidentally grants allUsers or allAuthenticatedUsers access, the buckets become publicly readable.",
+      "affected_resources": [
+        "GCS bucket: rdf-project-documents",
+        "GCS bucket: rdf-project-data"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Enable public access prevention on both buckets",
+            "commands": [
+              "gcloud storage buckets update gs://rdf-project-documents --public-access-prevention",
+              "gcloud storage buckets update gs://rdf-project-data --public-access-prevention"
+            ]
+          },
+          {
+            "order": 2,
+            "description": "Enable uniform bucket-level access (disables per-object ACLs)",
+            "commands": [
+              "gcloud storage buckets update gs://rdf-project-documents --uniform-bucket-level-access",
+              "gcloud storage buckets update gs://rdf-project-data --uniform-bucket-level-access"
+            ]
+          }
+        ],
+        "verification": [
+          "gcloud storage buckets describe gs://rdf-project-documents --format='value(public_access_prevention)'",
+          "gcloud storage buckets describe gs://rdf-project-data --format='value(public_access_prevention)'"
+        ]
+      }
+    },
+
+    {
+      "id": "SEC-010",
+      "severity": "HIGH",
+      "title": "No SSL enforcement on Cloud SQL connections",
+      "status": "open",
+      "description": "Cloud SQL instance rdf-postgres does not enforce SSL for connections. While Cloud Run uses the built-in Auth Proxy (which provides encryption), the batch VM currently connects via public IP without guaranteed SSL, allowing potential man-in-the-middle interception of database traffic.",
+      "affected_resources": [
+        "Cloud SQL instance: rdf-postgres"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Require SSL for all Cloud SQL connections",
+            "commands": [
+              "gcloud sql instances patch rdf-postgres --require-ssl"
+            ]
+          }
+        ],
+        "note": "Cloud SQL Auth Proxy connections (Cloud Run) are already encrypted and unaffected by this setting. If the batch VM still uses the public IP before SEC-005 is completed, add sslmode=verify-full to its DATABASE_URL.",
+        "verification": [
+          "gcloud sql instances describe rdf-postgres --format='value(settings.ipConfiguration.requireSsl)'"
+        ]
+      }
+    },
+
+    {
+      "id": "SEC-011",
+      "severity": "MEDIUM",
+      "title": "Batch VM uses overly broad storage-full scope",
+      "status": "open",
+      "description": "The batch VM was created with --scopes=storage-full, granting full read/write/delete access to ALL GCS buckets in the project. Should be scoped to specific buckets via IAM on a dedicated SA.",
+      "affected_resources": [
+        "GCE VM: rdf-batch-vm"
+      ],
+      "remediation": {
+        "note": "Resolved automatically by SEC-001 step 4 — switching to a dedicated SA with bucket-scoped IAM replaces the need for broad scopes.",
+        "depends_on": "SEC-001"
+      }
+    },
+
+    {
+      "id": "SEC-012",
+      "severity": "MEDIUM",
+      "title": "Stale backup cron references non-existent DuckDB file",
+      "status": "open",
+      "description": "deploy/rdf-backup.cron backs up /data/scraper.duckdb to GCS. The project migrated to PostgreSQL, so this file no longer exists. The cron runs as root and silently fails. Should be updated to back up PostgreSQL or removed.",
+      "affected_resources": [
+        "deploy/rdf-backup.cron"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Option A: Remove the stale cron if PostgreSQL backups are handled by Cloud SQL automated backups",
+            "commands": [
+              "gcloud sql instances patch rdf-postgres --backup-start-time=03:00 --enable-bin-log"
+            ],
+            "note": "Cloud SQL automated backups are recommended over manual pg_dump crons"
+          },
+          {
+            "order": 2,
+            "description": "Option B: Replace with a PostgreSQL backup cron if you need off-GCP backups",
+            "note": "Update deploy/rdf-backup.cron to use pg_dump instead of gsutil cp on DuckDB"
+          }
+        ]
+      }
+    },
+
+    {
+      "id": "SEC-013",
+      "severity": "MEDIUM",
+      "title": "Test dependencies shipped in production Docker image",
+      "status": "open",
+      "description": "requirements.txt includes pytest, pytest-asyncio, respx, and pandas (~120MB). These increase the attack surface, image size, and build time in the production container.",
+      "affected_resources": [
+        "requirements.txt",
+        "Dockerfile"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Split requirements into production and development files",
+            "note": "Create requirements-dev.txt with: pytest, pytest-asyncio, respx. Move pandas to requirements-dev.txt if only used for training data scripts (not the API runtime). Update Dockerfile to use requirements.txt (prod only). Update CI to install both."
+          }
+        ]
+      }
+    },
+
+    {
+      "id": "SEC-014",
+      "severity": "MEDIUM",
+      "title": "No Cloud Audit Logs for data access",
+      "status": "open",
+      "description": "Data Access audit logs are not configured for Cloud SQL or Cloud Storage. Without these, you cannot detect or investigate unauthorized data access after the fact.",
+      "affected_resources": [
+        "Cloud SQL instance: rdf-postgres",
+        "GCS buckets: rdf-project-documents, rdf-project-data"
+      ],
+      "remediation": {
+        "steps": [
+          {
+            "order": 1,
+            "description": "Enable Data Access audit logs for Cloud SQL and Cloud Storage",
+            "commands": [
+              "gcloud projects get-iam-policy rdf-api-project --format=json > /tmp/iam-policy.json"
+            ],
+            "note": "Edit /tmp/iam-policy.json to add auditConfigs, then apply with gcloud projects set-iam-policy"
+          },
+          {
+            "order": 2,
+            "description": "Add audit config JSON block to the IAM policy",
+            "json_to_add": {
+              "auditConfigs": [
+                {
+                  "service": "cloudsql.googleapis.com",
+                  "auditLogConfigs": [
+                    {"logType": "ADMIN_READ"},
+                    {"logType": "DATA_READ"},
+                    {"logType": "DATA_WRITE"}
+                  ]
+                },
+                {
+                  "service": "storage.googleapis.com",
+                  "auditLogConfigs": [
+                    {"logType": "ADMIN_READ"},
+                    {"logType": "DATA_READ"},
+                    {"logType": "DATA_WRITE"}
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "order": 3,
+            "description": "Apply the updated IAM policy",
+            "commands": [
+              "gcloud projects set-iam-policy rdf-api-project /tmp/iam-policy.json"
+            ]
+          }
+        ],
+        "note": "Data Access logs increase Cloud Logging costs. Monitor billing after enabling. Consider enabling DATA_WRITE only if cost is a concern.",
+        "verification": [
+          "gcloud projects get-iam-policy rdf-api-project --format=json | jq '.auditConfigs'"
+        ]
+      }
+    }
+  ],
+
+  "execution_order": [
+    {
+      "phase": "Phase 1 — Deploy code fixes (immediate)",
+      "items": ["SEC-002", "SEC-003", "SEC-004"],
+      "command": "gcloud run deploy rdf-api --source . --region europe-central2",
+      "note": "All three code fixes ship in a single deployment"
+    },
+    {
+      "phase": "Phase 2 — Tighten network & IAM (this week)",
+      "items": ["SEC-001", "SEC-006", "SEC-009", "SEC-010"],
+      "note": "Create dedicated SAs, tighten CORS, lock down GCS and Cloud SQL. These are independent and can be applied in any order."
+    },
+    {
+      "phase": "Phase 3 — Remove public access (this week, after Phase 2)",
+      "items": ["SEC-005", "SEC-007", "SEC-008"],
+      "note": "SEC-005 (remove Cloud SQL public IP) and SEC-007 (remove VM external IP) require SEC-001 to be done first. SEC-008 (secrets from Secret Manager) requires SEC-001 step 2. Apply SEC-007 last because it changes SSH access method."
+    },
+    {
+      "phase": "Phase 4 — Hardening & hygiene (next sprint)",
+      "items": ["SEC-011", "SEC-012", "SEC-013", "SEC-014"],
+      "note": "SEC-011 is auto-resolved by SEC-001. SEC-012-014 are lower priority cleanup."
+    }
+  ]
+}

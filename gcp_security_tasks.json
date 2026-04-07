@@ -1,0 +1,259 @@
+{
+  "title": "GCP Security Tasks — Infrastructure Changes",
+  "created_at": "2026-04-06",
+  "context": "These tasks must be run on GCP infrastructure (gcloud CLI, Cloud Console). They complement the code changes already applied locally for SEC-002/003/004/008/012/013. Deploy the code first, then apply these tasks in phase order.",
+
+  "tasks": [
+    {
+      "id": "GCP-SEC-001",
+      "source": "SEC-001",
+      "severity": "CRITICAL",
+      "title": "Create dedicated service accounts + remove roles/editor",
+      "phase": "Phase 1",
+      "depends_on": null,
+      "commands": [
+        "# --- Cloud Run SA ---",
+        "gcloud iam service-accounts create rdf-api-sa --display-name='RDF API Cloud Run'",
+        "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-api-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/cloudsql.client'",
+        "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-api-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/secretmanager.secretAccessor'",
+        "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-api-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/logging.logWriter'",
+        "",
+        "# --- Batch VM SA ---",
+        "gcloud iam service-accounts create rdf-batch-sa --display-name='RDF Batch VM'",
+        "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/cloudsql.client'",
+        "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/storage.objectAdmin' --condition=\"expression=resource.name.startsWith('projects/_/buckets/rdf-project-documents'),title=rdf-docs-bucket-only\"",
+        "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/logging.logWriter'",
+        "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com' --role='roles/secretmanager.secretAccessor'",
+        "",
+        "# --- Attach SAs ---",
+        "gcloud run services update rdf-api --region europe-central2 --service-account=rdf-api-sa@rdf-api-project.iam.gserviceaccount.com",
+        "",
+        "gcloud compute instances stop rdf-batch-vm --zone=europe-central2-a",
+        "gcloud compute instances set-service-account rdf-batch-vm --zone=europe-central2-a --service-account=rdf-batch-sa@rdf-api-project.iam.gserviceaccount.com --scopes=cloud-platform",
+        "gcloud compute instances start rdf-batch-vm --zone=europe-central2-a",
+        "",
+        "# --- Remove overly broad role (only after verifying services work!) ---",
+        "gcloud projects remove-iam-policy-binding rdf-api-project --member='serviceAccount:448201086881-compute@developer.gserviceaccount.com' --role='roles/editor'"
+      ],
+      "verification": [
+        "gcloud run services describe rdf-api --region europe-central2 --format='value(spec.template.spec.serviceAccountName)'",
+        "gcloud compute instances describe rdf-batch-vm --zone=europe-central2-a --format='value(serviceAccounts[0].email)'",
+        "curl https://rdf-api-448201086881.europe-central2.run.app/health"
+      ],
+      "rollback": "gcloud projects add-iam-policy-binding rdf-api-project --member='serviceAccount:448201086881-compute@developer.gserviceaccount.com' --role='roles/editor'",
+      "note": "Also resolves SEC-011 (overly broad storage-full scope)."
+    },
+
+    {
+      "id": "GCP-SEC-002",
+      "source": "SEC-006",
+      "severity": "HIGH",
+      "title": "Tighten CORS to actual frontend domains",
+      "phase": "Phase 1",
+      "depends_on": null,
+      "commands": [
+        "gcloud run services update rdf-api --region europe-central2 --set-env-vars 'CORS_ORIGINS=[\"https://joy-forge-express.lovable.app\",\"https://aaed77c9-b864-4814-8747-ad97402d1f70.lovableproject.com\"]'"
+      ],
+      "verification": [
+        "curl -s -H 'Origin: https://evil.com' -I https://rdf-api-448201086881.europe-central2.run.app/health | grep -i access-control",
+        "curl -s -H 'Origin: https://joy-forge-express.lovable.app' -I https://rdf-api-448201086881.europe-central2.run.app/health | grep -i access-control"
+      ]
+    },
+
+    {
+      "id": "GCP-SEC-003",
+      "source": "SEC-009",
+      "severity": "HIGH",
+      "title": "Lock down GCS buckets — prevent public access",
+      "phase": "Phase 1",
+      "depends_on": null,
+      "commands": [
+        "gcloud storage buckets update gs://rdf-project-documents --public-access-prevention",
+        "gcloud storage buckets update gs://rdf-project-data --public-access-prevention",
+        "gcloud storage buckets update gs://rdf-project-documents --uniform-bucket-level-access",
+        "gcloud storage buckets update gs://rdf-project-data --uniform-bucket-level-access"
+      ],
+      "verification": [
+        "gcloud storage buckets describe gs://rdf-project-documents --format='value(public_access_prevention)'",
+        "gcloud storage buckets describe gs://rdf-project-data --format='value(public_access_prevention)'"
+      ]
+    },
+
+    {
+      "id": "GCP-SEC-004",
+      "source": "SEC-010",
+      "severity": "HIGH",
+      "title": "Require SSL on Cloud SQL connections",
+      "phase": "Phase 1",
+      "depends_on": null,
+      "commands": [
+        "gcloud sql instances patch rdf-postgres --require-ssl"
+      ],
+      "verification": [
+        "gcloud sql instances describe rdf-postgres --format='value(settings.ipConfiguration.requireSsl)'"
+      ],
+      "note": "Cloud Run (Auth Proxy) is unaffected. If batch VM still uses public IP, add sslmode=verify-full to DATABASE_URL."
+    },
+
+    {
+      "id": "GCP-SEC-005",
+      "source": "SEC-005",
+      "severity": "HIGH",
+      "title": "Install Cloud SQL Auth Proxy on batch VM + remove public IP",
+      "phase": "Phase 2",
+      "depends_on": "GCP-SEC-001 (batch VM SA needs cloudsql.client role)",
+      "commands": [
+        "# Install proxy binary",
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo curl -o /usr/local/bin/cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.3/cloud-sql-proxy.linux.amd64 && sudo chmod +x /usr/local/bin/cloud-sql-proxy'",
+        "",
+        "# Install the systemd service (already in deploy/cloud-sql-proxy.service)",
+        "gcloud compute scp deploy/cloud-sql-proxy.service rdf-batch-vm:/tmp/ --zone=europe-central2-a",
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo cp /tmp/cloud-sql-proxy.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now cloud-sql-proxy'",
+        "",
+        "# Update .env: change DATABASE_URL to use localhost",
+        "# postgresql://postgres:<pw>@34.118.73.120:5432/rdf → postgresql://postgres:<pw>@127.0.0.1:5432/rdf",
+        "",
+        "# Restart workers to use proxy",
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo systemctl restart krs-scanner rdf-worker'",
+        "",
+        "# After verifying proxy works, remove public IP",
+        "gcloud sql instances patch rdf-postgres --no-assign-ip"
+      ],
+      "verification": [
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo systemctl status cloud-sql-proxy'",
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo systemctl status krs-scanner'",
+        "gcloud sql instances describe rdf-postgres --format='value(ipAddresses)'"
+      ],
+      "rollback": "gcloud sql instances patch rdf-postgres --assign-ip"
+    },
+
+    {
+      "id": "GCP-SEC-006",
+      "source": "SEC-007",
+      "severity": "HIGH",
+      "title": "Switch batch VM to IAP tunneling + remove external IP",
+      "phase": "Phase 2",
+      "depends_on": "GCP-SEC-001",
+      "commands": [
+        "# Enable IAP API",
+        "gcloud services enable iap.googleapis.com --project=rdf-api-project",
+        "",
+        "# Firewall rule for IAP",
+        "gcloud compute firewall-rules create allow-iap-ssh --direction=INGRESS --action=ALLOW --rules=tcp:22 --source-ranges=35.235.240.0/20 --target-tags=iap-ssh --project=rdf-api-project",
+        "gcloud compute instances add-tags rdf-batch-vm --tags=iap-ssh --zone=europe-central2-a",
+        "",
+        "# Grant IAP access",
+        "gcloud projects add-iam-policy-binding rdf-api-project --member='user:piotr.kraus01@gmail.com' --role='roles/iap.tunnelResourceAccessor'",
+        "",
+        "# Cloud NAT for outbound internet (workers need ms.gov.pl)",
+        "gcloud compute routers create rdf-router --network=default --region=europe-central2",
+        "gcloud compute routers nats create rdf-nat --router=rdf-router --region=europe-central2 --nat-all-subnet-ip-ranges --auto-allocate-nat-external-ips",
+        "",
+        "# Remove external IP",
+        "gcloud compute instances delete-access-config rdf-batch-vm --zone=europe-central2-a --access-config-name='External NAT'"
+      ],
+      "verification": [
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --tunnel-through-iap"
+      ],
+      "rollback": "gcloud compute instances add-access-config rdf-batch-vm --zone=europe-central2-a",
+      "note": "After this, always SSH via: gcloud compute ssh rdf-batch-vm --zone=europe-central2-a --tunnel-through-iap"
+    },
+
+    {
+      "id": "GCP-SEC-007",
+      "source": "SEC-008",
+      "severity": "HIGH",
+      "title": "Deploy secrets wrapper to batch VM + remove secrets from .env",
+      "phase": "Phase 2",
+      "depends_on": "GCP-SEC-001 (batch SA needs secretmanager.secretAccessor)",
+      "commands": [
+        "# Deploy updated systemd services + wrapper script",
+        "gcloud compute scp deploy/run-with-secrets.sh rdf-batch-vm:/opt/rdf-api-project/deploy/ --zone=europe-central2-a",
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'chmod +x /opt/rdf-api-project/deploy/run-with-secrets.sh'",
+        "",
+        "# Copy updated service files",
+        "gcloud compute scp deploy/krs-scanner.service deploy/rdf-worker.service deploy/metadata-backfill.service rdf-batch-vm:/tmp/ --zone=europe-central2-a",
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo cp /tmp/krs-scanner.service /tmp/rdf-worker.service /tmp/metadata-backfill.service /etc/systemd/system/ && sudo systemctl daemon-reload'",
+        "",
+        "# Remove secrets from .env (keep only non-sensitive vars)",
+        "# Manually edit /opt/rdf-api-project/.env on the VM:",
+        "#   Remove: DATABASE_URL, NORDVPN_USERNAME, NORDVPN_PASSWORD",
+        "",
+        "# Restart services",
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo systemctl restart krs-scanner rdf-worker'"
+      ],
+      "verification": [
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'sudo systemctl status krs-scanner'",
+        "gcloud compute ssh rdf-batch-vm --zone=europe-central2-a -- 'grep -c DATABASE_URL /opt/rdf-api-project/.env'",
+        "# Should return 0 (no DATABASE_URL in .env)"
+      ]
+    },
+
+    {
+      "id": "GCP-SEC-008",
+      "source": "SEC-012",
+      "severity": "MEDIUM",
+      "title": "Enable Cloud SQL automated backups",
+      "phase": "Phase 3",
+      "depends_on": null,
+      "commands": [
+        "gcloud sql instances patch rdf-postgres --backup-start-time=03:00"
+      ],
+      "verification": [
+        "gcloud sql instances describe rdf-postgres --format='value(settings.backupConfiguration)'"
+      ],
+      "note": "Replaces the stale DuckDB cron (already removed from deploy/rdf-backup.cron in code)."
+    },
+
+    {
+      "id": "GCP-SEC-009",
+      "source": "SEC-014",
+      "severity": "MEDIUM",
+      "title": "Enable Cloud Audit Logs for data access",
+      "phase": "Phase 3",
+      "depends_on": null,
+      "commands": [
+        "# Export current policy",
+        "gcloud projects get-iam-policy rdf-api-project --format=json > /tmp/iam-policy.json",
+        "",
+        "# Add auditConfigs to /tmp/iam-policy.json:",
+        "# {",
+        "#   \"auditConfigs\": [",
+        "#     {\"service\": \"cloudsql.googleapis.com\", \"auditLogConfigs\": [{\"logType\": \"DATA_WRITE\"}]},",
+        "#     {\"service\": \"storage.googleapis.com\", \"auditLogConfigs\": [{\"logType\": \"DATA_WRITE\"}]}",
+        "#   ]",
+        "# }",
+        "",
+        "# Apply updated policy",
+        "gcloud projects set-iam-policy rdf-api-project /tmp/iam-policy.json"
+      ],
+      "verification": [
+        "gcloud projects get-iam-policy rdf-api-project --format=json | grep -A5 auditConfigs"
+      ],
+      "note": "Start with DATA_WRITE only to minimize Cloud Logging costs. Add DATA_READ later if needed."
+    }
+  ],
+
+  "execution_order": [
+    {
+      "phase": "Phase 0 — Deploy code changes",
+      "description": "Deploy the codebase with SEC-002/003/004/008/012/013 fixes.",
+      "command": "gcloud run deploy rdf-api --source . --region europe-central2"
+    },
+    {
+      "phase": "Phase 1 — IAM + network hardening (independent, any order)",
+      "tasks": ["GCP-SEC-001", "GCP-SEC-002", "GCP-SEC-003", "GCP-SEC-004"],
+      "description": "Dedicated SAs, tighten CORS, lock GCS, require SSL. All independent."
+    },
+    {
+      "phase": "Phase 2 — Remove public access (after Phase 1)",
+      "tasks": ["GCP-SEC-005", "GCP-SEC-006", "GCP-SEC-007"],
+      "description": "Cloud SQL proxy on VM, IAP tunneling, secrets from Secret Manager. Requires Phase 1 SAs."
+    },
+    {
+      "phase": "Phase 3 — Hardening & audit (next sprint)",
+      "tasks": ["GCP-SEC-008", "GCP-SEC-009"],
+      "description": "Automated backups, audit logs. Lower priority."
+    }
+  ]
+}

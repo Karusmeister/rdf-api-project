@@ -52,33 +52,7 @@ class RdfDocumentStore:
 
     def _ensure_table(self):
         def _do(conn):
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS krs_documents (
-                    document_id         VARCHAR PRIMARY KEY,
-                    krs                 VARCHAR(10) NOT NULL,
-                    rodzaj              VARCHAR NOT NULL,
-                    status              VARCHAR NOT NULL,
-                    nazwa               VARCHAR,
-                    okres_start         VARCHAR,
-                    okres_end           VARCHAR,
-                    filename            VARCHAR,
-                    is_ifrs             BOOLEAN,
-                    is_correction       BOOLEAN,
-                    date_filed          VARCHAR,
-                    date_prepared       VARCHAR,
-                    is_downloaded       BOOLEAN DEFAULT false,
-                    downloaded_at       TIMESTAMP,
-                    storage_path        VARCHAR,
-                    storage_backend     VARCHAR,
-                    file_size_bytes     BIGINT,
-                    zip_size_bytes      BIGINT,
-                    file_count          INTEGER,
-                    file_types          VARCHAR,
-                    discovered_at       TIMESTAMP NOT NULL,
-                    metadata_fetched_at TIMESTAMP,
-                    download_error      VARCHAR
-                )
-            """)
+            # DB-003: Legacy krs_documents table removed.
             conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_krs_document_versions START 1")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS krs_document_versions (
@@ -249,20 +223,7 @@ class RdfDocumentStore:
                     change_reason="discovery",
                 )
 
-                # Legacy cache
-                conn.execute("""
-                    INSERT INTO krs_documents
-                        (document_id, krs, rodzaj, status, nazwa,
-                         okres_start, okres_end, discovered_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (document_id) DO NOTHING
-                """, [
-                    doc_id, krs,
-                    doc["rodzaj"], doc["status"], doc.get("nazwa"),
-                    doc.get("okresSprawozdawczyPoczatek"),
-                    doc.get("okresSprawozdawczyKoniec"),
-                    now,
-                ])
+                # DB-003: Legacy krs_documents write removed.
                 inserted += 1
             return inserted
         return self._with_conn(_do)
@@ -282,16 +243,12 @@ class RdfDocumentStore:
         return self._with_conn(_do)
 
     def _resolve_krs(self, conn, document_id: str) -> str:
-        """Get KRS from current version or legacy table. Raises if not found."""
+        """Get KRS from current version. Raises if not found."""
         current = self._get_current(conn, document_id)
         if current is not None:
             return current["krs"]
-        legacy = conn.execute(
-            "SELECT krs FROM krs_documents WHERE document_id = %s", [document_id]
-        ).fetchone()
-        if legacy is not None:
-            return legacy[0]
-        raise ValueError(f"Document {document_id} has no version history and no legacy record")
+        # DB-003: Legacy krs_documents fallback removed.
+        raise ValueError(f"Document {document_id} has no version history")
 
     def update_metadata(self, document_id: str, meta: dict) -> None:
         """Update extended metadata fields after fetching doc metadata."""
@@ -313,21 +270,7 @@ class RdfDocumentStore:
                 change_reason="metadata_update",
             )
 
-            # Legacy cache
-            conn.execute("""
-                UPDATE krs_documents SET
-                    filename            = %s,
-                    is_ifrs             = %s,
-                    is_correction       = %s,
-                    date_filed          = %s,
-                    date_prepared       = %s,
-                    metadata_fetched_at = %s
-                WHERE document_id = %s
-            """, [
-                meta.get("nazwaPliku"), meta.get("czyMSR"),
-                meta.get("czyKorekta"), meta.get("dataDodania"),
-                meta.get("dataSporządzenia"), now, document_id,
-            ])
+            # DB-003: Legacy krs_documents write removed.
         self._with_conn(_do)
 
     def mark_downloaded(
@@ -362,21 +305,7 @@ class RdfDocumentStore:
                 change_reason="downloaded",
             )
 
-            # Legacy cache
-            conn.execute("""
-                UPDATE krs_documents SET
-                    is_downloaded    = true,
-                    downloaded_at    = %s,
-                    storage_path     = %s,
-                    storage_backend  = %s,
-                    file_size_bytes  = %s,
-                    zip_size_bytes   = %s,
-                    file_count       = %s,
-                    file_types       = %s,
-                    download_error   = NULL
-                WHERE document_id = %s
-            """, [now, storage_path, storage_backend, file_size, zip_size,
-                  file_count, file_types, document_id])
+            # DB-003: Legacy krs_documents write removed.
         self._with_conn(_do)
 
     def update_error(self, document_id: str, error: str) -> None:
@@ -390,9 +319,5 @@ class RdfDocumentStore:
                 change_reason="download_error",
             )
 
-            # Legacy cache
-            conn.execute(
-                "UPDATE krs_documents SET download_error = %s WHERE document_id = %s",
-                [error, document_id],
-            )
+            # DB-003: Legacy krs_documents write removed.
         self._with_conn(_do)

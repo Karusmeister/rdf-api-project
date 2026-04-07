@@ -1,0 +1,92 @@
+name: Release API
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  PROJECT_ID: rdf-api-project
+  REGION: europe-central2
+  REGISTRY: europe-central2-docker.pkg.dev
+  IMAGE: europe-central2-docker.pkg.dev/rdf-api-project/rdf-images/rdf-api
+  SERVICE: rdf-api
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: rdf
+          POSTGRES_PASSWORD: rdf_dev
+          POSTGRES_DB: rdf
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rdf"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short -x
+        env:
+          DATABASE_URL: postgresql://rdf:rdf_dev@localhost:5432/rdf
+          ENVIRONMENT: local
+          JWT_SECRET: test-secret-that-is-at-least-32-bytes-long!!
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker ${{ env.REGISTRY }}
+
+      - name: Build and push image
+        run: |
+          docker build \
+            -t ${{ env.IMAGE }}:${{ github.ref_name }} \
+            -t ${{ env.IMAGE }}:latest \
+            .
+          docker push ${{ env.IMAGE }}:${{ github.ref_name }}
+          docker push ${{ env.IMAGE }}:latest
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run services update ${{ env.SERVICE }} \
+            --image ${{ env.IMAGE }}:${{ github.ref_name }} \
+            --region ${{ env.REGION }} \
+            --project ${{ env.PROJECT_ID }}
+
+      - name: Verify deployment
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE }} \
+            --region ${{ env.REGION }} \
+            --format='value(status.url)')
+          curl -sf "${URL}/health" || (echo "Health check failed" && exit 1)

@@ -52,6 +52,7 @@ def run_rdf_batch(
     page_size: int | None = None,
     dsn: str | None = None,
     skip_metadata: bool | None = None,
+    legal_forms: list[str] | None = None,
 ) -> None:
     """Spawn N worker processes for RDF document discovery + download."""
     _workers = workers if workers is not None else settings.batch_workers
@@ -75,10 +76,11 @@ def run_rdf_batch(
     logger.info(
         "rdf_batch_start workers=%d vpn=%s concurrency=%d delay=%.1f "
         "download_delay=%.1f page_size=%d db=%s storage_backend=%s "
-        "skip_metadata=%s proxy_pool_size=%d",
+        "skip_metadata=%s proxy_pool_size=%d legal_forms=%s",
         _workers, _vpn, _concurrency, _delay, _dl_delay, _page_size, _db,
         settings.storage_backend, _skip_meta,
         len(full_pool) if full_pool else 0,
+        legal_forms,
     )
 
     processes: list[multiprocessing.Process] = []
@@ -98,6 +100,7 @@ def run_rdf_batch(
                 dsn=_db,
                 skip_metadata=_skip_meta,
                 proxy_pool=full_pool,
+                legal_forms=legal_forms,
             ),
         )
         processes.append(p)
@@ -174,6 +177,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skip-metadata", action="store_true", default=None,
         help="Skip per-document metadata fetch (backfill later with metadata_runner)",
     )
+    parser.add_argument(
+        "--legal-forms", type=str, nargs="+", default=None,
+        help=(
+            "Only process KRS entities with these legal forms. "
+            "Example: --legal-forms 'SPÓŁKA Z OGRANICZONĄ ODPOWIEDZIALNOŚCIĄ' 'SPÓŁKA KOMANDYTOWA'"
+        ),
+    )
     return parser
 
 
@@ -200,6 +210,7 @@ def main() -> None:
         page_size=args.page_size,
         dsn=args.db,
         skip_metadata=args.skip_metadata,
+        legal_forms=args.legal_forms,
     )
 
 

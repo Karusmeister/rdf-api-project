@@ -1,0 +1,5 @@
+# Development & test dependencies (not shipped in production Docker image)
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.24
+respx>=0.22

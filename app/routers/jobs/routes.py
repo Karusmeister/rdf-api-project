@@ -8,6 +8,7 @@ from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.auth import CurrentUser, require_admin
 from app.jobs import krs_scanner, krs_sync
 from app.repositories import krs_repo
 
@@ -30,8 +31,9 @@ async def sync_status():
 
 
 @sync_router.post("/trigger", summary="Trigger KRS sync")
-async def trigger_sync():
-    """Manually trigger a KRS sync run without holding the request open."""
+async def trigger_sync(user: CurrentUser):
+    """Manually trigger a KRS sync run without holding the request open. Admin only."""
+    require_admin(user)
     logger.info("krs_sync_manual_trigger", extra={"event": "krs_sync_manual_trigger"})
     scheduled = await krs_sync.start_sync_task()
     if not scheduled:
@@ -73,8 +75,9 @@ async def scan_status():
 
 
 @scan_router.post("/trigger", summary="Trigger KRS scan")
-async def trigger_scan():
-    """Fire run_scan() in a background task. 202 if accepted, 409 if running."""
+async def trigger_scan(user: CurrentUser):
+    """Fire run_scan() in a background task. 202 if accepted, 409 if running. Admin only."""
+    require_admin(user)
     logger.info("krs_scan_manual_trigger", extra={"event": "krs_scan_manual_trigger"})
     scheduled = await krs_scanner.start_scan_task()
     if not scheduled:
@@ -89,15 +92,17 @@ async def trigger_scan():
 
 
 @scan_router.post("/stop", summary="Stop running scan")
-async def stop_scan():
-    """Signal the running scan to stop after its current probe."""
+async def stop_scan(user: CurrentUser):
+    """Signal the running scan to stop after its current probe. Admin only."""
+    require_admin(user)
     krs_scanner.request_stop()
     return {"status": "stop_requested"}
 
 
 @scan_router.post("/reset-cursor", summary="Reset scan cursor")
-async def reset_cursor(body: ResetCursorBody):
-    """Reset the scan cursor to an arbitrary position. Rejected if running."""
+async def reset_cursor(body: ResetCursorBody, user: CurrentUser):
+    """Reset the scan cursor to an arbitrary position. Rejected if running. Admin only."""
+    require_admin(user)
     if not 0 <= body.next_krs_int <= 99_999_999:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

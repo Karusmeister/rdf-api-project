@@ -215,7 +215,7 @@ async def test_backfill_loop_updates_metadata(pg_dsn, clean_pg):
     # Verify metadata was written
     wrapper = make_connection(pg_dsn)
     row = wrapper.execute(
-        "SELECT filename, is_ifrs, metadata_fetched_at FROM krs_documents WHERE document_id = %s",
+        "SELECT filename, is_ifrs, metadata_fetched_at FROM krs_document_versions WHERE document_id = %s AND is_current = true",
         ["meta_test_doc=="],
     ).fetchone()
     wrapper.close()
@@ -281,7 +281,7 @@ async def test_backfill_loop_processes_multiple_batches(pg_dsn, clean_pg):
     wrapper = make_connection(pg_dsn)
     for doc_id in doc_ids:
         row = wrapper.execute(
-            "SELECT metadata_fetched_at FROM krs_documents WHERE document_id = %s",
+            "SELECT metadata_fetched_at FROM krs_document_versions WHERE document_id = %s AND is_current = true",
             [doc_id],
         ).fetchone()
         assert row[0] is not None, f"Doc {doc_id} should have metadata"

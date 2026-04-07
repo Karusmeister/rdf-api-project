@@ -69,11 +69,13 @@ def test_krs_registry_still_populated(store, db):
     assert rows[0][0] == "Registry Corp"
 
 
-def test_legacy_cache_still_populated(store, db):
+def test_legacy_cache_removed(store, db):
+    """DB-003: Legacy krs_entities table is no longer written to."""
     store.upsert_entity("0000000005", "Cache Corp")
-    rows = db.query("SELECT name FROM krs_entities WHERE krs = '0000000005'")
-    assert len(rows) == 1
-    assert rows[0][0] == "Cache Corp"
+    # Data should be in krs_entity_versions, not krs_entities
+    versions = db.versions("0000000005")
+    assert len(versions) == 1
+    assert versions[0]["name"] == "Cache Corp"
 
 
 def test_multiple_changes_only_one_current(store, db):

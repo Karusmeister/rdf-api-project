@@ -63,24 +63,7 @@ class EntityStore:
     def _ensure_tables(self):
         """Create tables if they don't exist. Idempotent."""
         def _do(conn):
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS krs_entities (
-                    krs             VARCHAR(10) PRIMARY KEY,
-                    name            VARCHAR NOT NULL,
-                    legal_form      VARCHAR,
-                    status          VARCHAR,
-                    registered_at   DATE,
-                    last_changed_at DATE,
-                    nip             VARCHAR(13),
-                    regon           VARCHAR(14),
-                    address_city    VARCHAR,
-                    address_street  VARCHAR,
-                    address_postal_code VARCHAR,
-                    raw             JSON,
-                    source          VARCHAR NOT NULL DEFAULT 'rdf_batch',
-                    synced_at       TIMESTAMP NOT NULL DEFAULT current_timestamp
-                )
-            """)
+            # DB-003: Legacy krs_entities table removed.
             conn.execute("""
                 CREATE SEQUENCE IF NOT EXISTS seq_krs_entity_versions START 1
             """)
@@ -175,16 +158,7 @@ class EntityStore:
                         [krs, name, legal_form, raw_json, now_iso, snap_hash, now_iso],
                     )
 
-                # Legacy cache (inside same transaction)
-                conn.execute("""
-                    INSERT INTO krs_entities (krs, name, legal_form, raw, source, synced_at)
-                    VALUES (%s, %s, %s, %s, 'rdf_batch', %s)
-                    ON CONFLICT (krs) DO UPDATE SET
-                        name = COALESCE(excluded.name, krs_entities.name),
-                        legal_form = COALESCE(excluded.legal_form, krs_entities.legal_form),
-                        raw = COALESCE(excluded.raw, krs_entities.raw),
-                        synced_at = excluded.synced_at
-                """, [krs, name, legal_form, raw_json, now_iso])
+                # DB-003: Legacy krs_entities write removed.
 
                 # krs_registry (inside same transaction)
                 conn.execute("""

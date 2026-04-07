@@ -53,25 +53,8 @@ def _ensure_schema() -> None:
 def _init_schema() -> None:
     conn = get_conn()
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS krs_entities (
-            krs             VARCHAR(10) PRIMARY KEY,
-            name            VARCHAR NOT NULL,
-            legal_form      VARCHAR,
-            status          VARCHAR,
-            registered_at   DATE,
-            last_changed_at DATE,
-            nip             VARCHAR(13),
-            regon           VARCHAR(14),
-            address_city    VARCHAR,
-            address_street  VARCHAR,
-            address_postal_code VARCHAR,
-            raw             JSON,
-            source          VARCHAR NOT NULL DEFAULT 'ms_gov',
-            synced_at       TIMESTAMP NOT NULL DEFAULT current_timestamp
-        )
-    """)
-    _ensure_krs_entities_columns(conn)
+    # DB-003: Legacy krs_entities table removed.
+    # All reads go through krs_entities_current view on krs_entity_versions.
 
     # --- Append-only version history for KRS entities ---
     conn.execute("""
@@ -110,29 +93,25 @@ def _init_schema() -> None:
     }
     for idx_name, idx_sql in [
         ("idx_krs_entity_versions_krs", "CREATE INDEX idx_krs_entity_versions_krs ON krs_entity_versions(krs)"),
-        ("idx_krs_entity_versions_current", "CREATE INDEX idx_krs_entity_versions_current ON krs_entity_versions(krs, is_current)"),
-        ("idx_krs_entity_versions_valid_from", "CREATE INDEX idx_krs_entity_versions_valid_from ON krs_entity_versions(valid_from)"),
+        # DB-004: idx_krs_entity_versions_current and idx_krs_entity_versions_valid_from removed (0 scans in production)
+        # DB-005: Partial index — only indexes current rows
+        ("idx_entity_versions_current_krs", "CREATE INDEX idx_entity_versions_current_krs ON krs_entity_versions(krs) WHERE is_current = true"),
     ]:
         if idx_name not in existing_idx:
             conn.execute(idx_sql)
 
+    # DB-002: Simplified view — is_current is already maintained by the
+    # application (exactly one row per krs).  Removing the ROW_NUMBER()
+    # window function lets PostgreSQL push WHERE krs = ... filters into
+    # the base table via index scan.
     conn.execute("""
         CREATE OR REPLACE VIEW krs_entities_current AS
         SELECT
             krs, name, legal_form, status, registered_at, last_changed_at,
             nip, regon, address_city, address_street, address_postal_code,
             raw, source, valid_from AS synced_at
-        FROM (
-            SELECT
-                kev.*,
-                row_number() OVER (
-                    PARTITION BY kev.krs
-                    ORDER BY kev.valid_from DESC, kev.version_id DESC
-                ) AS rn
-            FROM krs_entity_versions kev
-            WHERE kev.is_current = true
-        ) ranked
-        WHERE rn = 1
+        FROM krs_entity_versions
+        WHERE is_current = true
     """)
 
     conn.execute("""
@@ -437,35 +416,7 @@ def upsert_entity(
 
     _append_entity_version_if_changed(conn, krs, snapshot, snap_hash, source, now, raw_json)
 
-    # Keep legacy cache table in sync for backward compatibility
-    conn.execute(
-        """
-        INSERT INTO krs_entities
-            (krs, name, legal_form, status, registered_at, last_changed_at,
-             nip, regon, address_city, address_street, address_postal_code,
-             raw, source, synced_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (krs) DO UPDATE SET
-            name            = excluded.name,
-            legal_form      = excluded.legal_form,
-            status          = excluded.status,
-            registered_at   = excluded.registered_at,
-            last_changed_at = excluded.last_changed_at,
-            nip             = excluded.nip,
-            regon           = excluded.regon,
-            address_city    = excluded.address_city,
-            address_street  = excluded.address_street,
-            address_postal_code = excluded.address_postal_code,
-            raw             = excluded.raw,
-            source          = excluded.source,
-            synced_at       = excluded.synced_at
-        """,
-        [
-            krs, name, legal_form, status, registered_at, last_changed_at,
-            nip, regon, address_city, address_street, address_postal_code,
-            raw_json, source, now,
-        ],
-    )
+    # DB-003: Legacy krs_entities write removed.
 
 
 def upsert_from_krs_entity(entity, *, source: str = "ms_gov") -> None:

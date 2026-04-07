@@ -104,37 +104,15 @@ def test_get_entity_not_found():
     assert krs_repo.get_entity("9999999999") is None
 
 
-def test_connect_migrates_existing_krs_entities_table():
+def test_connect_creates_entity_versions_table():
+    """DB-003: Legacy krs_entities table removed. Verify version table exists."""
     conn = db_conn.get_conn()
-    conn.execute("DROP TABLE IF EXISTS krs_entities CASCADE")
-    conn.execute("""
-        CREATE TABLE krs_entities (
-            krs             VARCHAR(10) PRIMARY KEY,
-            name            VARCHAR NOT NULL,
-            legal_form      VARCHAR,
-            status          VARCHAR,
-            registered_at   DATE,
-            last_changed_at DATE,
-            nip             VARCHAR(13),
-            regon           VARCHAR(14),
-            address_city    VARCHAR,
-            raw             JSON,
-            source          VARCHAR NOT NULL DEFAULT 'ms_gov',
-            synced_at       TIMESTAMP NOT NULL DEFAULT current_timestamp
-        )
-    """)
-
-    krs_repo._schema_initialized = False
-    krs_repo.connect()
-
-    columns = {
+    tables = {
         row[0] for row in conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name = 'krs_entities' AND table_schema = 'public'"
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
         ).fetchall()
     }
-    assert "address_street" in columns
-    assert "address_postal_code" in columns
+    assert "krs_entity_versions" in tables
 
 
 # ---------------------------------------------------------------------------
