@@ -323,6 +323,150 @@ FEATURE_DEFINITIONS = [
         "required_tags": ["RZiS.C", "RZiS.A"],
         "computation_logic": "ratio",
     },
+
+    # --- Maczynska-Zawadzki 2006 (SHV) Model W1-W4 ---
+    # Reference: Maczynska E., Zawadzki M., 2006. Dyskryminacyjne modele predykcji
+    # ZMZ = 9.498*W1 + 3.566*W2 + 2.903*W3 + 0.452*W4 - 1.498
+    {
+        "id": "w1_maczynska2006",
+        "name": "Maczynska2006 W1: operating ROA",
+        "description": "Operating profit / Total assets",
+        "category": "maczynska2006",
+        "formula_description": "RZiS.F / Aktywa",
+        "formula_numerator": "RZiS.F",
+        "formula_denominator": "Aktywa",
+        "required_tags": ["RZiS.F", "Aktywa"],
+        "computation_logic": "ratio",
+    },
+    {
+        "id": "w2_maczynska2006",
+        "name": "Maczynska2006 W2: equity ratio",
+        "description": "Equity / Total assets",
+        "category": "maczynska2006",
+        "formula_description": "Pasywa_A / Aktywa",
+        "formula_numerator": "Pasywa_A",
+        "formula_denominator": "Aktywa",
+        "required_tags": ["Pasywa_A", "Aktywa"],
+        "computation_logic": "ratio",
+    },
+    {
+        "id": "w3_maczynska2006",
+        "name": "Maczynska2006 W3: cash generation to debt",
+        "description": "(Net profit + Depreciation) / Total liabilities",
+        "category": "maczynska2006",
+        "formula_description": "(RZiS.L + CF.A_II_1) / Pasywa_B",
+        "formula_numerator": "RZiS.L",
+        "formula_denominator": "Pasywa_B",
+        "required_tags": ["RZiS.L", "CF.A_II_1", "Pasywa_B"],
+        "computation_logic": "custom",
+    },
+    {
+        "id": "w4_maczynska2006",
+        "name": "Maczynska2006 W4: current ratio",
+        "description": "Current assets / Short-term liabilities",
+        "category": "maczynska2006",
+        "formula_description": "Aktywa_B / Pasywa_B_III",
+        "formula_numerator": "Aktywa_B",
+        "formula_denominator": "Pasywa_B_III",
+        "required_tags": ["Aktywa_B", "Pasywa_B_III"],
+        "computation_logic": "ratio",
+    },
+
+    # --- Prusak P1 (2005) Model X1-X4 ---
+    # Reference: Prusak B., 2005. Nowoczesne metody prognozowania zagrozenia finansowego
+    # P1 = 6.5245*X1 + 0.1480*X2 + 0.4061*X3 + 2.1754*X4 - 1.5685
+    {
+        "id": "x1_prusak",
+        "name": "Prusak X1: return on assets",
+        "description": "Net profit / Total assets",
+        "category": "prusak",
+        "formula_description": "RZiS.L / Aktywa",
+        "formula_numerator": "RZiS.L",
+        "formula_denominator": "Aktywa",
+        "required_tags": ["RZiS.L", "Aktywa"],
+        "computation_logic": "ratio",
+    },
+    {
+        "id": "x2_prusak",
+        "name": "Prusak X2: operating costs to ST liabilities",
+        "description": "Operating costs / Short-term liabilities",
+        "category": "prusak",
+        "formula_description": "RZiS.B / Pasywa_B_III",
+        "formula_numerator": "RZiS.B",
+        "formula_denominator": "Pasywa_B_III",
+        "required_tags": ["RZiS.B", "Pasywa_B_III"],
+        "computation_logic": "ratio",
+    },
+    {
+        "id": "x3_prusak",
+        "name": "Prusak X3: current assets to total liabilities",
+        "description": "Current assets / Total liabilities",
+        "category": "prusak",
+        "formula_description": "Aktywa_B / Pasywa_B",
+        "formula_numerator": "Aktywa_B",
+        "formula_denominator": "Pasywa_B",
+        "required_tags": ["Aktywa_B", "Pasywa_B"],
+        "computation_logic": "ratio",
+    },
+    {
+        "id": "x4_prusak",
+        "name": "Prusak X4: operating margin",
+        "description": "Operating profit / Revenue",
+        "category": "prusak",
+        "formula_description": "RZiS.F / RZiS.A",
+        "formula_numerator": "RZiS.F",
+        "formula_denominator": "RZiS.A",
+        "required_tags": ["RZiS.F", "RZiS.A"],
+        "computation_logic": "ratio",
+    },
+
+    # --- Poznan (Wierzba 2000) Model X1-X4 ---
+    # Reference: Wierzba D., 2000. Wczesne wykrywanie przedsiebiorstw zagrozonych upadloscia
+    # ZP = 3.26261*X1 + 2.16352*X2 + 0.30141*X3 + 0.68516*X4 - 2.40435
+    {
+        "id": "x1_poznan",
+        "name": "Poznan X1: working capital ratio",
+        "description": "Working capital / Total assets",
+        "category": "poznan",
+        "formula_description": "(Aktywa_B - Pasywa_B_III) / Aktywa",
+        "formula_numerator": "Aktywa_B",
+        "formula_denominator": "Aktywa",
+        "required_tags": ["Aktywa_B", "Pasywa_B_III", "Aktywa"],
+        "computation_logic": "custom",
+    },
+    {
+        "id": "x2_poznan",
+        "name": "Poznan X2: return on assets",
+        "description": "Net profit / Total assets",
+        "category": "poznan",
+        "formula_description": "RZiS.L / Aktywa",
+        "formula_numerator": "RZiS.L",
+        "formula_denominator": "Aktywa",
+        "required_tags": ["RZiS.L", "Aktywa"],
+        "computation_logic": "ratio",
+    },
+    {
+        "id": "x3_poznan",
+        "name": "Poznan X3: cash generation to debt",
+        "description": "(Net profit + Depreciation) / Total liabilities",
+        "category": "poznan",
+        "formula_description": "(RZiS.L + CF.A_II_1) / Pasywa_B",
+        "formula_numerator": "RZiS.L",
+        "formula_denominator": "Pasywa_B",
+        "required_tags": ["RZiS.L", "CF.A_II_1", "Pasywa_B"],
+        "computation_logic": "custom",
+    },
+    {
+        "id": "x4_poznan",
+        "name": "Poznan X4: current ratio",
+        "description": "Current assets / Short-term liabilities",
+        "category": "poznan",
+        "formula_description": "Aktywa_B / Pasywa_B_III",
+        "formula_numerator": "Aktywa_B",
+        "formula_denominator": "Pasywa_B_III",
+        "required_tags": ["Aktywa_B", "Pasywa_B_III"],
+        "computation_logic": "ratio",
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -355,6 +499,27 @@ FEATURE_SETS = {
         "description": "Four features for the Poznanski (Hamrol/Czajka/Piechocki 2004) discriminant bankruptcy model",
         "members": [
             "x1_poznanski", "x2_poznanski", "x3_poznanski", "x4_poznanski",
+        ],
+    },
+    "maczynska2006_4": {
+        "name": "Maczynska-Zawadzki 2006 SHV Model (4 features)",
+        "description": "Four features for the Maczynska-Zawadzki (2006) discriminant bankruptcy model",
+        "members": [
+            "w1_maczynska2006", "w2_maczynska2006", "w3_maczynska2006", "w4_maczynska2006",
+        ],
+    },
+    "prusak_p1_4": {
+        "name": "Prusak P1 Model (4 features)",
+        "description": "Four features for the Prusak P1 (2005) discriminant bankruptcy model",
+        "members": [
+            "x1_prusak", "x2_prusak", "x3_prusak", "x4_prusak",
+        ],
+    },
+    "poznan_4": {
+        "name": "Poznan Model (4 features)",
+        "description": "Four features for the Poznan (Wierzba 2000) discriminant bankruptcy model",
+        "members": [
+            "x1_poznan", "x2_poznan", "x3_poznan", "x4_poznan",
         ],
     },
 }

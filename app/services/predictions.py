@@ -14,15 +14,33 @@ from typing import Callable
 
 from app.db import prediction_db
 from app.services import maczynska as maczynska_module
+from app.services import maczynska2006 as maczynska2006_module
 from app.services import poznanski as poznanski_module
+from app.services import poznan as poznan_module
+from app.services import prusak as prusak_module
 from app.services.maczynska import COEFFICIENTS as MACZYNSKA_COEFFICIENTS
 from app.services.maczynska import classify as maczynska_classify
+from app.services.maczynska2006 import (
+    COEFFICIENTS as MACZYNSKA2006_COEFFICIENTS,
+    INTERCEPT as MACZYNSKA2006_INTERCEPT,
+    classify as maczynska2006_classify,
+)
 from app.services.poznanski import (
     COEFFICIENTS as POZNANSKI_COEFFICIENTS,
     INTERCEPT as POZNANSKI_INTERCEPT,
     NON_LINEAR_LIQUIDITY_THRESHOLD as POZNANSKI_X2_THRESHOLD,
     WARNING_NON_LINEAR_LIQUIDITY,
     classify as poznanski_classify,
+)
+from app.services.prusak import (
+    COEFFICIENTS as PRUSAK_COEFFICIENTS,
+    INTERCEPT as PRUSAK_INTERCEPT,
+    classify as prusak_classify,
+)
+from app.services.poznan import (
+    COEFFICIENTS as POZNAN_COEFFICIENTS,
+    INTERCEPT as POZNAN_INTERCEPT,
+    classify as poznan_classify,
 )
 from app.services.schema_labels import SCHEMA_REGISTRY
 
@@ -51,6 +69,33 @@ INTERPRETATION: dict[str, dict] = {
     },
     "poznanski_2004_v1": {
         "score_name": "Z-score (Poznanski)",
+        "higher_is_better": True,
+        "thresholds": [
+            {"label": "critical", "max": 0, "summary": "Bankruptcy risk zone."},
+            {"label": "medium", "min": 0, "max": 1, "summary": "Stable but monitor."},
+            {"label": "low", "min": 1, "summary": "Good condition."},
+        ],
+    },
+    "maczynska_2006_v1": {
+        "score_name": "Z-score (Maczynska-Zawadzki 2006)",
+        "higher_is_better": True,
+        "thresholds": [
+            {"label": "critical", "max": 0, "summary": "Bankruptcy risk zone."},
+            {"label": "medium", "min": 0, "max": 1, "summary": "Stable but monitor."},
+            {"label": "low", "min": 1, "summary": "Good condition."},
+        ],
+    },
+    "prusak_p1_v1": {
+        "score_name": "P1-score (Prusak)",
+        "higher_is_better": True,
+        "thresholds": [
+            {"label": "critical", "max": -0.13, "summary": "Bankruptcy risk zone."},
+            {"label": "medium", "min": -0.13, "max": 0.65, "summary": "Grey zone — monitor closely."},
+            {"label": "low", "min": 0.65, "summary": "Good condition."},
+        ],
+    },
+    "poznan_2000_v1": {
+        "score_name": "Z-score (Poznan)",
         "higher_is_better": True,
         "thresholds": [
             {"label": "critical", "max": 0, "summary": "Bankruptcy risk zone."},
@@ -89,6 +134,9 @@ def invalidate_caches() -> None:
 _BUILTIN_MODEL_REGISTRARS: list[Callable[[], None]] = [
     maczynska_module.ensure_model_registered,
     poznanski_module.ensure_model_registered,
+    maczynska2006_module.ensure_model_registered,
+    prusak_module.ensure_model_registered,
+    poznan_module.ensure_model_registered,
 ]
 
 
@@ -237,6 +285,75 @@ def score_poznanski(features: dict[str, float | None]) -> dict | None:
 
 
 register_scorer("poznanski_2004_v1", score_poznanski)
+
+
+def score_maczynska2006(features: dict[str, float | None]) -> dict | None:
+    missing = [k for k in MACZYNSKA2006_COEFFICIENTS if features.get(k) is None]
+    if missing:
+        return None
+    z = float(MACZYNSKA2006_INTERCEPT) + sum(
+        MACZYNSKA2006_COEFFICIENTS[k] * features[k] for k in MACZYNSKA2006_COEFFICIENTS
+    )
+    z = round(z, 6)
+    classification, risk_category = maczynska2006_classify(z)
+    contributions: dict = {"_intercept": round(float(MACZYNSKA2006_INTERCEPT), 6)}
+    for k in MACZYNSKA2006_COEFFICIENTS:
+        contributions[k] = round(MACZYNSKA2006_COEFFICIENTS[k] * features[k], 6)
+    return {
+        "raw_score": z,
+        "classification": classification,
+        "risk_category": risk_category,
+        "contributions": contributions,
+    }
+
+
+register_scorer("maczynska_2006_v1", score_maczynska2006)
+
+
+def score_prusak_p1(features: dict[str, float | None]) -> dict | None:
+    missing = [k for k in PRUSAK_COEFFICIENTS if features.get(k) is None]
+    if missing:
+        return None
+    z = float(PRUSAK_INTERCEPT) + sum(
+        PRUSAK_COEFFICIENTS[k] * features[k] for k in PRUSAK_COEFFICIENTS
+    )
+    z = round(z, 6)
+    classification, risk_category = prusak_classify(z)
+    contributions: dict = {"_intercept": round(float(PRUSAK_INTERCEPT), 6)}
+    for k in PRUSAK_COEFFICIENTS:
+        contributions[k] = round(PRUSAK_COEFFICIENTS[k] * features[k], 6)
+    return {
+        "raw_score": z,
+        "classification": classification,
+        "risk_category": risk_category,
+        "contributions": contributions,
+    }
+
+
+register_scorer("prusak_p1_v1", score_prusak_p1)
+
+
+def score_poznan(features: dict[str, float | None]) -> dict | None:
+    missing = [k for k in POZNAN_COEFFICIENTS if features.get(k) is None]
+    if missing:
+        return None
+    z = float(POZNAN_INTERCEPT) + sum(
+        POZNAN_COEFFICIENTS[k] * features[k] for k in POZNAN_COEFFICIENTS
+    )
+    z = round(z, 6)
+    classification, risk_category = poznan_classify(z)
+    contributions: dict = {"_intercept": round(float(POZNAN_INTERCEPT), 6)}
+    for k in POZNAN_COEFFICIENTS:
+        contributions[k] = round(POZNAN_COEFFICIENTS[k] * features[k], 6)
+    return {
+        "raw_score": z,
+        "classification": classification,
+        "risk_category": risk_category,
+        "contributions": contributions,
+    }
+
+
+register_scorer("poznan_2000_v1", score_poznan)
 
 
 # ---------------------------------------------------------------------------
