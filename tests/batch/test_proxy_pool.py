@@ -457,7 +457,11 @@ async def test_krs_worker_retries_item_after_rotation(monkeypatch):
 
     dsn = settings.database_url
 
-    # Ensure batch_progress table exists (not created by app schema init)
+    # Ensure all required tables exist in CI (fresh DB)
+    from app.repositories import krs_repo
+    from app.db import prediction_db
+    krs_repo._init_schema()
+    prediction_db.init_schema()
     progress_store = ProgressStore(dsn)
 
     # Clean up test KRS from any previous run
