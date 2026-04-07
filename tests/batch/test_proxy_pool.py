@@ -457,6 +457,9 @@ async def test_krs_worker_retries_item_after_rotation(monkeypatch):
 
     dsn = settings.database_url
 
+    # Ensure batch_progress table exists (not created by app schema init)
+    progress_store = ProgressStore(dsn)
+
     # Clean up test KRS from any previous run
     from app.db.connection import make_connection
     conn = make_connection(dsn)
