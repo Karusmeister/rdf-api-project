@@ -11,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from app import rdf_client
 from app.auth import OptionalUser
+from app.db.connection import get_conn
 from app.routers.analysis.schemas import CompareRequest, StatementRequest, TimeSeriesRequest
 from app.services import xml_parser
 from app.services.activity import activity_logger
@@ -92,11 +93,71 @@ async def _get_available_periods(krs: str) -> list[dict]:
             }
 
     periods = sorted(period_map.values(), key=lambda x: x["period_end"])
+
+    # Supplement with completed reports from our DB that the upstream RDF API
+    # may not list (e.g. documents removed upstream, or ingested via batch).
+    periods = _supplement_periods_from_db(krs, periods)
+
     # Only cache when every metadata call succeeded to avoid poisoning the cache
     # with a partial list caused by transient upstream failures.
     if not has_errors:
         xml_parser.cache_set(cache_key, periods)
     return periods
+
+
+def _supplement_periods_from_db(krs: str, upstream_periods: list[dict]) -> list[dict]:
+    """Add any completed financial_reports periods missing from the upstream list."""
+    try:
+        conn = get_conn()
+        rows = conn.execute(
+            """
+            SELECT id, fiscal_year, period_start, period_end,
+                   report_version, source_document_id
+            FROM financial_reports
+            WHERE krs = %s AND ingestion_status = 'completed'
+            ORDER BY fiscal_year, report_version DESC
+            """,
+            [krs.zfill(10)],
+        ).fetchall()
+    except Exception:
+        logger.warning("supplement_periods_db_error", extra={"krs": krs}, exc_info=True)
+        return upstream_periods
+
+    if not rows:
+        return upstream_periods
+
+    # Build set of period_end dates already known from upstream
+    known_ends = {p["period_end"] for p in upstream_periods}
+
+    # Deduplicate DB rows by period_end (highest report_version wins)
+    db_map: dict[str, dict] = {}
+    for r in rows:
+        pe = str(r[3])  # period_end as string
+        if pe not in db_map:
+            db_map[pe] = {
+                "period_start": str(r[2]),
+                "period_end": pe,
+                "document_id": r[5],  # source_document_id
+                "date_filed": None,
+                "is_correction": r[4] > 1,  # report_version > 1 implies correction
+                "is_ifrs": False,
+                "filename": None,
+            }
+
+    added = 0
+    for pe, entry in db_map.items():
+        if pe not in known_ends:
+            upstream_periods.append(entry)
+            added += 1
+
+    if added:
+        upstream_periods.sort(key=lambda x: x["period_end"])
+        logger.info(
+            "supplement_periods_from_db",
+            extra={"krs": krs, "added": added, "total": len(upstream_periods)},
+        )
+
+    return upstream_periods
 
 
 async def _fetch_and_parse(krs: str, period_end: Optional[str]) -> dict:
