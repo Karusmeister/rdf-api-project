@@ -42,7 +42,7 @@ jobs:
       - run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short -x --ignore=tests/batch/test_proxy_pool.py
+        run: pytest tests/ -v --tb=short -x --ignore=tests/batch/
         env:
           DATABASE_URL: postgresql://rdf:rdf_dev@localhost:5432/rdf
           ENVIRONMENT: local
