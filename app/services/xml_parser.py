@@ -164,22 +164,13 @@ def extract_tree(
     labels:     Schema-specific tag→label mapping.  Falls back to TAG_LABELS.
     multiplier: Factor applied to all kwota values (1000 for WTys schemas).
     """
-    if element.find("KwotaA") is None:
-        return None
-
     raw_tag = element.tag
     tag = f"{tag_prefix}{raw_tag}" if tag_prefix else raw_tag
 
-    kwota_a = _parse_float(element, "KwotaA") * multiplier
-    kwota_b = _parse_float(element, "KwotaB") * multiplier
-    kwota_b1_el = element.find("KwotaB1")
-    kwota_b1: Optional[float] = None
-    if kwota_b1_el is not None and kwota_b1_el.text:
-        try:
-            kwota_b1 = float(kwota_b1_el.text.strip().replace(",", ".")) * multiplier
-        except ValueError:
-            pass
+    has_direct_kwota = element.find("KwotaA") is not None
 
+    # Recurse into children first — CF container sections (A, B, C) have no
+    # direct KwotaA but carry sub-elements (A_I, A_II, A_III) that do.
     children = []
     for child in element:
         if child.tag in ("KwotaA", "KwotaB", "KwotaB1"):
@@ -187,6 +178,27 @@ def extract_tree(
         child_node = extract_tree(child, depth + 1, tag_prefix, labels, multiplier)
         if child_node is not None:
             children.append(child_node)
+
+    if not has_direct_kwota and not children:
+        return None
+
+    if has_direct_kwota:
+        kwota_a = _parse_float(element, "KwotaA") * multiplier
+        kwota_b = _parse_float(element, "KwotaB") * multiplier
+    else:
+        # Container node (e.g. CF.A): derive totals from the subtotal child
+        # (conventionally the last child, e.g. A_III, B_III, C_III).
+        subtotal = children[-1] if children else None
+        kwota_a = subtotal["kwota_a"] if subtotal else 0.0
+        kwota_b = subtotal["kwota_b"] if subtotal else 0.0
+
+    kwota_b1_el = element.find("KwotaB1")
+    kwota_b1: Optional[float] = None
+    if kwota_b1_el is not None and kwota_b1_el.text:
+        try:
+            kwota_b1 = float(kwota_b1_el.text.strip().replace(",", ".")) * multiplier
+        except ValueError:
+            pass
 
     return {
         "tag": tag,

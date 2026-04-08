@@ -115,6 +115,64 @@ def _log_revenue(values: dict[str, Optional[float]], fdef: dict) -> Optional[flo
     return math.log(v)
 
 
+@register_custom("w3_maczynska2006")
+def _w3_maczynska2006(
+    values: dict[str, Optional[float]], fdef: dict
+) -> Optional[float]:
+    """(Net profit + Depreciation) / Total liabilities.
+
+    Net profit         = RZiS.L  (Zysk netto)
+    Depreciation       = CF.A_II_1  (Amortyzacja from cash flow)
+    Total liabilities  = Pasywa_B  (Zobowiazania i rezerwy)
+    """
+    net_profit = values.get("RZiS.L")
+    depreciation = values.get("CF.A_II_1")
+    liabilities = values.get("Pasywa_B")
+
+    if net_profit is None or liabilities is None or liabilities == 0:
+        return None
+    dep = depreciation or 0.0
+    return (net_profit + dep) / liabilities
+
+
+@register_custom("x1_poznan")
+def _x1_poznan(
+    values: dict[str, Optional[float]], fdef: dict
+) -> Optional[float]:
+    """Working capital / Total assets.
+
+    Working capital = Current assets - Short-term liabilities
+                    = Aktywa_B - Pasywa_B_III
+    Total assets    = Aktywa
+    """
+    current_assets = values.get("Aktywa_B")
+    st_liabilities = values.get("Pasywa_B_III")
+    total_assets = values.get("Aktywa")
+    if current_assets is None or st_liabilities is None or total_assets is None or total_assets == 0:
+        return None
+    return (current_assets - st_liabilities) / total_assets
+
+
+@register_custom("x3_poznan")
+def _x3_poznan(
+    values: dict[str, Optional[float]], fdef: dict
+) -> Optional[float]:
+    """(Net profit + Depreciation) / Total liabilities.
+
+    Net profit         = RZiS.L
+    Depreciation       = CF.A_II_1
+    Total liabilities  = Pasywa_B
+    """
+    net_profit = values.get("RZiS.L")
+    depreciation = values.get("CF.A_II_1")
+    liabilities = values.get("Pasywa_B")
+
+    if net_profit is None or liabilities is None or liabilities == 0:
+        return None
+    dep = depreciation or 0.0
+    return (net_profit + dep) / liabilities
+
+
 # ---------------------------------------------------------------------------
 # Core computation
 # ---------------------------------------------------------------------------

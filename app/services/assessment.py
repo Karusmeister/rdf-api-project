@@ -21,6 +21,9 @@ from app.scraper.storage import LocalStorage, make_doc_dir
 from app.services import etl, feature_engine
 from app.services import maczynska as maczynska_scorer
 from app.services import poznanski as poznanski_scorer
+from app.services import maczynska2006 as maczynska2006_scorer
+from app.services import prusak as prusak_scorer
+from app.services import poznan as poznan_scorer
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +316,33 @@ async def run_pipeline(job_id: str, krs: str) -> None:
             except Exception:
                 logger.warning(
                     "assessment_poznanski_scoring_failed",
+                    extra={"job_id": job_id, "krs": krs},
+                    exc_info=True,
+                )
+
+            try:
+                await _run_in_executor(maczynska2006_scorer.score_batch, report_ids)
+            except Exception:
+                logger.warning(
+                    "assessment_maczynska2006_scoring_failed",
+                    extra={"job_id": job_id, "krs": krs},
+                    exc_info=True,
+                )
+
+            try:
+                await _run_in_executor(prusak_scorer.score_batch, report_ids)
+            except Exception:
+                logger.warning(
+                    "assessment_prusak_scoring_failed",
+                    extra={"job_id": job_id, "krs": krs},
+                    exc_info=True,
+                )
+
+            try:
+                await _run_in_executor(poznan_scorer.score_batch, report_ids)
+            except Exception:
+                logger.warning(
+                    "assessment_poznan_scoring_failed",
                     extra={"job_id": job_id, "krs": krs},
                     exc_info=True,
                 )
