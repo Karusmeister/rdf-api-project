@@ -51,17 +51,18 @@ class RdfDocumentStore:
         for attempt in range(4):
             if attempt > 0:
                 time.sleep(1.0 * (2 ** (attempt - 1)))
-            conn = make_connection(self._dsn)
             try:
-                return fn(conn)
+                conn = make_connection(self._dsn)
+                try:
+                    return fn(conn)
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             except psycopg2.OperationalError as exc:
                 last_err = exc
                 logger.warning("db_retry attempt=%d/%d error=%s", attempt + 1, 4, exc)
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
         raise last_err
 
     def _ensure_table(self):
