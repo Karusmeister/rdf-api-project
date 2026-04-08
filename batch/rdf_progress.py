@@ -5,9 +5,14 @@ Uses a separate table (batch_rdf_progress) so it does not interfere
 with the KRS entity scanner's batch_progress table.
 """
 
+import logging
+import time
+
 import psycopg2
 
 from app.db.connection import make_connection
+
+logger = logging.getLogger(__name__)
 
 
 class RdfProgressStore:
@@ -18,13 +23,26 @@ class RdfProgressStore:
         self._init_schema()
 
     def _with_conn(self, fn):
-        """Open a short-lived connection, call fn(conn), close, return result."""
-        conn = make_connection(self._dsn)
-        try:
-            result = fn(conn)
-        finally:
-            conn.close()
-        return result
+        """Open a short-lived connection, call fn(conn), close, return result.
+
+        Retries up to 3 times on OperationalError (e.g. proxy connection drops).
+        """
+        last_err = None
+        for attempt in range(4):
+            if attempt > 0:
+                time.sleep(1.0 * (2 ** (attempt - 1)))
+            conn = make_connection(self._dsn)
+            try:
+                return fn(conn)
+            except psycopg2.OperationalError as exc:
+                last_err = exc
+                logger.warning("db_retry attempt=%d/%d error=%s", attempt + 1, 4, exc)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        raise last_err
 
     def _init_schema(self):
         def _do(conn):
