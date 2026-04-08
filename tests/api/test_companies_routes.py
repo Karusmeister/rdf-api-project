@@ -33,9 +33,11 @@ class TestSearchCompanies:
 
         # Main query result
         mock_conn.execute.return_value.fetchall.side_effect = [
-            # Search results
+            # Search results (ILIKE)
             [("0000694720", "Digital Software sp. z o.o.", "1234567890",
               "62.01.Z", "sp. z o.o.", "active", True)],
+            # Fuzzy fallback (word_similarity)
+            [],
             # Count query
             [(1,)],
         ]

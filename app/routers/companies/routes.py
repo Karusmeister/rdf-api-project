@@ -152,8 +152,10 @@ def search_companies(
         """, ['%' + query + '%', query + '%', limit]).fetchall()
 
         # Fuzzy fallback: if ILIKE found too few results, use trigram similarity
+        # Wrapped in try/except — word_similarity requires pg_trgm extension
         if len(rows) < limit:
-            fuzzy_rows = conn.execute("""
+            try:
+                fuzzy_rows = conn.execute("""
                 SELECT
                     kr.krs,
                     kr.company_name AS name,
@@ -169,7 +171,9 @@ def search_companies(
                 ORDER BY word_similarity(%s, kr.company_name) DESC, kr.company_name
                 LIMIT %s
             """, [query, '%' + query + '%', query, limit - len(rows)]).fetchall()
-            rows = list(rows) + list(fuzzy_rows)
+                rows = list(rows) + list(fuzzy_rows)
+            except Exception:
+                pass  # pg_trgm not available or query error — ILIKE results are sufficient
 
         count_row = conn.execute(
             "SELECT COUNT(*) FROM krs_registry WHERE company_name ILIKE %s",
