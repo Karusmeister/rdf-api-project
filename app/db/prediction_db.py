@@ -2126,7 +2126,7 @@ def create_user(user_id: str, email: str, name: Optional[str], auth_method: str,
 
 def get_user_by_email(email: str) -> Optional[dict]:
     conn = get_conn()
-    row = conn.execute(f"{_USER_SELECT} WHERE email = %s", [email]).fetchone()
+    row = conn.execute(f"{_USER_SELECT} WHERE LOWER(email) = LOWER(%s)", [email]).fetchone()
     return _row_to_user(row)
 
 
