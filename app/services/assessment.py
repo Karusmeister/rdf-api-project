@@ -32,6 +32,39 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _diagnose_no_predictions(krs: str, completed_reports: list[dict]) -> str | None:
+    """Determine why scoring produced no predictions for a KRS."""
+    from app.db.connection import get_conn as _get_conn
+
+    if not completed_reports:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT file_type FROM krs_documents_current WHERE krs = %s AND rodzaj = '18'",
+            [krs],
+        ).fetchall()
+        found = {r[0] for r in rows}
+        if found <= {"other", "unknown", "xhtml"}:
+            return "ifrs_xhtml"
+        if found <= {"pdf", "unknown"}:
+            return "pdf_only"
+        return "ingestion_failed"
+
+    schemas = {r.get("schema_code") for r in completed_reports if r.get("schema_code")}
+    if schemas <= {"SFJMIZ"}:
+        return "micro_entity"
+    if schemas <= {"SFZURT"}:
+        return "insurance_entity"
+
+    conn = _get_conn()
+    tag_check = conn.execute(
+        "SELECT count(*) FROM financial_line_items fli JOIN financial_reports fr ON fr.id = fli.report_id WHERE fr.krs = %s AND fli.tag_path = 'RZiS.A' LIMIT 1",
+        [krs],
+    ).fetchone()
+    if tag_check and tag_check[0] == 0:
+        return "missing_standard_tags"
+    return "scoring_failed"
+
+
 def check_data_readiness(krs: str) -> dict:
     """Check how much data we already have for this KRS. Returns a summary dict."""
     krs = krs.zfill(10)
@@ -60,43 +93,11 @@ def check_data_readiness(krs: str) -> dict:
     # Diagnose why predictions may be unavailable
     diagnosis = None
     if not predictions_available:
-        if not completed_reports:
-            # Check document file types to understand why no reports ingested
-            from app.db.connection import get_conn as _get_conn
-            conn = _get_conn()
-            file_types_rows = conn.execute(
-                "SELECT DISTINCT file_type FROM krs_documents_current WHERE krs = %s AND rodzaj = '18'",
-                [krs],
-            ).fetchall()
-            file_types_found = {r[0] for r in file_types_rows}
-            if file_types_found <= {"other", "unknown", "xhtml"}:
-                diagnosis = "ifrs_xhtml"
-            elif file_types_found <= {"pdf", "unknown"}:
-                diagnosis = "pdf_only"
-            else:
-                diagnosis = "ingestion_failed"
-        else:
-            # Reports ingested but no predictions — check schema
-            schemas = {r.get("schema_code") for r in completed_reports if r.get("schema_code")}
-            if schemas <= {"SFJMIZ"}:
-                diagnosis = "micro_entity"
-            elif schemas <= {"SFZURT"}:
-                diagnosis = "insurance_entity"
-            elif schemas & {"SFJMIZ", "SFZURT"} or any("Bank" in (r.get("schema_code") or "") for r in completed_reports):
-                diagnosis = "unsupported_schema"
-            else:
-                # Check if it's a bank by looking at tags
-                conn = _get_conn() if '_get_conn' in dir() else get_conn()
-                tag_check = conn.execute("""
-                    SELECT count(*) FROM financial_line_items fli
-                    JOIN financial_reports fr ON fr.id = fli.report_id
-                    WHERE fr.krs = %s AND fli.tag_path = 'RZiS.A'
-                    LIMIT 1
-                """, [krs]).fetchone()
-                if tag_check and tag_check[0] == 0:
-                    diagnosis = "missing_standard_tags"
-                else:
-                    diagnosis = "scoring_failed"
+        try:
+            diagnosis = _diagnose_no_predictions(krs, completed_reports)
+        except Exception:
+            logger.debug("diagnosis_failed", exc_info=True)
+            diagnosis = "generic"
 
     return {
         "entity_exists": len(known_ids) > 0,
