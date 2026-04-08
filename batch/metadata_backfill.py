@@ -112,6 +112,27 @@ async def _backfill_loop(
     """
     _batch_size = batch_size if batch_size is not None else settings.metadata_backfill_fetch_batch_size
     doc_store = RdfDocumentStore(dsn, init_schema=False)
+    try:
+        await _backfill_loop_inner(
+            worker_id, total_workers, connection, concurrency, delay,
+            dsn, _batch_size, doc_store, proxy_pool,
+        )
+    finally:
+        doc_store.close()
+
+
+async def _backfill_loop_inner(
+    worker_id: int,
+    total_workers: int,
+    connection: Connection,
+    concurrency: int,
+    delay: float,
+    dsn: str,
+    _batch_size: int,
+    doc_store: "RdfDocumentStore",
+    proxy_pool: list[Connection] | None = None,
+) -> None:
+    """Inner loop, separated so caller can wrap with try/finally for cleanup."""
     stats = BackfillStats()
     sem = asyncio.Semaphore(concurrency)
     unexpected_errors = 0

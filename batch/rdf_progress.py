@@ -20,30 +20,48 @@ class RdfProgressStore:
 
     def __init__(self, dsn: str):
         self._dsn = dsn
+        self._conn = None
         self._init_schema()
 
-    def _with_conn(self, fn):
-        """Open a short-lived connection, call fn(conn), close, return result.
+    def _get_conn(self):
+        """Return a cached connection, reconnecting if needed."""
+        if self._conn is not None and not self._conn.closed:
+            return self._conn
+        self._conn = make_connection(self._dsn)
+        return self._conn
 
-        Retries up to 3 times on OperationalError (e.g. proxy connection drops).
-        """
+    def _with_conn(self, fn):
+        """Execute fn(conn) using a persistent connection with retry on failure."""
         last_err = None
         for attempt in range(4):
             if attempt > 0:
+                self._close_stale()
                 time.sleep(1.0 * (2 ** (attempt - 1)))
             try:
-                conn = make_connection(self._dsn)
-                try:
-                    return fn(conn)
-                finally:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                return fn(self._get_conn())
             except psycopg2.OperationalError as exc:
                 last_err = exc
+                self._close_stale()
                 logger.warning("db_retry attempt=%d/%d error=%s", attempt + 1, 4, exc)
         raise last_err
+
+    def _close_stale(self):
+        """Close a potentially stale connection before reconnect."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def close(self):
+        """Close the persistent connection."""
+        if self._conn is not None and not self._conn.closed:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
 
     def _init_schema(self):
         def _do(conn):

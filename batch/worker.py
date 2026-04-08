@@ -236,6 +236,29 @@ async def _worker_loop(
     # (e.g. tests or direct invocation outside batch.runner pre-bootstrap).
     store = ProgressStore(dsn, init_schema=True)
     entities = EntityStore(dsn, init_schema=True)
+    try:
+        await _worker_loop_inner(
+            worker_id, start_krs, stride, connection, concurrency,
+            delay, dsn, store, entities, proxy_pool,
+        )
+    finally:
+        store.close()
+        entities.close()
+
+
+async def _worker_loop_inner(
+    worker_id: int,
+    start_krs: int,
+    stride: int,
+    connection: Connection,
+    concurrency: int,
+    delay: float,
+    dsn: str,
+    store: ProgressStore,
+    entities: EntityStore,
+    proxy_pool: list[Connection] | None = None,
+) -> None:
+    """Inner loop, separated so caller can wrap with try/finally for cleanup."""
     stats = WorkerStats()
     health = ConnectionHealth()
     sem = asyncio.Semaphore(concurrency)

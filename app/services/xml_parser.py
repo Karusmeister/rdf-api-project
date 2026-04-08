@@ -74,36 +74,77 @@ def _is_statement_marker(tag: str) -> bool:
     return any(tag.startswith(p) for p in _STATEMENT_MARKER_PREFIXES)
 
 
+_XML_ZIP_EXTENSIONS = (".xml", ".xades")
+
+
 def extract_xml_from_zip(zip_bytes: bytes) -> str:
     """
     Return the financial statement XML from a ZIP archive.
     Prefers any XML whose parsed tree contains Bilans, RZiS, or RachPrzeplywow
     over other XML files (e.g. digital signatures) that may be in the archive.
+    Also handles XAdES-signed envelopes (.xades files).
     """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        xml_names = sorted(n for n in zf.namelist() if n.lower().endswith(".xml"))
+        xml_names = sorted(
+            n for n in zf.namelist()
+            if n.lower().endswith(_XML_ZIP_EXTENSIONS)
+        )
         if not xml_names:
             raise ValueError("No XML file found in ZIP")
 
-        first_content: Optional[str] = None
+        def _local(tag: str) -> str:
+            return tag.split("}", 1)[1] if "}" in tag else tag
+
         for name in xml_names:
             content = zf.read(name).decode("utf-8", errors="replace")
-            if first_content is None:
-                first_content = content
             try:
                 root = ET.fromstring(content)
-                # Strip namespaces from tag names for the marker check
-                def _local(tag: str) -> str:
-                    return tag.split("}", 1)[1] if "}" in tag else tag
+                # Unwrap XAdES envelope if present
+                raw_tag = _local(root.tag)
+                if raw_tag in ("Signatures", "Signature"):
+                    root = _unwrap_xades(root)
                 if any(
                     _is_statement_marker(_local(el.tag))
                     for el in root.iter()
                 ):
                     return content
-            except ET.ParseError:
+            except (ET.ParseError, ValueError):
                 continue
 
         raise ValueError(f"No parseable financial statement XML found in ZIP (files: {xml_names})")
+
+
+def _unwrap_xades(root: ET.Element) -> ET.Element:
+    """Extract the financial statement element from an XAdES signature envelope.
+
+    XAdES-signed XML wraps the actual e-Sprawozdanie inside a
+    ``<ds:Object>`` child of ``<ds:Signature>``.  Two packaging variants exist:
+
+    1. **Inline XML** — the financial root is a direct child element of
+       ``<ds:Object>`` (not a ``QualifyingProperties``).
+    2. **Base64-encoded** — the ``<ds:Object>`` has no child elements but
+       carries base64-encoded XML as text content.
+    """
+    import base64
+
+    DS_NS = "http://www.w3.org/2000/09/xmldsig#"
+    XADES_NS = "http://uri.etsi.org/01903/"  # prefix match — covers v1.3.2+
+
+    for obj in root.iter(f"{{{DS_NS}}}Object"):
+        children = list(obj)
+        if len(children) == 1:
+            child = children[0]
+            if XADES_NS in child.tag:
+                continue
+            return child
+        # Base64-encoded financial XML (no child elements, text content)
+        if not children and obj.text and obj.text.strip():
+            try:
+                decoded = base64.b64decode(obj.text.strip()).decode("utf-8")
+                return ET.fromstring(decoded)
+            except Exception:
+                continue
+    raise ValueError("No financial statement found inside XAdES envelope")
 
 
 def parse_xml_no_ns(xml_string: str) -> ET.Element:
@@ -111,8 +152,16 @@ def parse_xml_no_ns(xml_string: str) -> ET.Element:
     Parse XML and strip all namespace URIs from tag and attribute names.
     More robust than text-level regex stripping because the parser handles
     namespace resolution; we then just remove the {uri} prefixes.
+
+    Automatically unwraps XAdES signature envelopes.
     """
     root = ET.fromstring(xml_string)
+
+    # Detect XAdES envelope: root tag is "Signatures" or a ds:Signature element
+    raw_tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+    if raw_tag in ("Signatures", "Signature"):
+        root = _unwrap_xades(root)
+
     for elem in root.iter():
         if "}" in elem.tag:
             elem.tag = elem.tag.split("}", 1)[1]

@@ -129,6 +129,17 @@ class HistoryEntry(BaseModel):
     scored_at: str | None = Field(default=None, description="When the score was computed")
 
 
+class DataCoverageInfo(BaseModel):
+    """Document coverage summary: which years have XML vs PDF-only data."""
+
+    xml_years: list[int] = Field(default_factory=list, description="Fiscal years with parsed XML data")
+    pdf_only_years: list[int] = Field(default_factory=list, description="Fiscal years with PDF-only documents (not analyzed)")
+    earliest_xml_year: int | None = Field(default=None, description="First year with XML data")
+    earliest_document_year: int | None = Field(default=None, description="First year with any document")
+    analysis_note_pl: str | None = Field(default=None, description="Polish note about data coverage")
+    analysis_note_en: str | None = Field(default=None, description="English note about data coverage")
+
+
 class PredictionResponse(BaseModel):
     """Full prediction response: company info, latest predictions per model, and score history."""
 
@@ -148,6 +159,10 @@ class PredictionResponse(BaseModel):
             "Score timeline for charting: one entry per (model, fiscal_year), ordered by fiscal year ascending. "
             "When a fiscal year has been rescored multiple times, only the most recent score is returned."
         ),
+    )
+    data_coverage: DataCoverageInfo | None = Field(
+        default=None,
+        description="Document coverage: XML vs PDF-only years, with human-readable notes",
     )
 
 
@@ -181,3 +196,37 @@ class ModelsResponse(BaseModel):
     """List of all active prediction models."""
 
     models: list[ModelCatalogEntry] = Field(default_factory=list, description="Active models")
+
+
+# --- PKR-85: Pipeline trigger/status ---
+
+
+class PipelineTriggerResponse(BaseModel):
+    """Response from POST /api/predictions/{krs}/generate."""
+
+    job_id: str
+    krs: str
+    status: str = Field(description="pending, running, completed, or failed")
+    message: str
+
+
+class PipelineProgress(BaseModel):
+    """Live progress counters from the pipeline."""
+    documents_total: int = 0
+    documents_downloaded: int = 0
+    documents_ingested: int = 0
+    features_computed: bool = False
+    predictions_scored: bool = False
+
+
+class PipelineStatusResponse(BaseModel):
+    """Response from GET /api/predictions/{krs}/status."""
+
+    job_id: str
+    krs: str
+    status: str = Field(description="pending, running, completed, or failed")
+    current_stage: str | None = Field(default=None, description="Current pipeline stage name")
+    error_message: str | None = None
+    created_at: str
+    progress: PipelineProgress | None = None
+    diagnosis: str | None = Field(default=None, description="Why predictions are unavailable: ifrs_xhtml, pdf_only, micro_entity, insurance_entity, missing_standard_tags, scoring_failed")

@@ -10,6 +10,7 @@ when the snapshot hash changes.
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
 import psycopg2
@@ -48,17 +49,45 @@ class EntityStore:
 
     def __init__(self, dsn: str, *, init_schema: bool = True):
         self._dsn = dsn
+        self._conn = None
         if init_schema:
             self._ensure_tables()
 
+    def _get_conn(self):
+        """Return a cached connection, reconnecting if needed."""
+        if self._conn is not None and not self._conn.closed:
+            return self._conn
+        self._conn = make_connection(self._dsn)
+        return self._conn
+
     def _with_conn(self, fn):
-        """Open a short-lived connection, call fn(conn), close, return result."""
-        conn = make_connection(self._dsn)
-        try:
-            result = fn(conn)
-        finally:
-            conn.close()
-        return result
+        """Execute fn(conn) using a persistent connection with retry on failure."""
+        for attempt in range(3):
+            try:
+                return fn(self._get_conn())
+            except psycopg2.OperationalError:
+                self._close_stale()
+                if attempt == 2:
+                    raise
+                time.sleep(1.0 * (2 ** attempt))
+
+    def _close_stale(self):
+        """Close a potentially stale connection before reconnect."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def close(self):
+        """Close the persistent connection."""
+        if self._conn is not None and not self._conn.closed:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
 
     def _ensure_tables(self):
         """Create tables if they don't exist. Idempotent."""

@@ -613,6 +613,7 @@ def get_predictions(krs: str) -> dict:
             "company": company_info,
             "predictions": [],
             "history": history_entries,
+            "data_coverage": _build_data_coverage(krs),
         }
 
     # Return one entry per (model_id, fiscal_year). When a fiscal year has
@@ -723,11 +724,84 @@ def get_predictions(krs: str) -> dict:
         for h in history_data
     ]
 
+    # PKR-130: data coverage (XML vs PDF awareness)
+    data_coverage = _build_data_coverage(krs)
+
     return {
         "company": company_info,
         "predictions": predictions,
         "history": history_entries,
+        "data_coverage": data_coverage,
     }
+
+
+def _build_data_coverage(krs: str) -> dict | None:
+    """Build document coverage summary showing XML vs PDF-only years.
+
+    Schema-drift errors (UndefinedColumn) are handled in the DB layer and
+    return an empty list. Unexpected errors propagate so they surface in
+    logs and metrics.
+    """
+    rows = prediction_db.get_document_coverage(krs)
+
+    if not rows:
+        return None
+
+    xml_years: set[int] = set()
+    pdf_years: set[int] = set()
+    all_years: set[int] = set()
+
+    for row in rows:
+        fy = row.get("fiscal_year")
+        if fy is None:
+            continue
+        all_years.add(fy)
+        ft = row.get("file_type", "unknown")
+        if ft == "xml" and row.get("is_parsed"):
+            xml_years.add(fy)
+        elif ft == "pdf":
+            pdf_years.add(fy)
+
+    # PDF-only years = years with PDFs but no parsed XML
+    pdf_only_years = sorted(pdf_years - xml_years)
+    xml_years_sorted = sorted(xml_years)
+
+    earliest_xml = min(xml_years_sorted) if xml_years_sorted else None
+    earliest_doc = min(all_years) if all_years else None
+
+    note_pl, note_en = _build_coverage_notes(xml_years_sorted, pdf_only_years)
+
+    return {
+        "xml_years": xml_years_sorted,
+        "pdf_only_years": pdf_only_years,
+        "earliest_xml_year": earliest_xml,
+        "earliest_document_year": earliest_doc,
+        "analysis_note_pl": note_pl,
+        "analysis_note_en": note_en,
+    }
+
+
+def _build_coverage_notes(
+    xml_years: list[int], pdf_only_years: list[int],
+) -> tuple[str | None, str | None]:
+    """Generate human-readable coverage notes in PL and EN."""
+    if not pdf_only_years:
+        return None, None
+
+    xml_range = f"{min(xml_years)}-{max(xml_years)}" if xml_years else "brak"
+    pdf_range = f"{min(pdf_only_years)}-{max(pdf_only_years)}"
+
+    note_pl = (
+        f"Analiza obejmuje lata {xml_range} (dane XML). "
+        f"Sprawozdania za lata {pdf_range} dostepne sa wylacznie w formacie PDF "
+        f"i nie zostaly jeszcze uwzglednione w analizie."
+    )
+    note_en = (
+        f"Analysis covers {xml_range} (XML data). "
+        f"Reports for {pdf_range} are available as PDF only "
+        f"and are not yet included in the analysis."
+    )
+    return note_pl, note_en
 
 
 def get_history(krs: str, model_id: str | None = None) -> dict:

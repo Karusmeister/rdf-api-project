@@ -63,10 +63,17 @@ def _finish_etl_attempt(
     )
 
 
+_XML_EXTENSIONS = (".xml", ".xades")
+
+
 def _find_xml_in_dir(storage: LocalStorage, doc_dir: str) -> Optional[str]:
-    """Find the financial statement XML file in an extracted document directory."""
+    """Find the financial statement XML file in an extracted document directory.
+
+    Recognises both plain ``.xml`` files and XAdES-signed envelopes
+    (``.xml.xades``, ``.xml.XAdES``) which the XML parser can unwrap.
+    """
     files = storage.list_files(doc_dir)
-    xml_files = [f for f in files if f.lower().endswith(".xml")]
+    xml_files = [f for f in files if f.lower().endswith(_XML_EXTENSIONS)]
     if not xml_files:
         return None
 
@@ -75,13 +82,17 @@ def _find_xml_in_dir(storage: LocalStorage, doc_dir: str) -> Optional[str]:
         try:
             content = storage.read(f"{doc_dir}/{name}").decode("utf-8")
             root = xml_parser.ET.fromstring(content)
+            # Unwrap XAdES if needed so we inspect the financial root
+            raw_tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+            if raw_tag in ("Signatures", "Signature"):
+                root = xml_parser._unwrap_xades(root)
             for el in root.iter():
                 tag = el.tag.split("}", 1)[1] if "}" in el.tag else el.tag
                 if xml_parser._is_statement_marker(tag):
                     return f"{doc_dir}/{name}"
         except xml_parser.ET.ParseError:
             continue
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, ValueError):
             continue
 
     # Fallback: return first XML file

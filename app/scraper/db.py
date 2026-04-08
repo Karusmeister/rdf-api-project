@@ -144,11 +144,19 @@ def _init_schema() -> None:
         )
     """)
 
+    # Ensure file_type column exists (migration 006 adds it; bootstrap must
+    # be aligned so restarts don't regress the view definition).
+    conn.execute("""
+        ALTER TABLE krs_document_versions
+            ADD COLUMN IF NOT EXISTS file_type VARCHAR(10) DEFAULT 'unknown'
+    """)
+
     # DB-002: Simplified view — is_current is already maintained by the
     # application (exactly one row per document_id).  Removing the
     # ROW_NUMBER() window function lets PostgreSQL push WHERE krs = ...
     # filters into the base table, using an index scan instead of a
     # full-table sequential scan of all 1.9M rows.
+    # NOTE: Must include file_type — aligned with migration 006.
     conn.execute("""
         CREATE OR REPLACE VIEW krs_documents_current AS
         SELECT
@@ -156,7 +164,7 @@ def _init_schema() -> None:
             filename, is_ifrs, is_correction, date_filed, date_prepared,
             is_downloaded, downloaded_at, storage_path, storage_backend,
             file_size_bytes, zip_size_bytes, file_count, file_types,
-            discovered_at, metadata_fetched_at, download_error
+            discovered_at, metadata_fetched_at, download_error, file_type
         FROM krs_document_versions
         WHERE is_current = true
     """)
@@ -484,6 +492,16 @@ def mark_downloaded(
 
     krs = _resolve_krs(conn, document_id)
 
+    # Derive file_type from the comma-separated file_types list
+    if "xml" in file_types.split(","):
+        file_type = "xml"
+    elif "pdf" in file_types.split(","):
+        file_type = "pdf"
+    elif file_types:
+        file_type = "other"
+    else:
+        file_type = "unknown"
+
     _append_document_version_if_changed(
         conn, document_id, krs,
         patch={
@@ -495,6 +513,7 @@ def mark_downloaded(
             "zip_size_bytes": zip_size,
             "file_count": file_count,
             "file_types": file_types,
+            "file_type": file_type,
             "download_error": None,
         },
         change_reason="downloaded",

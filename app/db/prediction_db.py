@@ -610,6 +610,11 @@ def upsert_company(krs: str, nip: Optional[str] = None, regon: Optional[str] = N
                    voivodeship: Optional[str] = None) -> None:
     conn = get_conn()
     now = datetime.now(timezone.utc)
+    # Sanitise: some bank XML schemas map long descriptions into NIP/REGON fields
+    if nip and len(nip) > 20:
+        nip = None
+    if regon and len(regon) > 20:
+        regon = None
     conn.execute("""
         INSERT INTO companies (krs, nip, regon, pkd_code, incorporation_date, voivodeship, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -1894,16 +1899,20 @@ def update_assessment_job(job_id: str, status: str, stage: Optional[str] = None,
                            result: Optional[dict] = None) -> None:
     conn = get_conn()
     now = datetime.now(timezone.utc)
-    conn.execute("""
-        UPDATE assessment_jobs SET
-            status        = %s,
-            stage         = %s,
-            error_message = %s,
-            result_json   = %s,
-            updated_at    = %s
-        WHERE id = %s
-    """, [status, stage, error_message,
-          json.dumps(result) if result else None, now, job_id])
+    if result is not None:
+        conn.execute("""
+            UPDATE assessment_jobs SET
+                status = %s, stage = %s, error_message = %s,
+                result_json = %s, updated_at = %s
+            WHERE id = %s
+        """, [status, stage, error_message, json.dumps(result), now, job_id])
+    else:
+        conn.execute("""
+            UPDATE assessment_jobs SET
+                status = %s, stage = %s, error_message = %s,
+                updated_at = %s
+            WHERE id = %s
+        """, [status, stage, error_message, now, job_id])
 
 
 def get_assessment_job(job_id: str) -> Optional[dict]:
@@ -1939,6 +1948,89 @@ def get_running_assessment_for_krs(krs: str) -> Optional[dict]:
     return result
 
 
+def atomic_start_pipeline(krs: str, max_concurrent: int) -> dict:
+    """Atomically dedup + check concurrency + create assessment job.
+
+    Creates a **standalone** psycopg2 connection that is closed after use.
+    This guarantees the shared global connection is never mutated, even
+    when the ThreadedConnectionPool is not initialized (tests, CLI).
+    A PostgreSQL advisory lock serialises concurrent callers within the
+    transaction.
+
+    Returns one of:
+      {"outcome": "existing", "job_id": "..."}  — already running for this KRS
+      {"outcome": "rejected"}                   — max concurrent exceeded
+      {"outcome": "created",  "job_id": "..."}  — new job created
+    """
+    import uuid
+
+    import psycopg2
+
+    from app.config import settings
+
+    raw = psycopg2.connect(settings.database_url)
+    try:
+        raw.autocommit = False
+        with raw.cursor() as cur:
+            # Advisory lock prevents concurrent triggers from both passing
+            # the count check before either inserts.
+            cur.execute("SELECT pg_advisory_xact_lock(42)")
+
+            # 1) Check if already running for this KRS
+            cur.execute("""
+                SELECT id FROM assessment_jobs
+                WHERE krs = %s AND status IN ('pending', 'running')
+                ORDER BY created_at DESC LIMIT 1
+            """, [krs])
+            existing = cur.fetchone()
+            if existing:
+                raw.commit()
+                return {"outcome": "existing", "job_id": existing[0]}
+
+            # 2) Count running pipelines globally
+            cur.execute(
+                "SELECT COUNT(*) FROM assessment_jobs WHERE status IN ('pending', 'running')"
+            )
+            count = cur.fetchone()[0]
+            if count >= max_concurrent:
+                raw.commit()
+                return {"outcome": "rejected"}
+
+            # 3) Create new job
+            job_id = str(uuid.uuid4())
+            now = datetime.now(timezone.utc)
+            cur.execute("""
+                INSERT INTO assessment_jobs (id, krs, status, stage, created_at, updated_at)
+                VALUES (%s, %s, 'pending', NULL, %s, %s)
+            """, [job_id, krs, now, now])
+
+            raw.commit()
+            return {"outcome": "created", "job_id": job_id}
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        raw.close()
+
+
+def get_latest_assessment_for_krs(krs: str) -> Optional[dict]:
+    """Return the most recent assessment job for a KRS (any status)."""
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT id, krs, status, stage, error_message, result_json, created_at, updated_at
+        FROM assessment_jobs
+        WHERE krs = %s
+        ORDER BY created_at DESC LIMIT 1
+    """, [krs]).fetchone()
+    if row is None:
+        return None
+    cols = ["id", "krs", "status", "stage", "error_message", "result_json", "created_at", "updated_at"]
+    result = dict(zip(cols, row))
+    result["created_at"] = str(result["created_at"])
+    result["updated_at"] = str(result["updated_at"])
+    return result
+
+
 def update_assessment_progress(job_id: str, progress: dict) -> None:
     """Update only the progress portion of result_json without overwriting other keys."""
     conn = get_conn()
@@ -1947,7 +2039,8 @@ def update_assessment_progress(job_id: str, progress: dict) -> None:
     row = conn.execute(
         "SELECT result_json FROM assessment_jobs WHERE id = %s", [job_id]
     ).fetchone()
-    existing = json.loads(row[0]) if row and row[0] else {}
+    raw = row[0] if row else None
+    existing = json.loads(raw) if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
     existing["progress"] = progress
     conn.execute("""
         UPDATE assessment_jobs SET result_json = %s, updated_at = %s WHERE id = %s
@@ -1962,6 +2055,47 @@ def get_ingested_report_ids_for_krs(krs: str) -> set[str]:
         WHERE krs = %s AND ingestion_status = 'completed'
     """, [krs]).fetchall()
     return {row[0] for row in rows if row[0]}
+
+
+# --- document coverage (PKR-130) ---
+
+
+def get_document_coverage(krs: str) -> list[dict]:
+    """Return per-year, per-file_type document coverage for a KRS.
+
+    Uses krs_documents_current (which includes file_type after bootstrap/migration 006).
+    Only catches UndefinedColumn errors (file_type missing on older schema);
+    unexpected DB errors are re-raised so they surface in logs.
+    """
+    import psycopg2.errors
+
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT
+                COALESCE(
+                    EXTRACT(YEAR FROM kd.okres_end::date),
+                    EXTRACT(YEAR FROM kd.discovered_at)
+                )::int AS fiscal_year,
+                kd.file_type,
+                COUNT(*) AS doc_count,
+                bool_or(fr.id IS NOT NULL AND fr.ingestion_status = 'completed') AS is_parsed
+            FROM krs_documents_current kd
+            LEFT JOIN financial_reports fr ON fr.source_document_id = kd.document_id
+            WHERE kd.krs = %s
+            GROUP BY 1, kd.file_type
+            ORDER BY 1
+        """, [krs]).fetchall()
+    except psycopg2.errors.UndefinedColumn:
+        # file_type column not in view yet — schema drift, not a real failure
+        logger.warning(
+            "data_coverage_missing_column",
+            extra={"event": "data_coverage_missing_column", "krs": krs},
+        )
+        return []
+
+    cols = ["fiscal_year", "file_type", "doc_count", "is_parsed"]
+    return [dict(zip(cols, row)) for row in rows]
 
 
 # --- users ---

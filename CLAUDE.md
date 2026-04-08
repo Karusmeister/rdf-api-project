@@ -106,12 +106,15 @@ app/
       routes.py        - /api/auth/* (signup, login, verify, Google SSO, admin grant)
       schemas.py       - Auth request/response Pydantic models
     predictions/
-      routes.py        - /api/predictions/* (per-KRS scores, history, models, cache)
-      schemas.py       - Prediction response Pydantic models
+      routes.py        - /api/predictions/* (per-KRS scores, history, models, cache, pipeline trigger/status)
+      schemas.py       - Prediction response Pydantic models (incl. DataCoverageInfo, PipelineStatus)
+    companies/
+      routes.py        - /api/companies/* (search, popular, health-metrics, click logging)
+      schemas.py       - Company search + health metrics Pydantic models
   auth.py              - JWT create/decode, get_current_user dependency, require_admin, require_krs_access
   rate_limit.py        - Shared slowapi Limiter instance
   services/
-    xml_parser.py      - e-Sprawozdanie XML parser (~1300 TAG_LABELS for Bilans, RZiS, CF)
+    xml_parser.py      - e-Sprawozdanie XML parser (~1300 TAG_LABELS for Bilans, RZiS, CF) + XAdES unwrapping
     etl.py             - XML-to-PostgreSQL ingestion pipeline
     feature_engine.py  - Computes financial ratios from line items (incl. x1_maczynska custom)
     maczynska.py       - Maczynska 1994 discriminant model (baseline bankruptcy predictor)
@@ -161,10 +164,12 @@ tests/
   e2e/                 - End-to-end tests against live APIs (--e2e flag required)
   regression/          - Live API regression tests (--e2e flag required)
 deploy/
-  krs-scanner.service    - systemd unit for KRS batch scanner
-  rdf-worker.service     - systemd unit for RDF document download worker
+  krs-scanner.service      - systemd unit for KRS batch scanner
+  rdf-worker.service       - systemd unit for RDF document download worker
   metadata-backfill.service - systemd unit for metadata backfill worker
-  rdf-backup.cron        - Cron job for RDF backup
+  rdf-backup.cron          - Cron job for RDF backup
+  journald-size-limit.conf - journald cap (500M) deployed to /etc/systemd/journald.conf.d/
+  logrotate-rdf.conf       - Log rotation for /var/log/rdf-*.log
 data/
   documents/           - Extracted RDF files + manifest.json
 ```
@@ -174,7 +179,7 @@ data/
 ### Scraper tables (app/scraper/db.py)
 - `krs_registry` - KRS master list, scraper priority/scheduling
 - `krs_documents` - Documents per KRS (legacy cache; reads via `krs_documents_current` view)
-- `krs_document_versions` - Append-only document history. PK = version_id. UNIQUE(document_id, version_no).
+- `krs_document_versions` - Append-only document history. PK = version_id. UNIQUE(document_id, version_no). Includes `file_type` (xml/pdf/other/unknown).
 - `scraper_runs` - Scraper run history
 
 ### KRS entity tables (app/repositories/krs_repo.py)
@@ -186,8 +191,11 @@ data/
 
 ### Views
 - `krs_entities_current` - Current entity snapshot from `krs_entity_versions` (read path for all entity queries).
-- `krs_documents_current` - Current document snapshot from `krs_document_versions` (read path for all document queries).
+- `krs_documents_current` - Current document snapshot from `krs_document_versions` (read path for all document queries). Includes `file_type`.
 - `latest_successful_financial_reports` - Latest completed report per logical key (used by feature engine).
+
+### Search tables (migration 005)
+- `search_log` - Tracks company search queries and clicked results. PK = id BIGSERIAL. Indexes on clicked_krs and created_at.
 
 ### Batch scanner table (batch/progress.py)
 - `batch_progress` - Tracks which KRS integers have been probed by the batch scanner. PK = krs BIGINT. Status: found/not_found/error.
@@ -238,7 +246,7 @@ Managed by `app/db/connection.py` with two tiers:
 - All connections use `autocommit=True` for per-statement commit behavior
 - `app/scraper/db.py` and `app/db/prediction_db.py` delegate to `get_conn()` which routes to the right connection
 - `app/main.py` lifespan calls `db_conn.connect()` + `db_conn.init_pool()` + both schema inits at startup
-- Batch workers use `make_connection(dsn)` for standalone connections (no retry/lock logic needed)
+- Batch workers use persistent connections via `_get_conn()` with auto-reconnect on `OperationalError` (retry up to 3× with exponential backoff). Each store instance (`RdfProgressStore`, `RdfDocumentStore`, `EntityStore`, `ProgressStore`) holds one long-lived connection, avoiding per-call connection churn through Cloud NAT.
 - `get_db()` context manager is available for explicit pool usage outside middleware
 - Plain SQL with `%s` parameterized queries, no ORM
 - Configuration via `DATABASE_URL` env var (default: `postgresql://rdf:rdf_dev@localhost:5432/rdf`)
@@ -247,6 +255,7 @@ Managed by `app/db/connection.py` with two tiers:
 `app/services/xml_parser.py` has ~1300 TAG_LABELS mapping XML tags to Polish labels.
 It parses e-Sprawozdania into hierarchical trees with kwota_a (current) and kwota_b (previous).
 The ETL flattens these trees into financial_line_items using tag paths such as `Aktywa`, `Pasywa_A`, `RZiS.A`, and `CF.D`.
+XAdES support: `_unwrap_xades()` handles both inline XML and base64-encoded XAdES envelopes. `extract_xml_from_zip()` also recognizes `.xades` files. In `storage.py`, `_classify_file()` treats `.xades` as `xml`.
 
 ### Feature computation
 Features are defined as metadata rows in feature_definitions, not hardcoded columns.
@@ -381,9 +390,19 @@ bash scripts/pull_cloud_data.sh
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
 | GET | /api/predictions/models | - | List active models with interpretation thresholds |
-| GET | /api/predictions/{krs} | Bearer JWT + KRS access | Full prediction detail: scores, features, source tags, history |
+| GET | /api/predictions/{krs} | Bearer JWT + KRS access | Full prediction detail: scores, features, source tags, history, data_coverage |
 | GET | /api/predictions/{krs}/history | Bearer JWT + KRS access | Score timeline per model for charting |
+| POST | /api/predictions/{krs}/generate | Bearer JWT + KRS access | Trigger on-demand pipeline (max 5 concurrent) |
+| GET | /api/predictions/{krs}/status | Bearer JWT + KRS access | Poll pipeline stage for a KRS |
 | POST | /api/predictions/cache/invalidate | Bearer JWT (admin) | Flush model + feature definition caches |
+
+### Companies
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| GET | /api/companies/search | - | Search by name (trigram) or KRS prefix. TTL-cached. `?q=...&limit=10` |
+| GET | /api/companies/search/popular | - | Top 10 most-clicked KRS in last 30 days |
+| POST | /api/companies/search/log-click | - | Record a clicked search result (`?q=...&krs=...`) |
+| GET | /api/companies/{krs}/health-metrics | - | 5 financial health indicators across all fiscal years |
 
 ## Gotchas
 
@@ -419,6 +438,18 @@ bash scripts/pull_cloud_data.sh
     - Preflight TCP-check runs at startup, removing unreachable proxies. Dead proxies stored in `dead_proxies` table (6h TTL).
     - Strict production: `BATCH_USE_VPN=true BATCH_USE_PUBLIC_PROXIES=true BATCH_REQUIRE_VPN_ONLY=true`
     - Permissive local: `BATCH_USE_VPN=false` (all workers use direct, no proxy pool loaded)
+26. Company search uses GIN trigram index on `krs_registry.company_name` (requires `pg_trgm` extension). Migration 005 creates it.
+27. Search results are TTL-cached (10 min, max 1000 entries) via `cachetools.TTLCache` in the companies router.
+28. `POST /api/predictions/{krs}/generate` delegates to the existing assessment pipeline (`assessment_service`). Max 5 concurrent pipelines enforced globally.
+29. `data_coverage` on the prediction response requires migration 006 (`file_type` column on `krs_document_versions`). Degrades gracefully if migration not yet applied.
+30. Health metrics endpoint (`/api/companies/{krs}/health-metrics`) computes revenue_growth from year-over-year `RZiS.A` change — first year always has `null` growth.
+31. **XAdES envelopes**: `.xades` files are treated as XML throughout the pipeline. `_unwrap_xades()` in `xml_parser.py` handles both inline XML and base64-encoded content. `_find_xml_in_dir()` in `etl.py` recognizes `.xades` extensions and unwraps XAdES during statement marker check.
+32. **RZiS net profit**: Health metrics SQL uses `COALESCE(RZiS.N, RZiS.L)` for net profit to handle both porównawczy (variant N) and kalkulacyjny (variant L) RZiS layouts.
+33. **Pipeline progress**: `update_assessment_job` does not overwrite `result_json` on stage transitions — only explicit result updates write to that column. `update_assessment_progress` handles psycopg2 returning JSON as dict (not just string).
+34. **file_type derivation**: `mark_downloaded` in `scraper/db.py` derives and sets the `file_type` column from the `file_types` set, so file_type is populated at download time rather than requiring a separate backfill.
+35. **NIP/REGON sanitization**: `upsert_company` truncates NIP and REGON values longer than 20 characters — workaround for malformed bank XML where identifiers contain extra data.
+36. **Pipeline diagnosis**: `check_data_readiness()` in `assessment.py` returns a `diagnosis` field explaining why scoring failed (e.g. `ifrs_xhtml`, `micro_entity`, `no_financial_data`). The status endpoint exposes this to the frontend.
+37. **data_coverage SQL**: `get_document_coverage` uses `GROUP BY 1` instead of `GROUP BY fiscal_year` to avoid column ambiguity when the aliased column name clashes with a table column.
 
 ## Keeping docs current
 

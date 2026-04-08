@@ -480,6 +480,33 @@ async def _worker_loop(
     """Main async loop for a single RDF document discovery + download worker."""
     progress = RdfProgressStore(dsn)
     doc_store = RdfDocumentStore(dsn)
+    try:
+        await _rdf_worker_loop_inner(
+            worker_id, total_workers, connection, concurrency, delay,
+            download_delay, page_size, dsn, progress, doc_store,
+            skip_metadata, proxy_pool, legal_forms,
+        )
+    finally:
+        progress.close()
+        doc_store.close()
+
+
+async def _rdf_worker_loop_inner(
+    worker_id: int,
+    total_workers: int,
+    connection: Connection,
+    concurrency: int,
+    delay: float,
+    download_delay: float,
+    page_size: int,
+    dsn: str,
+    progress: "RdfProgressStore",
+    doc_store: "RdfDocumentStore",
+    skip_metadata: bool = False,
+    proxy_pool: list[Connection] | None = None,
+    legal_forms: list[str] | None = None,
+) -> None:
+    """Inner loop, separated so caller can wrap with try/finally for cleanup."""
     storage = create_storage()
     stats = RdfWorkerStats()
     health = ConnectionHealth()

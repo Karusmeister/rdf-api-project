@@ -37,8 +37,17 @@ def make_doc_dir(krs: str, document_id: str) -> str:
 
 
 def _classify_file(filename: str) -> str:
-    """Return file type from extension."""
+    """Return file type from extension.
+
+    XAdES-signed XML files (.xml.xades, .xml.XAdES) are classified as 'xml'
+    since they contain the actual financial statement inside a signature envelope.
+    """
+    lower = filename.lower()
+    if lower.endswith((".xml.xades", ".xml.xades.xml")):
+        return "xml"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "unknown"
+    if ext == "xades":
+        return "xml"
     return ext
 
 

@@ -115,7 +115,8 @@ class TestGetPredictions:
     @patch("app.db.prediction_db.get_features_for_predictions_batch", return_value={})
     @patch("app.db.prediction_db.get_source_line_items_for_reports_batch", return_value={})
     @patch("app.db.prediction_db.get_prediction_history_fat", return_value=[])
-    def test_returns_predictions(self, mock_hist, mock_sources, mock_feat, mock_company, mock_preds, mock_user, mock_access):
+    @patch("app.db.prediction_db.get_document_coverage", return_value=[])
+    def test_returns_predictions(self, mock_cov, mock_hist, mock_sources, mock_feat, mock_company, mock_preds, mock_user, mock_access):
         resp = client.get("/api/predictions/0000694720", headers=_auth_header())
         assert resp.status_code == 200
         data = resp.json()
@@ -145,8 +146,10 @@ class TestGetPredictions:
     @patch("app.db.prediction_db.get_features_for_predictions_batch", return_value={})
     @patch("app.db.prediction_db.get_source_line_items_for_reports_batch", return_value={})
     @patch("app.db.prediction_db.get_prediction_history_fat", return_value=[])
+    @patch("app.db.prediction_db.get_document_coverage", return_value=[])
     def test_returns_multi_year_predictions_per_model(
         self,
+        mock_cov,
         mock_hist,
         mock_sources,
         mock_feat,
@@ -177,7 +180,8 @@ class TestGetPredictions:
     @patch("app.db.prediction_db.get_prediction_history_fat", return_value=[])
     @patch("app.db.prediction_db.get_predictions_fat", return_value=[])
     @patch("app.db.prediction_db.get_company", return_value=None)
-    def test_404_unknown_krs(self, mock_company, mock_preds, mock_hist, mock_user, mock_access):
+    @patch("app.db.prediction_db.get_document_coverage", return_value=[])
+    def test_404_unknown_krs(self, mock_cov, mock_company, mock_preds, mock_hist, mock_user, mock_access):
         resp = client.get("/api/predictions/9999999999", headers=_auth_header())
         assert resp.status_code == 404
 
@@ -186,7 +190,8 @@ class TestGetPredictions:
     @patch("app.db.prediction_db.get_prediction_history_fat", return_value=[])
     @patch("app.db.prediction_db.get_predictions_fat", return_value=[])
     @patch("app.db.prediction_db.get_company", return_value=_FAKE_COMPANY)
-    def test_200_company_exists_no_predictions(self, mock_company, mock_preds, mock_hist, mock_user, mock_access):
+    @patch("app.db.prediction_db.get_document_coverage", return_value=[])
+    def test_200_company_exists_no_predictions(self, mock_cov, mock_company, mock_preds, mock_hist, mock_user, mock_access):
         """Company exists with metadata but no predictions/history -> 200, not 404."""
         resp = client.get("/api/predictions/0000694720", headers=_auth_header())
         assert resp.status_code == 200
@@ -330,6 +335,7 @@ class TestPoznanskiWarningsPropagation:
     @patch("app.db.prediction_db.get_features_for_predictions_batch", return_value={})
     @patch("app.db.prediction_db.get_source_line_items_for_reports_batch", return_value={})
     @patch("app.db.prediction_db.get_prediction_history_fat", return_value=[])
+    @patch("app.db.prediction_db.get_document_coverage", return_value=[])
     def test_warning_surfaces_in_result(self, *_):
         resp = client.get("/api/predictions/0000694720", headers=_auth_header())
         assert resp.status_code == 200
@@ -357,6 +363,7 @@ class TestPoznanskiWarningsPropagation:
     @patch("app.db.prediction_db.get_features_for_predictions_batch", return_value={})
     @patch("app.db.prediction_db.get_source_line_items_for_reports_batch", return_value={})
     @patch("app.db.prediction_db.get_prediction_history_fat", return_value=[])
+    @patch("app.db.prediction_db.get_document_coverage", return_value=[])
     def test_warnings_empty_when_none_raised(self, *_):
         resp = client.get("/api/predictions/0000694720", headers=_auth_header())
         assert resp.status_code == 200
