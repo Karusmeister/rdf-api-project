@@ -5,6 +5,13 @@
 --
 -- Idempotent: only touches columns still typed as json. Safe to re-run
 -- even though schema_migrations already guards single-apply.
+--
+-- Drop the one dependent view that blocks ALTER COLUMN TYPE
+-- (raw_financial_data.data_json → latest_raw_financial_data). The app's
+-- _init_schema() in prediction_db.py recreates it via CREATE OR REPLACE
+-- VIEW immediately after migrations run, so there is no observable gap.
+DROP VIEW IF EXISTS latest_raw_financial_data;
+
 DO $$
 DECLARE
     targets text[][] := ARRAY[
