@@ -41,7 +41,7 @@
       "step": 5,
       "title": "Deploy to Cloud Run",
       "commands": [
-        "gcloud run deploy rdf-api --source . --region europe-central2 --allow-unauthenticated --port 8000 --memory 1Gi --cpu 1 --min-instances 0 --max-instances 3 --add-cloudsql-instances <CONNECTION_NAME_FROM_STEP_3> --set-env-vars DATABASE_URL=postgresql://postgres:<PASSWORD_FROM_STEP_2>@/rdf?host=/cloudsql/<CONNECTION_NAME_FROM_STEP_3> --set-env-vars JWT_SECRET=<SECRET_FROM_STEP_4> --set-env-vars WORKERS=2 --set-env-vars LOG_LEVEL=INFO --set-env-vars CORS_ORIGINS=[\"https://<YOUR_LOVABLE_APP>.lovable.app\"]"
+        "gcloud run deploy rdf-api --source . --region europe-central2 --allow-unauthenticated --port 8000 --memory 1Gi --cpu 1 --min-instances 0 --max-instances 3 --add-cloudsql-instances <CONNECTION_NAME_FROM_STEP_3> --set-env-vars DATABASE_URL=postgresql://postgres:<PASSWORD_FROM_STEP_2>@/rdf?host=/cloudsql/<CONNECTION_NAME_FROM_STEP_3> --set-env-vars JWT_SECRET=<SECRET_FROM_STEP_4> --set-env-vars WORKERS=2 --set-env-vars LOG_LEVEL=INFO --set-env-vars CORS_ORIGINS=[\"https://rentgen.kraus.uk\"]"
       ],
       "notes": "Cloud Run builds the container from your Dockerfile via Cloud Build. First deploy takes 2-3 minutes. The --allow-unauthenticated flag makes the API publicly accessible."
     },
@@ -51,7 +51,7 @@
       "commands": [
         "gcloud run services describe rdf-api --region europe-central2 --format='value(status.url)'"
       ],
-      "notes": "Returns something like https://rdf-api-xxxxx-ew.a.run.app. This is your API base URL for the Lovable app."
+      "notes": "Returns something like https://rdf-api-xxxxx-ew.a.run.app. This is your API base URL for the frontend."
     },
     {
       "step": 7,
@@ -71,9 +71,9 @@
     },
     {
       "step": 9,
-      "title": "Configure your Lovable app",
+      "title": "Configure your frontend",
       "instructions": [
-        "In your Lovable app, set the API base URL to the Cloud Run service URL from step 6.",
+        "In your frontend, set the API base URL to the Cloud Run service URL from step 6.",
         "All API calls should use this base, e.g.: POST https://rdf-api-xxxxx-ew.a.run.app/api/podmiot/lookup",
         "If using auth endpoints, store the JWT token from /api/auth/login and send it as Authorization: Bearer <token>."
       ]
@@ -82,9 +82,9 @@
       "step": 10,
       "title": "Tighten CORS for production",
       "commands": [
-        "gcloud run services update rdf-api --region europe-central2 --set-env-vars CORS_ORIGINS=[\"https://<YOUR_LOVABLE_APP>.lovable.app\"]"
+        "gcloud run services update rdf-api --region europe-central2 --set-env-vars CORS_ORIGINS=[\"https://rentgen.kraus.uk\"]"
       ],
-      "notes": "Replace with your actual Lovable domain. You can add multiple origins as a JSON array."
+      "notes": "Replace with your actual frontend domain. You can add multiple origins as a JSON array."
     }
   ],
   "cost_estimate": {

@@ -341,7 +341,7 @@ async def signup(request: Request, body: SignupRequest):
     return {"message": "Verification code sent", "user_id": user_id}
 
 
-# /register is an alias for /signup — the Lovable frontend uses this path
+# /register is an alias for /signup — the frontend uses this path
 @router.post("/register", response_model=SignupResponse, summary="Register new account (alias)")
 @limiter.limit("5/minute")
 async def register(request: Request, body: SignupRequest):

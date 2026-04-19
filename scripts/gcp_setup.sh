@@ -34,9 +34,7 @@ echo "Zone:     $ZONE"
 echo "Region:   $REGION"
 echo ""
 
-# Verify correct account
-# Account migrated from piotr.kraus01@gmail.com to contact@kraus.uk on 2026-04-10
-# (project moved into kraus.uk org). See rdf-infra/ACCOUNT_MIGRATION_PLAN.md.
+# Verify correct account — contact@kraus.uk is the sole project owner.
 ACCOUNT=$(gcloud config get-value account 2>/dev/null)
 if [[ "$ACCOUNT" != *"contact@kraus.uk"* ]]; then
   echo "ERROR: Active account is '$ACCOUNT', expected contact@kraus.uk"

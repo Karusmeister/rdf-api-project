@@ -20,7 +20,7 @@ The RDF API project is a data pipeline + API system that:
 ```mermaid
 graph TB
     subgraph Internet["Internet"]
-        Client["Client / Frontend<br/>(Lovable app)"]
+        Client["Client / Frontend<br/>(rentgen.kraus.uk)"]
     end
 
     subgraph GCP["GCP — europe-central2 (Warsaw)"]

@@ -46,7 +46,7 @@ Production deployment of the RDF API on Google Cloud Platform.
 |----------|-------|
 | GCP project | `rdf-api-project` |
 | GCP organization | `kraus.uk` (`184017532341`) |
-| GCP account | `contact@kraus.uk` (post-migration; piotr.kraus01@gmail.com retained until Phase 9 — see [rdf-infra/docs/12-gcp-org-migration.md](../../rdf-infra/docs/12-gcp-org-migration.md)) |
+| GCP account | `contact@kraus.uk` (sole owner; `piotr.kraus01@gmail.com` is read-only Viewer) |
 | Billing account | `0139F7-FC5D8B-3BBAC1` (`kraus.uk`) |
 | Region | `europe-central2` (Warsaw) |
 | **Cloud Run** | |
@@ -153,7 +153,7 @@ gcloud run services update rdf-api --region europe-central2 \
 
 # For values with special characters (JSON arrays), use an env vars file:
 cat > /tmp/env-vars.yaml << 'EOF'
-CORS_ORIGINS: '["https://my-app.lovable.app"]'
+CORS_ORIGINS: '["https://rentgen.kraus.uk"]'
 EOF
 gcloud run services update rdf-api --region europe-central2 \
   --env-vars-file /tmp/env-vars.yaml
@@ -363,7 +363,7 @@ To reduce cold starts, set `--min-instances 1` (~$20-30/mo additional). To handl
 1. **CORS**: Replace `["*"]` with your actual frontend domain:
    ```bash
    gcloud run services update rdf-api --region europe-central2 \
-     --set-env-vars 'CORS_ORIGINS=["https://your-app.lovable.app"]'
+     --set-env-vars 'CORS_ORIGINS=["https://rentgen.kraus.uk"]'
    ```
 
 2. **Authentication**: The API is publicly accessible (`--allow-unauthenticated`). Auth-protected endpoints use JWT tokens. Consider adding Cloud IAP or API Gateway for additional protection.

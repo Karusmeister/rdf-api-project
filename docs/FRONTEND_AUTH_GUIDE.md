@@ -1,6 +1,6 @@
 # Frontend Authentication Guide
 
-Backend API reference for the Lovable (React) frontend. All endpoints are under `/api/auth`.
+Backend API reference for the React frontend. All endpoints are under `/api/auth`.
 
 **Base URL (production):** `https://rdf-api-<hash>-europe-central2.a.run.app`
 **Base URL (local):** `http://localhost:8000`
