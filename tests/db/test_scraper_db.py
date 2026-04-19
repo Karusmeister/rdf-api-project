@@ -30,7 +30,7 @@ def test_schema_creation():
         ).fetchall()
     }
     assert "krs_registry" in tables
-    assert "krs_documents" in tables
+    assert "krs_document_versions" in tables
     assert "scraper_runs" in tables
 
 

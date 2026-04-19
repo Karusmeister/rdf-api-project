@@ -33,7 +33,6 @@ def connect() -> None:
     """Ensure shared connection is open and KRS entity schema exists."""
     shared_conn.connect()
     _ensure_schema()
-    _check_backfill_needed()
     _close_orphaned_runs()
     logger.info("krs_repo_ready", extra={"event": "krs_repo_ready"})
 
@@ -204,46 +203,6 @@ def _close_orphaned_runs() -> None:
         logger.warning("krs_sync_orphaned_runs_closed", extra={
             "event": "krs_sync_orphaned_runs_closed", "run_ids": ids,
         })
-
-
-_ALLOWED_ALTER_COLUMNS = {
-    "address_street": "VARCHAR",
-    "address_postal_code": "VARCHAR",
-}
-
-
-def _ensure_krs_entities_columns(conn) -> None:
-    existing_columns = {
-        row[0] for row in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'krs_entities' AND table_schema = 'public' ORDER BY ordinal_position").fetchall()
-    }
-    for name, definition in _ALLOWED_ALTER_COLUMNS.items():
-        if name not in existing_columns:
-            if name not in _ALLOWED_ALTER_COLUMNS or _ALLOWED_ALTER_COLUMNS[name] != definition:
-                raise ValueError(f"Refusing to add unapproved column: {name} {definition}")
-            conn.execute(f"ALTER TABLE krs_entities ADD COLUMN {name} {definition}")
-
-
-def _check_backfill_needed() -> None:
-    """Fail fast when legacy cache has rows but version table is empty."""
-    conn = get_conn()
-    legacy = conn.execute("SELECT count(*) FROM krs_entities").fetchone()[0]
-    versions = conn.execute("SELECT count(*) FROM krs_entity_versions").fetchone()[0]
-    if legacy > 0 and versions == 0:
-        msg = (
-            "Cutover blocked: krs_entity_versions is empty while legacy "
-            f"krs_entities has {legacy} rows. "
-            "Run the append-only backfill migration against PostgreSQL before startup."
-        )
-        logger.error(
-            "krs_entity_backfill_required",
-            extra={
-                "event": "backfill_required",
-                "legacy_count": legacy,
-                "versions_count": versions,
-                "hint": msg,
-            },
-        )
-        raise RuntimeError(msg)
 
 
 # ---------------------------------------------------------------------------

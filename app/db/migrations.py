@@ -216,7 +216,7 @@ def _validate_history(
         )
 
 
-def apply_pending(conn: ConnectionWrapper, namespaces: Iterable[str] = ("prediction",)) -> list[str]:
+def apply_pending(conn: ConnectionWrapper, namespaces: Iterable[str] = ("prediction", "dedupe")) -> list[str]:
     """Apply every migration in `namespaces` that is not yet recorded.
 
     Runs each migration file inside an explicit transaction (autocommit is

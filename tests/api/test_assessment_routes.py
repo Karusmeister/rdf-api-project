@@ -39,6 +39,9 @@ _READY_SUMMARY = {
     "reports_ingested": 3,
     "features_computed": True,
     "predictions_available": True,
+    "models_total": 1,
+    "models_scored": 1,
+    "scoring_gaps": 0,
     "latest_fiscal_year": 2024,
 }
 
@@ -49,6 +52,9 @@ _NOT_READY_SUMMARY = {
     "reports_ingested": 0,
     "features_computed": False,
     "predictions_available": False,
+    "models_total": 0,
+    "models_scored": 0,
+    "scoring_gaps": 0,
     "latest_fiscal_year": None,
 }
 
@@ -179,6 +185,12 @@ class TestJobStatus:
 
 class TestDataReadiness:
 
+    @patch("app.db.prediction_db.get_scoring_coverage_for_krs", return_value={
+        "active_model_ids": ["m1"],
+        "completed_report_ids": ["r1"],
+        "scored_models": {"m1": ["r1"]},
+        "missing": [],
+    })
     @patch("app.db.prediction_db.get_predictions_fat", return_value=[{"raw_score": 2.0}])
     @patch("app.db.prediction_db.get_computed_features_for_report", return_value=[{"value": 1.0}])
     @patch("app.db.prediction_db.get_reports_for_krs", return_value=[
@@ -192,6 +204,12 @@ class TestDataReadiness:
         summary = check_data_readiness("0000694720")
         assert is_data_ready(summary) is True
 
+    @patch("app.db.prediction_db.get_scoring_coverage_for_krs", return_value={
+        "active_model_ids": [],
+        "completed_report_ids": [],
+        "scored_models": {},
+        "missing": [],
+    })
     @patch("app.db.prediction_db.get_predictions_fat", return_value=[])
     @patch("app.db.prediction_db.get_computed_features_for_report", return_value=[])
     @patch("app.db.prediction_db.get_reports_for_krs", return_value=[])
@@ -203,6 +221,12 @@ class TestDataReadiness:
         summary = check_data_readiness("0000694720")
         assert is_data_ready(summary) is False
 
+    @patch("app.db.prediction_db.get_scoring_coverage_for_krs", return_value={
+        "active_model_ids": ["m1"],
+        "completed_report_ids": ["r1"],
+        "scored_models": {},
+        "missing": [{"model_id": "m1", "report_id": "r1"}],
+    })
     @patch("app.db.prediction_db.get_predictions_fat", return_value=[])
     @patch("app.db.prediction_db.get_computed_features_for_report", return_value=[{"value": 1.0}])
     @patch("app.db.prediction_db.get_reports_for_krs", return_value=[

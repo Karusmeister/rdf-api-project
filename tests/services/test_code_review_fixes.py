@@ -122,7 +122,7 @@ class TestSharedConnection:
             ).fetchall()
         }
         assert "krs_registry" in tables
-        assert "krs_documents" in tables
+        assert "krs_document_versions" in tables
         assert "financial_reports" in tables
         assert "computed_features" in tables
 
@@ -483,17 +483,6 @@ class TestFailedRetry:
 # ---------------------------------------------------------------------------
 
 class TestScraperDDL:
-    def test_not_downloaded_index_exists(self, isolated_db):
-        """The idx_documents_not_downloaded index exists."""
-        conn = db_conn.get_conn()
-        indexes = {
-            row[0]
-            for row in conn.execute(
-                "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
-            ).fetchall()
-        }
-        assert "idx_documents_not_downloaded" in indexes
-
     def test_all_documented_indexes_exist(self, isolated_db):
         """All scraper indexes expected by the implementation are present."""
         conn = db_conn.get_conn()
@@ -506,8 +495,8 @@ class TestScraperDDL:
         expected = [
             "idx_registry_last_checked",
             "idx_registry_priority",
-            "idx_documents_krs",
-            "idx_documents_not_downloaded",
+            "idx_krs_doc_versions_doc_current",
+            "idx_doc_versions_current_krs",
             "idx_runs_started",
         ]
         for idx_name in expected:

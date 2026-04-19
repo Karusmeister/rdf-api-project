@@ -238,10 +238,9 @@ async def test_stale_entity_re_enrichment(monkeypatch):
     await krs_sync.run_sync()
     assert krs_repo.count_entities() == 1
 
-    # Artificially age the entity's synced_at (both legacy cache and version table)
+    # Artificially age the entity's synced_at on the append-only version table
     conn = db_conn.get_conn()
     old_ts = (datetime.now(timezone.utc) - timedelta(hours=200)).isoformat()
-    conn.execute("UPDATE krs_entities SET synced_at = %s WHERE krs = %s", [old_ts, "0000694720"])
     conn.execute("UPDATE krs_entity_versions SET valid_from = %s WHERE krs = %s AND is_current = true", [old_ts, "0000694720"])
 
     # Second run: should re-enrich the stale entity

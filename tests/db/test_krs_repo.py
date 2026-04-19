@@ -359,16 +359,3 @@ def test_list_stale_uses_current_view():
     assert "0000000017" in krs_list
 
 
-def test_startup_guardrail_fails_fast_when_legacy_without_versions():
-    """connect() should fail fast on legacy rows without append-only backfill."""
-    conn = db_conn.get_conn()
-    # Insert legacy data directly, ensure version table is empty
-    conn.execute("DELETE FROM krs_entity_versions")
-    conn.execute("""
-        INSERT INTO krs_entities (krs, name, source) VALUES ('0000099999', 'Guard Corp', 'ms_gov')
-        ON CONFLICT (krs) DO NOTHING
-    """)
-    # Re-connect — guardrail must block startup with clear migration hint.
-    krs_repo._schema_initialized = False
-    with pytest.raises(RuntimeError, match="Cutover blocked: krs_entity_versions is empty"):
-        krs_repo.connect()

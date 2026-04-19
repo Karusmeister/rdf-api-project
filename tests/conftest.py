@@ -77,13 +77,82 @@ def pg_dsn():
     return dsn
 
 
+import pathlib
+
+_MIGRATIONS_ROOT = pathlib.Path(__file__).resolve().parent.parent / "migrations"
+
+# These use psql client-side `:'var'` substitution (e.g. CREATE ROLE rdf_batch
+# LOGIN PASSWORD :'batch_password'). They fail psycopg2 parsing, so operators
+# apply them manually. In tests we don't need the scoped roles — mark as
+# applied so apply_pending() skips them and the retroactive-insertion check
+# doesn't flag pending prediction/dedupe migrations as back-fills.
+_ROLE_MIGRATIONS_HANDLED_MANUALLY = {
+    "008_scoped_batch_role",
+    "009_scoped_api_role",
+    "010_reassign_object_ownership_to_rdf_api",
+}
+
+
+def _apply_test_migrations(conn) -> None:
+    """Apply SQL migrations directly, skipping psql-only role migrations.
+
+    Mirrors app.db.migrations.apply_pending() but:
+      * inserts a stub schema_migrations row for every skipped role migration
+        so its version number doesn't trip the retroactive-insertion guard
+        when new prediction/NNN files land below it;
+      * discovers namespaces in a fixed order (prediction then dedupe) so
+        dedupe/* can reference tables created by prediction/*.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version VARCHAR PRIMARY KEY,
+            applied_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+        )
+    """)
+    for namespace in ("prediction", "dedupe"):
+        ns_dir = _MIGRATIONS_ROOT / namespace
+        if not ns_dir.is_dir():
+            continue
+        for path in sorted(ns_dir.iterdir()):
+            if path.suffix != ".sql":
+                continue
+            key = f"{namespace}/{path.stem}"
+            already = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = %s", [key]
+            ).fetchone()
+            if already:
+                continue
+            if namespace == "prediction" and path.stem in _ROLE_MIGRATIONS_HANDLED_MANUALLY:
+                conn.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s) "
+                    "ON CONFLICT DO NOTHING",
+                    [key],
+                )
+                continue
+            sql = path.read_text(encoding="utf-8")
+            raw = conn.raw
+            prev = raw.autocommit
+            raw.autocommit = False
+            try:
+                with raw.cursor() as cur:
+                    cur.execute(sql)
+                    cur.execute(
+                        "INSERT INTO schema_migrations (version) VALUES (%s)", [key]
+                    )
+                raw.commit()
+            except Exception:
+                raw.rollback()
+                raise
+            finally:
+                raw.autocommit = prev
+
+
 @pytest.fixture(scope="session")
 def pg_schema_initialized(pg_dsn):
     """Initialize all schemas once per test session."""
     from unittest.mock import patch
     from app.config import settings
     from app.db import connection as db_conn
-    from app.db import migrations as db_migrations
     from app.scraper import db as scraper_db
     from app.db import prediction_db
     from app.repositories import krs_repo
@@ -98,9 +167,7 @@ def pg_schema_initialized(pg_dsn):
         scraper_db._ensure_schema()
         prediction_db._ensure_schema()
         krs_repo._ensure_schema()
-        # CR2-OPS-004: apply versioned migrations after bootstrap tables exist
-        # so tests see the same schema shape (columns, FKs) as production.
-        db_migrations.apply_pending(db_conn.get_conn())
+        _apply_test_migrations(db_conn.get_conn())
         db_conn.close()
         db_conn.reset()
 

@@ -89,7 +89,7 @@ def _init_schema() -> None:
             report_id       VARCHAR NOT NULL,
             section         VARCHAR(30) NOT NULL,
             extraction_version INTEGER NOT NULL DEFAULT 1,
-            data_json       JSON NOT NULL,
+            data_json       JSONB NOT NULL,
             taxonomy_version VARCHAR(50),
             created_at      TIMESTAMP DEFAULT current_timestamp,
             PRIMARY KEY(report_id, section, extraction_version)
@@ -122,7 +122,7 @@ def _init_schema() -> None:
             formula_description VARCHAR,
             formula_numerator   VARCHAR(200),
             formula_denominator VARCHAR(200),
-            required_tags   JSON,
+            required_tags   JSONB,
             computation_logic VARCHAR(20) DEFAULT 'ratio',
             version         INTEGER DEFAULT 1,
             is_active       BOOLEAN DEFAULT true,
@@ -175,10 +175,10 @@ def _init_schema() -> None:
             version         VARCHAR(20) NOT NULL,
             feature_set_id  VARCHAR,
             description     VARCHAR,
-            hyperparameters JSON,
-            training_metrics JSON,
+            hyperparameters JSONB,
+            training_metrics JSONB,
             training_date   TIMESTAMP,
-            training_data_spec JSON,
+            training_data_spec JSONB,
             artifact_path   VARCHAR,
             is_active       BOOLEAN DEFAULT true,
             is_baseline     BOOLEAN DEFAULT false,
@@ -192,7 +192,7 @@ def _init_schema() -> None:
             id              VARCHAR PRIMARY KEY,
             model_id        VARCHAR NOT NULL,
             run_date        TIMESTAMP DEFAULT current_timestamp,
-            parameters      JSON,
+            parameters      JSONB,
             companies_scored INTEGER,
             status          VARCHAR(20) DEFAULT 'running',
             error_message   VARCHAR,
@@ -211,8 +211,8 @@ def _init_schema() -> None:
             probability     DOUBLE PRECISION,
             classification  SMALLINT,
             risk_category   VARCHAR(20),
-            feature_contributions JSON,
-            feature_snapshot JSON,
+            feature_contributions JSONB,
+            feature_snapshot JSONB,
             created_at      TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -266,7 +266,7 @@ def _init_schema() -> None:
             status          VARCHAR(30) DEFAULT 'pending',
             stage           VARCHAR(50),
             error_message   VARCHAR,
-            result_json     JSON,
+            result_json     JSONB,
             created_at      TIMESTAMP DEFAULT current_timestamp,
             updated_at      TIMESTAMP DEFAULT current_timestamp
         )
