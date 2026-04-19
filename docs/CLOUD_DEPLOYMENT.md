@@ -45,7 +45,9 @@ Production deployment of the RDF API on Google Cloud Platform.
 | Resource | Value |
 |----------|-------|
 | GCP project | `rdf-api-project` |
-| GCP account | `piotr.kraus01@gmail.com` |
+| GCP organization | `kraus.uk` (`184017532341`) |
+| GCP account | `contact@kraus.uk` (post-migration; piotr.kraus01@gmail.com retained until Phase 9 — see [rdf-infra/docs/12-gcp-org-migration.md](../../rdf-infra/docs/12-gcp-org-migration.md)) |
+| Billing account | `0139F7-FC5D8B-3BBAC1` (`kraus.uk`) |
 | Region | `europe-central2` (Warsaw) |
 | **Cloud Run** | |
 | Service URL | `https://rdf-api-448201086881.europe-central2.run.app` |

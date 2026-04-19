@@ -2057,6 +2057,64 @@ def get_ingested_report_ids_for_krs(krs: str) -> set[str]:
     return {row[0] for row in rows if row[0]}
 
 
+# --- scoring coverage ---
+
+
+def get_scoring_coverage_for_krs(krs: str) -> dict:
+    """Return per-model scoring coverage for a KRS.
+
+    Computes the cross-product of active models × completed reports and
+    identifies which combinations have predictions (scored) vs not (gaps).
+    """
+    conn = get_conn()
+
+    active_models = conn.execute(
+        "SELECT id FROM model_registry WHERE is_active = true ORDER BY id"
+    ).fetchall()
+    active_model_ids = [r[0] for r in active_models]
+
+    completed_reports = conn.execute("""
+        SELECT id FROM latest_successful_financial_reports WHERE krs = %s
+    """, [krs]).fetchall()
+    completed_report_ids = [r[0] for r in completed_reports]
+
+    if not active_model_ids or not completed_report_ids:
+        return {
+            "active_model_ids": active_model_ids,
+            "completed_report_ids": completed_report_ids,
+            "scored_models": {},
+            "missing": [],
+        }
+
+    # Existing predictions for this KRS
+    scored_rows = conn.execute("""
+        SELECT DISTINCT pr.model_id, p.report_id
+        FROM predictions p
+        JOIN prediction_runs pr ON pr.id = p.prediction_run_id
+        WHERE p.krs = %s
+    """, [krs]).fetchall()
+
+    scored_set = {(r[0], r[1]) for r in scored_rows}
+
+    scored_models: dict[str, list[str]] = {}
+    for model_id, report_id in scored_set:
+        scored_models.setdefault(model_id, []).append(report_id)
+
+    missing = [
+        {"model_id": m, "report_id": r}
+        for m in active_model_ids
+        for r in completed_report_ids
+        if (m, r) not in scored_set
+    ]
+
+    return {
+        "active_model_ids": active_model_ids,
+        "completed_report_ids": completed_report_ids,
+        "scored_models": scored_models,
+        "missing": missing,
+    }
+
+
 # --- document coverage (PKR-130) ---
 
 

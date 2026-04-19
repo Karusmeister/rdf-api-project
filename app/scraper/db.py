@@ -185,8 +185,6 @@ def _init_schema() -> None:
         ("idx_krs_doc_versions_doc_current", "CREATE INDEX idx_krs_doc_versions_doc_current ON krs_document_versions(document_id, is_current)"),
         # DB-005: Partial index — only indexes ~857K current rows instead of all 1.9M
         ("idx_doc_versions_current_krs", "CREATE INDEX idx_doc_versions_current_krs ON krs_document_versions(krs) WHERE is_current = true"),
-        # DB-012: Covering index for pipeline discovery (changed-since queries)
-        ("idx_doc_versions_observed", "CREATE INDEX idx_doc_versions_observed ON krs_document_versions(observed_at DESC) WHERE is_current = true"),
     ]
 
     for name, sql in index_defs:
@@ -407,24 +405,34 @@ def get_undownloaded_documents(krs: str) -> list[str]:
 
 
 def insert_documents(docs: list[dict]) -> None:
-    """Batch insert new documents — creates initial version in krs_document_versions."""
+    """Batch insert new documents — creates initial version in krs_document_versions.
+
+    Only sets is_downloaded=False for genuinely new documents. Existing documents
+    retain their current download status to avoid re-downloading.
+    """
     conn = get_conn()
     for doc in docs:
         doc_id = doc["document_id"]
         krs = doc["krs"]
 
-        # Append-only: create version 1 if document not yet known
+        patch: dict = {
+            "rodzaj": doc["rodzaj"],
+            "status": doc["status"],
+            "nazwa": doc.get("nazwa"),
+            "okres_start": doc.get("okres_start"),
+            "okres_end": doc.get("okres_end"),
+            "discovered_at": doc["discovered_at"],
+        }
+
+        # Only set is_downloaded=False for new documents — existing ones
+        # keep their current download status via _merge_document_patch.
+        current = _get_current_document_snapshot(conn, doc_id)
+        if current is None:
+            patch["is_downloaded"] = False
+
         _append_document_version_if_changed(
             conn, doc_id, krs,
-            patch={
-                "rodzaj": doc["rodzaj"],
-                "status": doc["status"],
-                "nazwa": doc.get("nazwa"),
-                "okres_start": doc.get("okres_start"),
-                "okres_end": doc.get("okres_end"),
-                "is_downloaded": False,
-                "discovered_at": doc["discovered_at"],
-            },
+            patch=patch,
             change_reason="discovery",
         )
 

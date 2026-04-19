@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ app/
 COPY batch/ batch/
 COPY scripts/ scripts/
+COPY migrations/ migrations/
 
 RUN useradd --no-create-home --shell /usr/sbin/nologin appuser
 USER appuser

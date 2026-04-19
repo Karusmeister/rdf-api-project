@@ -17,7 +17,7 @@ from app import rdf_client
 from app.config import settings
 from app.db import prediction_db
 from app.scraper import db as scraper_db
-from app.scraper.storage import LocalStorage, make_doc_dir
+from app.scraper.storage import GcsStorage, LocalStorage, make_doc_dir
 from app.services import etl, feature_engine
 from app.services import maczynska as maczynska_scorer
 from app.services import poznanski as poznanski_scorer
@@ -90,6 +90,11 @@ def check_data_readiness(krs: str) -> dict:
         preds = prediction_db.get_predictions_fat(krs)
         predictions_available = len(preds) > 0
 
+    # Granular scoring coverage
+    scoring_coverage = prediction_db.get_scoring_coverage_for_krs(krs)
+    models_total = len(scoring_coverage["active_model_ids"])
+    models_with_scores = len(scoring_coverage["scored_models"])
+
     # Diagnose why predictions may be unavailable
     diagnosis = None
     if not predictions_available:
@@ -106,6 +111,9 @@ def check_data_readiness(krs: str) -> dict:
         "reports_ingested": len(ingested_ids),
         "features_computed": features_computed,
         "predictions_available": predictions_available,
+        "models_total": models_total,
+        "models_scored": models_with_scores,
+        "scoring_gaps": len(scoring_coverage["missing"]),
         "latest_fiscal_year": latest_fiscal_year,
         "diagnosis": diagnosis,
     }
@@ -120,6 +128,9 @@ def is_data_ready(summary: dict) -> bool:
         and summary["reports_ingested"] > 0
         and summary["features_computed"]
         and summary["predictions_available"]
+        # All active models must have scored at least one report
+        and summary.get("models_total", 0) > 0
+        and summary.get("models_scored", 0) == summary.get("models_total", 0)
     )
 
 
@@ -128,7 +139,9 @@ def is_data_ready(summary: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _get_storage() -> LocalStorage:
+def _get_storage() -> LocalStorage | GcsStorage:
+    if settings.storage_backend == "gcs":
+        return GcsStorage(settings.storage_gcs_bucket, settings.storage_gcs_prefix)
     return LocalStorage(settings.storage_local_path)
 
 
@@ -227,8 +240,6 @@ async def run_pipeline(job_id: str, krs: str) -> None:
         # ----------------------------------------------------------------
         # Stage 3: Download undownloaded documents
         # ----------------------------------------------------------------
-        await _run_in_executor(_update_job, job_id, "running", "downloading")
-
         to_download = await _run_in_executor(scraper_db.get_undownloaded_documents, krs)
         total_to_download = len(to_download)
         storage = _get_storage()
@@ -240,7 +251,10 @@ async def run_pipeline(job_id: str, krs: str) -> None:
             "features_computed": False,
             "predictions_scored": False,
         }
+        # Update progress BEFORE changing stage so the frontend sees the
+        # correct already-downloaded count immediately when polling.
         await _run_in_executor(_update_progress, job_id, progress)
+        await _run_in_executor(_update_job, job_id, "running", "downloading")
 
         for i, doc_id in enumerate(to_download):
             try:
@@ -343,60 +357,107 @@ async def run_pipeline(job_id: str, krs: str) -> None:
         # ----------------------------------------------------------------
         await _run_in_executor(_update_job, job_id, "running", "scoring")
 
+        scorer_map = {
+            "maczynska_1994_v1": maczynska_scorer,
+            "poznanski_2004_v1": poznanski_scorer,
+            "maczynska_2006_v1": maczynska2006_scorer,
+            "prusak_p1_v1": prusak_scorer,
+            "poznan_2000_v1": poznan_scorer,
+        }
+
         report_ids = [r["id"] for r in completed_reports]
+        scoring_results: dict = {}
         if report_ids:
-            try:
-                await _run_in_executor(maczynska_scorer.score_batch, report_ids)
-            except Exception:
-                logger.warning(
-                    "assessment_maczynska_scoring_failed",
-                    extra={"job_id": job_id, "krs": krs},
-                    exc_info=True,
-                )
-
-            try:
-                await _run_in_executor(poznanski_scorer.score_batch, report_ids)
-            except Exception:
-                logger.warning(
-                    "assessment_poznanski_scoring_failed",
-                    extra={"job_id": job_id, "krs": krs},
-                    exc_info=True,
-                )
-
-            try:
-                await _run_in_executor(maczynska2006_scorer.score_batch, report_ids)
-            except Exception:
-                logger.warning(
-                    "assessment_maczynska2006_scoring_failed",
-                    extra={"job_id": job_id, "krs": krs},
-                    exc_info=True,
-                )
-
-            try:
-                await _run_in_executor(prusak_scorer.score_batch, report_ids)
-            except Exception:
-                logger.warning(
-                    "assessment_prusak_scoring_failed",
-                    extra={"job_id": job_id, "krs": krs},
-                    exc_info=True,
-                )
-
-            try:
-                await _run_in_executor(poznan_scorer.score_batch, report_ids)
-            except Exception:
-                logger.warning(
-                    "assessment_poznan_scoring_failed",
-                    extra={"job_id": job_id, "krs": krs},
-                    exc_info=True,
-                )
+            for model_id, scorer in scorer_map.items():
+                try:
+                    result = await _run_in_executor(scorer.score_batch, report_ids)
+                    scoring_results[model_id] = {
+                        "scored": result.get("scored", 0),
+                        "skipped": result.get("skipped", 0),
+                        "errors": result.get("errors", 0),
+                    }
+                except Exception:
+                    scoring_results[model_id] = {"scored": 0, "skipped": 0, "errors": 0, "failed": True}
+                    logger.warning(
+                        "assessment_scoring_failed",
+                        extra={"job_id": job_id, "krs": krs, "model_id": model_id},
+                        exc_info=True,
+                    )
 
         progress["predictions_scored"] = True
+        progress["scoring_results"] = scoring_results
         await _run_in_executor(_update_progress, job_id, progress)
 
         # ----------------------------------------------------------------
-        # Done
+        # Stage 6b: Verify scoring completeness and repair gaps
+        # ----------------------------------------------------------------
+        coverage = await _run_in_executor(
+            prediction_db.get_scoring_coverage_for_krs, krs,
+        )
+        gaps = coverage.get("missing", [])
+
+        if gaps:
+            logger.info(
+                "assessment_scoring_gaps_detected",
+                extra={
+                    "event": "assessment_scoring_gaps_detected",
+                    "job_id": job_id,
+                    "krs": krs,
+                    "gap_count": len(gaps),
+                },
+            )
+
+            # Group gaps by model for targeted re-scoring
+            from collections import defaultdict
+            gaps_by_model: dict[str, list[str]] = defaultdict(list)
+            for gap in gaps:
+                gaps_by_model[gap["model_id"]].append(gap["report_id"])
+
+            # Re-compute features for reports with gaps (idempotent)
+            gap_report_ids = list({g["report_id"] for g in gaps})
+            for rid in gap_report_ids:
+                try:
+                    await _run_in_executor(
+                        feature_engine.compute_features_for_report, rid,
+                    )
+                except Exception:
+                    logger.warning(
+                        "assessment_repair_feature_failed",
+                        extra={"job_id": job_id, "report_id": rid},
+                        exc_info=True,
+                    )
+
+            # Re-score only the missing report-model combinations
+            for model_id, missing_report_ids in gaps_by_model.items():
+                scorer = scorer_map.get(model_id)
+                if scorer is None:
+                    continue
+                try:
+                    result = await _run_in_executor(scorer.score_batch, missing_report_ids)
+                    logger.info(
+                        "assessment_repair_scored",
+                        extra={
+                            "job_id": job_id, "model_id": model_id,
+                            "scored": result.get("scored", 0),
+                            "skipped": result.get("skipped", 0),
+                        },
+                    )
+                except Exception:
+                    logger.warning(
+                        "assessment_repair_scoring_failed",
+                        extra={"job_id": job_id, "model_id": model_id},
+                        exc_info=True,
+                    )
+
+        # ----------------------------------------------------------------
+        # Done — final summary with scoring completeness
         # ----------------------------------------------------------------
         final_summary = await _run_in_executor(check_data_readiness, krs)
+        final_summary["scoring_completeness"] = {
+            "models_total": final_summary.get("models_total", 0),
+            "models_scored": final_summary.get("models_scored", 0),
+            "is_complete": final_summary.get("models_scored", 0) == final_summary.get("models_total", 0),
+        }
         await _run_in_executor(
             _update_job, job_id, "completed", "scoring", None, final_summary,
         )

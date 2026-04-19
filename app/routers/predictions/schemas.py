@@ -210,6 +210,14 @@ class PipelineTriggerResponse(BaseModel):
     message: str
 
 
+class ScoringModelResult(BaseModel):
+    """Per-model scoring outcome."""
+    scored: int = 0
+    skipped: int = 0
+    errors: int = 0
+    failed: bool = False
+
+
 class PipelineProgress(BaseModel):
     """Live progress counters from the pipeline."""
     documents_total: int = 0
@@ -217,6 +225,7 @@ class PipelineProgress(BaseModel):
     documents_ingested: int = 0
     features_computed: bool = False
     predictions_scored: bool = False
+    scoring_results: dict[str, ScoringModelResult] | None = None
 
 
 class PipelineStatusResponse(BaseModel):

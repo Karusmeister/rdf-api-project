@@ -79,7 +79,7 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
-          gcloud run services update ${{ env.SERVICE }} \
+          gcloud run deploy ${{ env.SERVICE }} \
             --image ${{ env.IMAGE }}:${{ github.ref_name }} \
             --region ${{ env.REGION }} \
             --project ${{ env.PROJECT_ID }}
@@ -89,4 +89,25 @@ jobs:
           URL=$(gcloud run services describe ${{ env.SERVICE }} \
             --region ${{ env.REGION }} \
             --format='value(status.url)')
+          # Verify health
           curl -sf "${URL}/health" || (echo "Health check failed" && exit 1)
+          # Verify the new revision is actually serving traffic
+          ACTIVE=$(gcloud run revisions list \
+            --service=${{ env.SERVICE }} \
+            --region=${{ env.REGION }} \
+            --filter="status.conditions.type=Active AND status.conditions.status=True" \
+            --sort-by="~metadata.creationTimestamp" \
+            --limit=1 \
+            --format="value(metadata.name)")
+          echo "Active revision: ${ACTIVE}"
+          LATEST=$(gcloud run revisions list \
+            --service=${{ env.SERVICE }} \
+            --region=${{ env.REGION }} \
+            --sort-by="~metadata.creationTimestamp" \
+            --limit=1 \
+            --format="value(metadata.name)")
+          echo "Latest revision: ${LATEST}"
+          if [ "$ACTIVE" != "$LATEST" ]; then
+            echo "::error::Traffic is NOT routed to the latest revision (active=${ACTIVE}, latest=${LATEST})"
+            exit 1
+          fi

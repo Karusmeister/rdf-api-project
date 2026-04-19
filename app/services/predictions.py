@@ -788,19 +788,29 @@ def _build_coverage_notes(
     if not pdf_only_years:
         return None, None
 
-    xml_range = f"{min(xml_years)}-{max(xml_years)}" if xml_years else "brak"
     pdf_range = f"{min(pdf_only_years)}-{max(pdf_only_years)}"
 
-    note_pl = (
-        f"Analiza obejmuje lata {xml_range} (dane XML). "
-        f"Sprawozdania za lata {pdf_range} dostepne sa wylacznie w formacie PDF "
-        f"i nie zostaly jeszcze uwzglednione w analizie."
-    )
-    note_en = (
-        f"Analysis covers {xml_range} (XML data). "
-        f"Reports for {pdf_range} are available as PDF only "
-        f"and are not yet included in the analysis."
-    )
+    if xml_years:
+        xml_range = f"{min(xml_years)}-{max(xml_years)}"
+        note_pl = (
+            f"Analiza obejmuje lata {xml_range} (dane XML). "
+            f"Sprawozdania za lata {pdf_range} dostępne są wyłącznie w formacie PDF "
+            f"i nie zostały jeszcze uwzględnione w analizie."
+        )
+        note_en = (
+            f"Analysis covers {xml_range} (XML data). "
+            f"Reports for {pdf_range} are available as PDF only "
+            f"and are not yet included in the analysis."
+        )
+    else:
+        note_pl = (
+            f"Sprawozdania za lata {pdf_range} dostępne są wyłącznie w formacie PDF "
+            f"i nie zostały jeszcze uwzględnione w analizie."
+        )
+        note_en = (
+            f"Reports for {pdf_range} are available as PDF only "
+            f"and are not yet included in the analysis."
+        )
     return note_pl, note_en
 
 
