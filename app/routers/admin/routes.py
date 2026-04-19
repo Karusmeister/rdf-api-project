@@ -163,7 +163,7 @@ def krs_coverage(
             COUNT(DISTINCT d.rodzaj) AS doc_types_count,
             ARRAY_AGG(DISTINCT d.rodzaj) FILTER (WHERE d.rodzaj IS NOT NULL) AS doc_types_present,
             COUNT(DISTINCT d.okres_end)
-                FILTER (WHERE d.rodzaj = '18') AS financial_periods
+                FILTER (WHERE d.rodzaj = 18) AS financial_periods
         FROM krs_companies r
         LEFT JOIN krs_documents_current d ON d.krs = r.krs
         GROUP BY r.krs, r.name, r.legal_form,

@@ -69,25 +69,25 @@ def _get_needs_metadata_batch(
     try:
         if after_krs is not None and after_doc_id is not None:
             rows = conn.execute("""
-                SELECT document_id, krs
-                FROM krs_document_versions
-                WHERE is_current = true
-                  AND is_downloaded = true
-                  AND metadata_fetched_at IS NULL
-                  AND abs(hashtext(krs)) %% %s = %s
-                  AND (krs, document_id) > (%s, %s)
-                ORDER BY krs, document_id
+                SELECT d.document_id, d.krs
+                FROM krs_documents d
+                JOIN krs_document_downloads dl USING (document_id)
+                WHERE dl.is_downloaded = true
+                  AND dl.metadata_fetched_at IS NULL
+                  AND abs(hashtext(d.krs)) %% %s = %s
+                  AND (d.krs, d.document_id) > (%s, %s)
+                ORDER BY d.krs, d.document_id
                 LIMIT %s
             """, [total_workers, worker_id, after_krs, after_doc_id, batch_size]).fetchall()
         else:
             rows = conn.execute("""
-                SELECT document_id, krs
-                FROM krs_document_versions
-                WHERE is_current = true
-                  AND is_downloaded = true
-                  AND metadata_fetched_at IS NULL
-                  AND abs(hashtext(krs)) %% %s = %s
-                ORDER BY krs, document_id
+                SELECT d.document_id, d.krs
+                FROM krs_documents d
+                JOIN krs_document_downloads dl USING (document_id)
+                WHERE dl.is_downloaded = true
+                  AND dl.metadata_fetched_at IS NULL
+                  AND abs(hashtext(d.krs)) %% %s = %s
+                ORDER BY d.krs, d.document_id
                 LIMIT %s
             """, [total_workers, worker_id, batch_size]).fetchall()
         return [(row[0], row[1]) for row in rows]

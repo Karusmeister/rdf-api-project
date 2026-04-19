@@ -39,7 +39,7 @@ def _diagnose_no_predictions(krs: str, completed_reports: list[dict]) -> str | N
     if not completed_reports:
         conn = _get_conn()
         rows = conn.execute(
-            "SELECT DISTINCT file_type FROM krs_documents_current WHERE krs = %s AND rodzaj = '18'",
+            "SELECT DISTINCT file_type FROM krs_documents_current WHERE krs = %s AND rodzaj = 18",
             [krs],
         ).fetchall()
         found = {r[0] for r in rows}

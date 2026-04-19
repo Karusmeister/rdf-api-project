@@ -1,7 +1,8 @@
-"""Tests for PR3: append-only document versioning.
+"""Tests for the split-document storage contract.
 
-Covers both app/scraper/db.py (shared connection) and batch/rdf_document_store.py
-(short-lived connections).
+File keeps its historical name for git-history stability. The subject is
+now the post-dedupe krs_documents + krs_document_downloads pair; the
+append-only version history was removed in SCHEMA_DEDUPE_PLAN #1.
 """
 from datetime import datetime, timezone
 
@@ -36,226 +37,220 @@ def isolated_db(pg_dsn, clean_pg):
     krs_repo._schema_initialized = False
 
 
-def _doc_versions(document_id: str) -> list[dict]:
+def _view_row(document_id: str) -> dict | None:
     conn = db_conn.get_conn()
-    rows = conn.execute(
-        "SELECT * FROM krs_document_versions WHERE document_id = %s ORDER BY version_no",
-        [document_id],
-    ).fetchall()
-    cols = [d[0] for d in conn.execute("SELECT * FROM krs_document_versions LIMIT 0").description]
-    return [dict(zip(cols, r)) for r in rows]
+    cur = conn.execute(
+        "SELECT * FROM krs_documents_current WHERE document_id = %s", [document_id]
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    cols = [d[0] for d in cur.description]
+    return dict(zip(cols, row))
+
+
+def _document_count(document_id: str) -> int:
+    conn = db_conn.get_conn()
+    return conn.execute(
+        "SELECT count(*) FROM krs_documents WHERE document_id = %s", [document_id]
+    ).fetchone()[0]
 
 
 # ---------------------------------------------------------------------------
-# app/scraper/db.py — shared connection path
+# app/scraper/db.py — shared-connection path
 # ---------------------------------------------------------------------------
 
-class TestScraperDbAppendOnly:
+class TestScraperDbDocuments:
 
-    def test_insert_creates_version_1(self):
+    def test_insert_creates_document_and_downloads_row(self):
         scraper_db.insert_documents([{
             "document_id": "doc-001", "krs": "0000000001",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
             "discovered_at": datetime.now(timezone.utc),
         }])
-        versions = _doc_versions("doc-001")
-        assert len(versions) == 1
-        assert versions[0]["version_no"] == 1
-        assert versions[0]["is_current"] is True
-        assert versions[0]["change_reason"] == "discovery"
+        row = _view_row("doc-001")
+        assert row is not None
+        assert row["rodzaj"] == 18
+        assert row["is_deleted"] is False
+        assert row["is_downloaded"] is False
 
-    def test_metadata_update_creates_version_2(self):
+    def test_metadata_update_fills_columns(self):
         scraper_db.insert_documents([{
             "document_id": "doc-002", "krs": "0000000001",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
             "discovered_at": datetime.now(timezone.utc),
         }])
         scraper_db.update_document_metadata("doc-002", {
             "filename": "report.xml", "is_ifrs": False,
             "is_correction": False, "date_filed": "2025-06-01",
         })
-        versions = _doc_versions("doc-002")
-        assert len(versions) == 2
-        assert versions[1]["filename"] == "report.xml"
-        assert versions[1]["change_reason"] == "metadata_update"
+        row = _view_row("doc-002")
+        assert row["filename"] == "report.xml"
+        assert row["is_ifrs"] is False
+        assert str(row["date_filed"]) == "2025-06-01"
+        assert row["metadata_fetched_at"] is not None
 
-    def test_download_creates_version_3(self):
+    def test_download_sets_is_downloaded_and_file_type(self):
         scraper_db.insert_documents([{
             "document_id": "doc-003", "krs": "0000000001",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
             "discovered_at": datetime.now(timezone.utc),
         }])
-        scraper_db.update_document_metadata("doc-003", {
-            "filename": "report.xml",
-        })
         scraper_db.mark_downloaded(
             "doc-003", "/tmp/report", "local", 1024, 512, 1, "xml",
         )
-        versions = _doc_versions("doc-003")
-        assert len(versions) == 3
-        assert versions[2]["is_downloaded"] is True
-        assert versions[2]["change_reason"] == "downloaded"
+        row = _view_row("doc-003")
+        assert row["is_downloaded"] is True
+        assert row["storage_path"] == "/tmp/report"
+        assert row["file_type"] == "xml"
 
-    def test_identical_update_no_new_version(self):
-        scraper_db.insert_documents([{
+    def test_duplicate_insert_is_idempotent(self):
+        doc = {
             "document_id": "doc-004", "krs": "0000000001",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
             "discovered_at": datetime.now(timezone.utc),
-        }])
-        # Re-insert the same document — should be no-op
-        scraper_db.insert_documents([{
-            "document_id": "doc-004", "krs": "0000000001",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
-            "discovered_at": datetime.now(timezone.utc),
-        }])
-        versions = _doc_versions("doc-004")
-        assert len(versions) == 1
+        }
+        scraper_db.insert_documents([doc])
+        scraper_db.insert_documents([doc])
+        assert _document_count("doc-004") == 1
 
-    def test_only_one_current_per_document(self):
+    def test_full_lifecycle_leaves_single_row(self):
         scraper_db.insert_documents([{
             "document_id": "doc-005", "krs": "0000000001",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
             "discovered_at": datetime.now(timezone.utc),
         }])
         scraper_db.update_document_metadata("doc-005", {"filename": "a.xml"})
         scraper_db.mark_downloaded("doc-005", "/p", "local", 100, 50, 1, "xml")
 
-        versions = _doc_versions("doc-005")
-        current = [v for v in versions if v["is_current"]]
-        assert len(current) == 1
+        assert _document_count("doc-005") == 1
+        row = _view_row("doc-005")
+        assert row["is_downloaded"] is True
+        assert row["filename"] == "a.xml"
 
-    def test_error_creates_version(self):
+    def test_update_error_is_recorded_on_downloads_row(self):
         scraper_db.insert_documents([{
             "document_id": "doc-006", "krs": "0000000001",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
             "discovered_at": datetime.now(timezone.utc),
         }])
         scraper_db.update_document_error("doc-006", "timeout")
-        versions = _doc_versions("doc-006")
-        assert len(versions) == 2
-        assert versions[1]["download_error"] == "timeout"
+        row = _view_row("doc-006")
+        assert row["download_error"] == "timeout"
+        # Document row itself is unchanged — only the downloads row moved.
+        assert _document_count("doc-006") == 1
 
-    def test_read_from_current_view(self):
+    def test_read_from_view(self):
         scraper_db.insert_documents([{
             "document_id": "doc-007", "krs": "0000000001",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
             "discovered_at": datetime.now(timezone.utc),
         }])
         ids = scraper_db.get_known_document_ids("0000000001")
         assert "doc-007" in ids
 
-    def test_undownloaded_from_current_view(self):
+    def test_undownloaded_lifecycle(self):
         scraper_db.insert_documents([{
             "document_id": "doc-008", "krs": "0000000002",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
             "discovered_at": datetime.now(timezone.utc),
         }])
-        undownloaded = scraper_db.get_undownloaded_documents("0000000002")
-        assert "doc-008" in undownloaded
+        assert "doc-008" in scraper_db.get_undownloaded_documents("0000000002")
 
         scraper_db.mark_downloaded("doc-008", "/p", "local", 100, 50, 1, "xml")
-        undownloaded = scraper_db.get_undownloaded_documents("0000000002")
-        assert "doc-008" not in undownloaded
+        assert "doc-008" not in scraper_db.get_undownloaded_documents("0000000002")
 
-    def test_error_then_download_clears_error_in_current_view(self):
-        """Fix 2 regression: mark_downloaded must clear download_error."""
+    def test_mark_downloaded_clears_prior_error(self):
         scraper_db.insert_documents([{
             "document_id": "doc-009", "krs": "0000000003",
-            "rodzaj": "sprawozdanie", "status": "aktywny",
+            "rodzaj": "18", "status": "NIEUSUNIETY",
             "discovered_at": datetime.now(timezone.utc),
         }])
         scraper_db.update_document_error("doc-009", "timeout")
+        assert _view_row("doc-009")["download_error"] == "timeout"
 
-        # Verify error is set
-        conn = db_conn.get_conn()
-        row = conn.execute(
-            "SELECT download_error FROM krs_documents_current WHERE document_id = 'doc-009'"
-        ).fetchone()
-        assert row[0] == "timeout"
-
-        # Download should clear the error
         scraper_db.mark_downloaded("doc-009", "/p", "local", 100, 50, 1, "xml")
-        row = conn.execute(
-            "SELECT download_error, is_downloaded FROM krs_documents_current WHERE document_id = 'doc-009'"
-        ).fetchone()
-        assert row[0] is None, f"download_error should be NULL, got {row[0]}"
-        assert row[1] is True
+        row = _view_row("doc-009")
+        assert row["download_error"] is None
+        assert row["is_downloaded"] is True
 
 
 # ---------------------------------------------------------------------------
-# batch/rdf_document_store.py — short-lived connection path
+# batch/rdf_document_store.py — short-lived-connection path
 # ---------------------------------------------------------------------------
 
-class TestBatchDocumentStoreAppendOnly:
+class TestBatchDocumentStore:
 
     @pytest.fixture()
     def store(self, pg_dsn):
-        """Separate store for batch (own short-lived connections)."""
         return RdfDocumentStore(pg_dsn)
 
-    def _versions(self, store, document_id):
+    def _view(self, store, document_id):
         conn = make_connection(store._dsn)
-        rows = conn.execute(
-            "SELECT * FROM krs_document_versions WHERE document_id = %s ORDER BY version_no",
-            [document_id],
-        ).fetchall()
-        cols = [d[0] for d in conn.execute("SELECT * FROM krs_document_versions LIMIT 0").description]
-        conn.close()
-        return [dict(zip(cols, r)) for r in rows]
+        try:
+            cur = conn.execute(
+                "SELECT * FROM krs_documents_current WHERE document_id = %s",
+                [document_id],
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cols = [d[0] for d in cur.description]
+            return dict(zip(cols, row))
+        finally:
+            conn.close()
 
-    def test_insert_creates_version(self, store):
+    def test_insert_creates_row(self, store):
         store.insert_documents("0000000010", [{
-            "id": "bdoc-001", "rodzaj": "sprawozdanie", "status": "aktywny",
+            "id": "bdoc-001", "rodzaj": "18", "status": "NIEUSUNIETY",
         }])
-        versions = self._versions(store, "bdoc-001")
-        assert len(versions) == 1
-        assert versions[0]["is_current"] is True
+        row = self._view(store, "bdoc-001")
+        assert row is not None
+        assert row["rodzaj"] == 18
+        assert row["is_downloaded"] is False
 
-    def test_metadata_creates_version(self, store):
+    def test_metadata_update(self, store):
         store.insert_documents("0000000010", [{
-            "id": "bdoc-002", "rodzaj": "sprawozdanie", "status": "aktywny",
+            "id": "bdoc-002", "rodzaj": "18", "status": "NIEUSUNIETY",
         }])
         store.update_metadata("bdoc-002", {
             "nazwaPliku": "report.xml", "czyMSR": False,
         })
-        versions = self._versions(store, "bdoc-002")
-        assert len(versions) == 2
+        row = self._view(store, "bdoc-002")
+        assert row["filename"] == "report.xml"
+        assert row["is_ifrs"] is False
 
-    def test_download_creates_version(self, store):
+    def test_download_marks_downloaded(self, store):
         store.insert_documents("0000000010", [{
-            "id": "bdoc-003", "rodzaj": "sprawozdanie", "status": "aktywny",
+            "id": "bdoc-003", "rodzaj": "18", "status": "NIEUSUNIETY",
         }])
         store.mark_downloaded("bdoc-003", "/p", "local", 100, 50, 1, "xml")
-        versions = self._versions(store, "bdoc-003")
-        assert len(versions) == 2
-        assert versions[1]["is_downloaded"] is True
+        row = self._view(store, "bdoc-003")
+        assert row["is_downloaded"] is True
+        assert row["file_type"] == "xml"
 
-    def test_identical_insert_no_new_version(self, store):
-        doc = {"id": "bdoc-004", "rodzaj": "sprawozdanie", "status": "aktywny"}
+    def test_duplicate_insert_stays_single_row(self, store):
+        doc = {"id": "bdoc-004", "rodzaj": "18", "status": "NIEUSUNIETY"}
         store.insert_documents("0000000010", [doc])
         store.insert_documents("0000000010", [doc])
-        versions = self._versions(store, "bdoc-004")
-        assert len(versions) == 1
+        assert self._view(store, "bdoc-004") is not None
 
-    def test_error_creates_version(self, store):
+    def test_update_error_on_downloads_row(self, store):
         store.insert_documents("0000000010", [{
-            "id": "bdoc-005", "rodzaj": "sprawozdanie", "status": "aktywny",
+            "id": "bdoc-005", "rodzaj": "18", "status": "NIEUSUNIETY",
         }])
         store.update_error("bdoc-005", "connection reset")
-        versions = self._versions(store, "bdoc-005")
-        assert len(versions) == 2
-        assert versions[1]["download_error"] == "connection reset"
+        row = self._view(store, "bdoc-005")
+        assert row["download_error"] == "connection reset"
 
-    def test_full_lifecycle_version_count(self, store):
-        """discovery -> metadata -> download = 3 versions."""
+    def test_full_lifecycle_final_state(self, store):
+        """discovery -> metadata -> download collapses to one row."""
         store.insert_documents("0000000010", [{
-            "id": "bdoc-006", "rodzaj": "sprawozdanie", "status": "aktywny",
+            "id": "bdoc-006", "rodzaj": "18", "status": "NIEUSUNIETY",
         }])
         store.update_metadata("bdoc-006", {"nazwaPliku": "r.xml"})
         store.mark_downloaded("bdoc-006", "/p", "local", 100, 50, 1, "xml")
 
-        versions = self._versions(store, "bdoc-006")
-        assert len(versions) == 3
-        current = [v for v in versions if v["is_current"]]
-        assert len(current) == 1
-        assert current[0]["version_no"] == 3
+        row = self._view(store, "bdoc-006")
+        assert row["is_downloaded"] is True
+        assert row["filename"] == "r.xml"

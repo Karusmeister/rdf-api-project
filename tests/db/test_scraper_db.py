@@ -31,7 +31,8 @@ def test_schema_creation():
     }
     # krs_companies is created by the dedupe/003 migration, applied via conftest.
     assert "krs_companies" in tables
-    assert "krs_document_versions" in tables
+    assert "krs_documents" in tables
+    assert "krs_document_downloads" in tables
     assert "scraper_runs" in tables
 
 
@@ -105,7 +106,8 @@ def test_mark_downloaded():
 
     conn = scraper_db.get_conn()
     row = conn.execute(
-        "SELECT is_downloaded, storage_path, file_count, file_types FROM krs_document_versions WHERE document_id = 'docXYZ' AND is_current = true"
+        "SELECT is_downloaded, storage_path, file_count, file_type "
+        "FROM krs_document_downloads WHERE document_id = 'docXYZ'"
     ).fetchone()
     assert row[0] is True
     assert row[1] == "krs/0000000001/docXYZ"
@@ -213,14 +215,15 @@ def test_stats():
     assert stats["total_downloaded"] >= 2
 
 
-def test_db003_legacy_tables_removed():
-    """DB-003: Legacy krs_documents table no longer created."""
+def test_legacy_document_tables_dropped():
+    """DB-003 + SCHEMA_DEDUPE_PLAN #1: neither legacy table should survive."""
     conn = scraper_db.get_conn()
     tables = {
         row[0] for row in conn.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
         ).fetchall()
     }
-    assert "krs_document_versions" in tables
-    # Legacy table should not be created by _init_schema anymore
-    # (may still exist in production until DROP TABLE is run)
+    assert "krs_documents" in tables
+    assert "krs_document_downloads" in tables
+    assert "krs_document_versions" not in tables
+    assert "krs_entities" not in tables

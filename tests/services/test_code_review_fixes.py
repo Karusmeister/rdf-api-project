@@ -122,7 +122,8 @@ class TestSharedConnection:
             ).fetchall()
         }
         assert "krs_companies" in tables
-        assert "krs_document_versions" in tables
+        assert "krs_documents" in tables
+        assert "krs_document_downloads" in tables
         assert "financial_reports" in tables
         assert "computed_features" in tables
 
@@ -495,8 +496,8 @@ class TestScraperDDL:
         expected = [
             "idx_krs_companies_last_checked",
             "idx_krs_companies_priority",
-            "idx_krs_doc_versions_doc_current",
-            "idx_doc_versions_current_krs",
+            "idx_documents_krs",
+            "idx_downloads_pending",
             "idx_runs_started",
         ]
         for idx_name in expected:

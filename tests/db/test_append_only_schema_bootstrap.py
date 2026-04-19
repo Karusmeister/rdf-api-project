@@ -55,14 +55,15 @@ class TestDDLPresence:
         }
         assert "krs_companies" in tables
 
-    def test_krs_document_versions_table_exists(self):
+    def test_krs_documents_tables_exist(self):
         conn = db_conn.get_conn()
         tables = {
             row[0] for row in conn.execute(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
             ).fetchall()
         }
-        assert "krs_document_versions" in tables
+        assert "krs_documents" in tables
+        assert "krs_document_downloads" in tables
 
     def test_etl_attempts_table_exists(self):
         conn = db_conn.get_conn()
