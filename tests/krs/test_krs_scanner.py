@@ -123,16 +123,15 @@ async def test_scan_discovers_valid_entity():
     assert summary["probed_count"] == 5
     assert summary["error_count"] == 0
 
-    # Entity was written to krs_entities
+    # Entity was written to krs_companies (single unified table post-dedupe).
     entity = krs_repo.get_entity("0000000001")
     assert entity is not None
     assert entity["name"] == "SCANNER TEST SP. Z O.O."
     assert entity["source"] == "ms_gov_scan"
 
-    # Entity was also written to krs_registry
     conn = scraper_db.get_conn()
     reg = conn.execute(
-        "SELECT company_name FROM krs_registry WHERE krs = '0000000001'"
+        "SELECT name FROM krs_companies WHERE krs = '0000000001'"
     ).fetchone()
     assert reg is not None
     assert reg[0] == "SCANNER TEST SP. Z O.O."

@@ -51,7 +51,6 @@ def test_upsert_entity_insert():
     assert entity["address_city"] == "GDANSK"
     assert entity["address_street"] == "UL. MYSLIWSKA"
     assert entity["address_postal_code"] == "80-175"
-    assert entity["raw"] == {"foo": "bar"}
     assert entity["source"] == "ms_gov"
 
 
@@ -84,15 +83,7 @@ def test_upsert_from_krs_entity():
     assert row["nip"] == "5842734981"
     assert row["address_street"] == "UL. MYSLIWSKA"
     assert row["address_postal_code"] == "80-175"
-    assert row["raw"] == {"odpis": {}}
-
-
-def test_upsert_entity_preserves_empty_raw_dict():
-    krs_repo.upsert_entity(krs="0000000001", name="Test Corp", raw={})
-
-    entity = krs_repo.get_entity("0000000001")
-    assert entity is not None
-    assert entity["raw"] == {}
+    # Post-dedupe: upstream payload (``raw``) is no longer persisted.
 
 
 # ---------------------------------------------------------------------------
@@ -104,15 +95,15 @@ def test_get_entity_not_found():
     assert krs_repo.get_entity("9999999999") is None
 
 
-def test_connect_creates_entity_versions_table():
-    """DB-003: Legacy krs_entities table removed. Verify version table exists."""
+def test_connect_creates_krs_companies_table():
+    """Post-dedupe: a single krs_companies table replaces version history."""
     conn = db_conn.get_conn()
     tables = {
         row[0] for row in conn.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
         ).fetchall()
     }
-    assert "krs_entity_versions" in tables
+    assert "krs_companies" in tables
 
 
 # ---------------------------------------------------------------------------
@@ -260,55 +251,51 @@ def test_multiple_scan_runs_returns_latest():
 
 
 # ---------------------------------------------------------------------------
-# Append-only entity versioning (PR2)
+# krs_companies upsert semantics (post-dedupe; see SCHEMA_DEDUPE_PLAN #2)
 # ---------------------------------------------------------------------------
+#
+# Entity history was never exercised in production (current_rows == total_rows
+# on krs_entity_versions) so we deleted the versioning machinery entirely.
+# These tests now validate the plain-upsert contract against krs_companies.
 
 
-def _version_rows(krs: str):
+def _company_row(krs: str) -> dict | None:
     conn = db_conn.get_conn()
-    return conn.execute(
-        "SELECT * FROM krs_entity_versions WHERE krs = %s ORDER BY version_id",
-        [krs],
-    ).fetchall()
+    cur = conn.execute("SELECT * FROM krs_companies WHERE krs = %s", [krs])
+    row = cur.fetchone()
+    if row is None:
+        return None
+    cols = [d[0] for d in cur.description]
+    return dict(zip(cols, row))
 
 
-def _version_dicts(krs: str) -> list[dict]:
-    conn = db_conn.get_conn()
-    rows = conn.execute(
-        "SELECT * FROM krs_entity_versions WHERE krs = %s ORDER BY version_id",
-        [krs],
-    ).fetchall()
-    cols = [d[0] for d in conn.execute("SELECT * FROM krs_entity_versions LIMIT 0").description]
-    return [dict(zip(cols, r)) for r in rows]
+def test_upsert_creates_row():
+    """First upsert inserts a single krs_companies row."""
+    krs_repo.upsert_entity(krs="0000000010", name="Company Corp")
+    row = _company_row("0000000010")
+    assert row is not None
+    assert row["name"] == "Company Corp"
+    assert row["is_active"] is True
 
 
-def test_upsert_creates_version():
-    """First upsert should create exactly one version row."""
-    krs_repo.upsert_entity(krs="0000000010", name="Version Corp")
-    versions = _version_dicts("0000000010")
-    assert len(versions) == 1
-    assert versions[0]["is_current"] is True
-    assert versions[0]["valid_to"] is None
-
-
-def test_different_snapshots_create_two_versions():
-    """Two different snapshots should produce two version rows."""
+def test_upsert_overwrites_changed_fields():
+    """A second upsert should overwrite the row in place."""
     krs_repo.upsert_entity(krs="0000000011", name="Name A", nip="1111111111")
     krs_repo.upsert_entity(krs="0000000011", name="Name B", nip="2222222222")
-    versions = _version_dicts("0000000011")
-    assert len(versions) == 2
-    # Only the latest is current
-    current_versions = [v for v in versions if v["is_current"]]
-    assert len(current_versions) == 1
-    assert current_versions[0]["name"] == "Name B"
-    # Old version is closed
-    old = [v for v in versions if not v["is_current"]]
-    assert len(old) == 1
-    assert old[0]["valid_to"] is not None
+
+    conn = db_conn.get_conn()
+    count = conn.execute(
+        "SELECT count(*) FROM krs_companies WHERE krs = %s", ["0000000011"]
+    ).fetchone()[0]
+    assert count == 1
+
+    row = _company_row("0000000011")
+    assert row["name"] == "Name B"
+    assert row["nip"] == "2222222222"
 
 
-def test_identical_snapshot_no_new_version():
-    """Same snapshot twice should NOT create a second version."""
+def test_upsert_is_idempotent_on_identical_payload():
+    """Upserting the same snapshot twice leaves exactly one row."""
     krs_repo.upsert_entity(
         krs="0000000012", name="Stable Corp", legal_form="SA",
         raw={"key": "value"},
@@ -317,24 +304,15 @@ def test_identical_snapshot_no_new_version():
         krs="0000000012", name="Stable Corp", legal_form="SA",
         raw={"key": "value"},
     )
-    versions = _version_dicts("0000000012")
-    assert len(versions) == 1
-    assert versions[0]["is_current"] is True
+    conn = db_conn.get_conn()
+    count = conn.execute(
+        "SELECT count(*) FROM krs_companies WHERE krs = %s", ["0000000012"]
+    ).fetchone()[0]
+    assert count == 1
 
 
-def test_only_one_current_per_krs_after_multiple_changes():
-    """After several changes, exactly one version should be current."""
-    for i in range(5):
-        krs_repo.upsert_entity(krs="0000000013", name=f"Name {i}")
-    versions = _version_dicts("0000000013")
-    assert len(versions) == 5
-    current = [v for v in versions if v["is_current"]]
-    assert len(current) == 1
-    assert current[0]["name"] == "Name 4"
-
-
-def test_version_appears_in_current_view():
-    """get_entity reads from krs_entities_current view, backed by versions."""
+def test_get_entity_returns_current_row():
+    """get_entity reads straight from krs_companies."""
     krs_repo.upsert_entity(krs="0000000014", name="View Corp", nip="9999999999")
     entity = krs_repo.get_entity("0000000014")
     assert entity is not None
@@ -342,16 +320,15 @@ def test_version_appears_in_current_view():
     assert entity["nip"] == "9999999999"
 
 
-def test_count_entities_uses_current_view():
-    """count_entities should count distinct current entities, not version rows."""
+def test_count_entities_counts_rows():
     krs_repo.upsert_entity(krs="0000000015", name="A")
-    krs_repo.upsert_entity(krs="0000000015", name="B")  # version 2, same krs
+    krs_repo.upsert_entity(krs="0000000015", name="B")  # same KRS, overwrites
     krs_repo.upsert_entity(krs="0000000016", name="C")
     assert krs_repo.count_entities() == 2
 
 
-def test_list_stale_uses_current_view():
-    """list_stale should work against krs_entities_current."""
+def test_list_stale_uses_synced_at():
+    """list_stale returns rows where synced_at < threshold."""
     krs_repo.upsert_entity(krs="0000000017", name="Stale Corp")
     far_future = datetime(2099, 1, 1, tzinfo=timezone.utc)
     stale = krs_repo.list_stale(far_future)

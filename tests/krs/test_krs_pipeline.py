@@ -110,8 +110,8 @@ def _mock_krs_api():
             f"https://api-krs.ms.gov.pl/api/krs/OdpisAktualny/{krs_num}"
         ).mock(return_value=httpx.Response(200, json=payload))
 
-    # Unknown KRS → 404
-    respx.get(url__regex=r".*/OdpisAktualny/\d{10}$").mock(
+    # Unknown KRS → 404 (path has query params appended by the adapter)
+    respx.get(url__regex=r".*/OdpisAktualny/\d{10}(\?.*)?$").mock(
         return_value=httpx.Response(404, json={"status": 404})
     )
 
@@ -166,13 +166,17 @@ async def _setup(monkeypatch, pg_dsn, clean_pg):
 
 
 def _seed_registry(*krs_numbers: str):
-    """Insert KRS numbers into krs_registry for discovery."""
+    """Insert KRS numbers into krs_companies (post-dedupe entity table).
+
+    Uses ``source='rdf_batch'`` so the sync-job discovery query picks them up.
+    """
     conn = scraper_db.get_conn()
     now = datetime.now(timezone.utc).isoformat()
     for krs in krs_numbers:
         conn.execute(
-            "INSERT INTO krs_registry (krs, first_seen_at) VALUES (%s, %s) ON CONFLICT (krs) DO NOTHING",
-            [krs, now],
+            "INSERT INTO krs_companies (krs, name, source, first_seen_at, synced_at) "
+            "VALUES (%s, '', 'rdf_batch', %s, %s) ON CONFLICT (krs) DO NOTHING",
+            [krs, now, now],
         )
 
 
@@ -238,10 +242,10 @@ async def test_stale_entity_re_enrichment(monkeypatch):
     await krs_sync.run_sync()
     assert krs_repo.count_entities() == 1
 
-    # Artificially age the entity's synced_at on the append-only version table
+    # Artificially age synced_at so the stale-re-enrichment criterion fires.
     conn = db_conn.get_conn()
     old_ts = (datetime.now(timezone.utc) - timedelta(hours=200)).isoformat()
-    conn.execute("UPDATE krs_entity_versions SET valid_from = %s WHERE krs = %s AND is_current = true", [old_ts, "0000694720"])
+    conn.execute("UPDATE krs_companies SET synced_at = %s WHERE krs = %s", [old_ts, "0000694720"])
 
     # Second run: should re-enrich the stale entity
     second = await krs_sync.run_sync()
@@ -256,14 +260,22 @@ async def test_stale_entity_re_enrichment(monkeypatch):
 @respx.mock
 @pytest.mark.asyncio
 async def test_upstream_404_not_found():
-    """KRS number unknown to upstream is skipped without error."""
+    """KRS number unknown to upstream is skipped without error.
+
+    Post-dedupe the scanner stage creates the krs_companies row with
+    source='rdf_batch'; a 404 at sync means we simply don't promote it to
+    source='ms_gov'. The row count therefore stays at 1 (the seed) but
+    neither new_count nor error_count should move.
+    """
     _mock_krs_api()
     _seed_registry("9999999999")
 
     summary = await krs_sync.run_sync()
     assert summary["new_count"] == 0
     assert summary["error_count"] == 0
-    assert krs_repo.count_entities() == 0
+    entity = krs_repo.get_entity("9999999999")
+    assert entity is not None
+    assert entity["source"] == "rdf_batch"
 
 
 @respx.mock

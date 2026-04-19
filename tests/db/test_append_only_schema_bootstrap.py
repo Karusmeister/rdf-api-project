@@ -17,7 +17,11 @@ from app.scraper import db as scraper_db
 
 @pytest.fixture(autouse=True)
 def isolated_db(pg_dsn, clean_pg):
-    """Isolated PostgreSQL schema for each test."""
+    """Isolated PostgreSQL schema for each test.
+
+    clean_pg depends on pg_schema_initialized which has already run the full
+    bootstrap + dedupe migrations once per session, so krs_companies exists.
+    """
     db_conn.reset()
     krs_repo._schema_initialized = False
     scraper_db._schema_initialized = False
@@ -36,18 +40,20 @@ def isolated_db(pg_dsn, clean_pg):
 
 
 # ---------------------------------------------------------------------------
-# DDL presence
+# DDL presence (post-dedupe SCHEMA_DEDUPE_PLAN #2: entity history collapsed
+# into krs_companies; doc history still lives on krs_document_versions until
+# SCHEMA_DEDUPE_PLAN #1 lands).
 # ---------------------------------------------------------------------------
 
 class TestDDLPresence:
-    def test_krs_entity_versions_table_exists(self):
+    def test_krs_companies_table_exists(self):
         conn = db_conn.get_conn()
         tables = {
             row[0] for row in conn.execute(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
             ).fetchall()
         }
-        assert "krs_entity_versions" in tables
+        assert "krs_companies" in tables
 
     def test_krs_document_versions_table_exists(self):
         conn = db_conn.get_conn()
@@ -66,12 +72,6 @@ class TestDDLPresence:
             ).fetchall()
         }
         assert "etl_attempts" in tables
-
-    def test_krs_entities_current_view_exists(self):
-        conn = db_conn.get_conn()
-        # View should be queryable even when empty
-        rows = conn.execute("SELECT * FROM krs_entities_current").fetchall()
-        assert rows == []
 
     def test_krs_documents_current_view_exists(self):
         conn = db_conn.get_conn()

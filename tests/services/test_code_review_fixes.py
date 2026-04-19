@@ -121,7 +121,7 @@ class TestSharedConnection:
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
             ).fetchall()
         }
-        assert "krs_registry" in tables
+        assert "krs_companies" in tables
         assert "krs_document_versions" in tables
         assert "financial_reports" in tables
         assert "computed_features" in tables
@@ -493,8 +493,8 @@ class TestScraperDDL:
             ).fetchall()
         }
         expected = [
-            "idx_registry_last_checked",
-            "idx_registry_priority",
+            "idx_krs_companies_last_checked",
+            "idx_krs_companies_priority",
             "idx_krs_doc_versions_doc_current",
             "idx_doc_versions_current_krs",
             "idx_runs_started",

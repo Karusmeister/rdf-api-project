@@ -29,28 +29,35 @@ def test_schema_creation():
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
         ).fetchall()
     }
-    assert "krs_registry" in tables
+    # krs_companies is created by the dedupe/003 migration, applied via conftest.
+    assert "krs_companies" in tables
     assert "krs_document_versions" in tables
     assert "scraper_runs" in tables
 
 
 def test_upsert_krs():
-    # Insert
     scraper_db.upsert_krs("0000694720", "ACME SP. Z O.O.", "SP. Z O.O.", True)
     conn = scraper_db.get_conn()
-    row = conn.execute("SELECT * FROM krs_registry WHERE krs = '0000694720'").fetchone()
+    row = conn.execute(
+        "SELECT name, legal_form, is_active FROM krs_companies WHERE krs = '0000694720'"
+    ).fetchone()
     assert row is not None
-    assert row[1] == "ACME SP. Z O.O."
+    assert row[0] == "ACME SP. Z O.O."
 
-    # Update same KRS - name changes, is_active goes false
+    # Update same KRS — name changes, is_active flips false.
     scraper_db.upsert_krs("0000694720", "NEW NAME", None, False)
-    row = conn.execute("SELECT company_name, is_active FROM krs_registry WHERE krs = '0000694720'").fetchone()
+    row = conn.execute(
+        "SELECT name, is_active FROM krs_companies WHERE krs = '0000694720'"
+    ).fetchone()
     assert row[0] == "NEW NAME"
     assert row[1] is False
 
-    # Upsert with None name keeps existing name
+    # Upsert with empty-string name preserves the existing name
+    # (upsert_krs normalises None → '' at the write boundary).
     scraper_db.upsert_krs("0000694720", None, None, True)
-    row = conn.execute("SELECT company_name FROM krs_registry WHERE krs = '0000694720'").fetchone()
+    row = conn.execute(
+        "SELECT name FROM krs_companies WHERE krs = '0000694720'"
+    ).fetchone()
     assert row[0] == "NEW NAME"
 
 
@@ -120,8 +127,8 @@ def test_ordering_strategies():
     conn = scraper_db.get_conn()
     for krs, priority, last_checked in entries:
         conn.execute("""
-            INSERT INTO krs_registry (krs, is_active, check_priority, last_checked_at, first_seen_at)
-            VALUES (%s, true, %s, %s, %s)
+            INSERT INTO krs_companies (krs, name, is_active, check_priority, last_checked_at, first_seen_at)
+            VALUES (%s, '', true, %s, %s, %s)
         """, [krs, priority, last_checked, now])
 
     # priority_then_oldest: highest priority first, then oldest last_checked (NULLs first)
@@ -156,8 +163,8 @@ def test_error_backoff():
     now = datetime.now(timezone.utc)
     # KRS with high error count, checked very recently
     conn.execute("""
-        INSERT INTO krs_registry (krs, is_active, check_error_count, last_checked_at, first_seen_at)
-        VALUES ('0000099999', true, 5, %s, %s)
+        INSERT INTO krs_companies (krs, name, is_active, check_error_count, last_checked_at, first_seen_at)
+        VALUES ('0000099999', '', true, 5, %s, %s)
     """, [now, now])
 
     results = scraper_db.get_krs_to_check("sequential", 100, 24)
@@ -194,7 +201,7 @@ def test_stats():
     # Simulate checked state for 0000111111
     conn = scraper_db.get_conn()
     conn.execute("""
-        UPDATE krs_registry SET last_checked_at = NOW(), total_documents = 3, total_downloaded = 2
+        UPDATE krs_companies SET last_checked_at = NOW(), total_documents = 3, total_downloaded = 2
         WHERE krs = '0000111111'
     """)
 

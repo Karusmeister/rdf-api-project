@@ -337,7 +337,8 @@ async def _worker_loop_inner(
                     if rotator:
                         rotator.record_success()
 
-                # Store entity in krs_entities + krs_registry
+                # Store discovered entity in krs_companies (one row covers
+                # both what used to be entity + registry, post dedupe).
                 if result == "found" and entity_data:
                     try:
                         podmiot = entity_data.get("podmiot") or {}

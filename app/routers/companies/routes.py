@@ -110,13 +110,13 @@ def search_companies(
         rows = conn.execute("""
             SELECT
                 kr.krs,
-                kr.company_name AS name,
+                kr.name AS name,
                 c.nip,
                 c.pkd_code,
                 kr.legal_form,
                 CASE WHEN kr.is_active THEN 'active' ELSE 'inactive' END AS status,
                 EXISTS(SELECT 1 FROM predictions p WHERE p.krs = kr.krs LIMIT 1) AS has_predictions
-            FROM krs_registry kr
+            FROM krs_companies kr
             LEFT JOIN companies c ON c.krs = kr.krs
             WHERE kr.krs LIKE %s
             ORDER BY c.krs IS NOT NULL DESC, kr.krs
@@ -124,7 +124,7 @@ def search_companies(
         """, [like_pattern, limit]).fetchall()
 
         count_row = conn.execute(
-            "SELECT COUNT(*) FROM krs_registry WHERE krs LIKE %s",
+            "SELECT COUNT(*) FROM krs_companies WHERE krs LIKE %s",
             [like_pattern],
         ).fetchone()
     else:
@@ -132,22 +132,22 @@ def search_companies(
         rows = conn.execute("""
             SELECT
                 kr.krs,
-                kr.company_name AS name,
+                kr.name AS name,
                 c.nip,
                 c.pkd_code,
                 kr.legal_form,
                 CASE WHEN kr.is_active THEN 'active' ELSE 'inactive' END AS status,
                 EXISTS(SELECT 1 FROM predictions p WHERE p.krs = kr.krs LIMIT 1) AS has_predictions
-            FROM krs_registry kr
+            FROM krs_companies kr
             LEFT JOIN companies c ON c.krs = kr.krs
-            WHERE kr.company_name ILIKE %s
+            WHERE kr.name ILIKE %s
             ORDER BY
                 c.krs IS NOT NULL DESC,
                 CASE
-                    WHEN kr.company_name ILIKE %s THEN 1
+                    WHEN kr.name ILIKE %s THEN 1
                     ELSE 2
                 END,
-                kr.company_name
+                kr.name
             LIMIT %s
         """, ['%' + query + '%', query + '%', limit]).fetchall()
 
@@ -158,17 +158,17 @@ def search_companies(
                 fuzzy_rows = conn.execute("""
                 SELECT
                     kr.krs,
-                    kr.company_name AS name,
+                    kr.name AS name,
                     c.nip,
                     c.pkd_code,
                     kr.legal_form,
                     CASE WHEN kr.is_active THEN 'active' ELSE 'inactive' END AS status,
                     EXISTS(SELECT 1 FROM predictions p WHERE p.krs = kr.krs LIMIT 1) AS has_predictions
-                FROM krs_registry kr
+                FROM krs_companies kr
                 LEFT JOIN companies c ON c.krs = kr.krs
-                WHERE word_similarity(%s, kr.company_name) > 0.15
-                  AND kr.company_name NOT ILIKE %s
-                ORDER BY word_similarity(%s, kr.company_name) DESC, kr.company_name
+                WHERE word_similarity(%s, kr.name) > 0.15
+                  AND kr.name NOT ILIKE %s
+                ORDER BY word_similarity(%s, kr.name) DESC, kr.name
                 LIMIT %s
             """, [query, '%' + query + '%', query, limit - len(rows)]).fetchall()
                 rows = list(rows) + list(fuzzy_rows)
@@ -176,7 +176,7 @@ def search_companies(
                 pass  # pg_trgm not available or query error — ILIKE results are sufficient
 
         count_row = conn.execute(
-            "SELECT COUNT(*) FROM krs_registry WHERE company_name ILIKE %s",
+            "SELECT COUNT(*) FROM krs_companies WHERE name ILIKE %s",
             ['%' + query + '%'],
         ).fetchone()
 
@@ -196,12 +196,12 @@ def popular_companies() -> PopularCompaniesResponse:
     """Return the top 10 most-clicked KRS numbers from search results in the last 30 days."""
     conn = db_conn.get_conn()
     rows = conn.execute("""
-        SELECT sl.clicked_krs, kr.company_name, COUNT(*) AS click_count
+        SELECT sl.clicked_krs, kr.name, COUNT(*) AS click_count
         FROM search_log sl
         JOIN krs_registry kr ON kr.krs = sl.clicked_krs
         WHERE sl.clicked_krs IS NOT NULL
           AND sl.created_at >= current_timestamp - interval '30 days'
-        GROUP BY sl.clicked_krs, kr.company_name
+        GROUP BY sl.clicked_krs, kr.name
         ORDER BY click_count DESC
         LIMIT 10
     """).fetchall()

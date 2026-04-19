@@ -107,7 +107,7 @@ class RdfProgressStore:
         been processed yet, partitioned by worker_id modulo total_workers.
 
         If *legal_forms* is provided, only KRS numbers whose entity has a
-        matching legal_form in krs_entity_versions are returned.
+        matching legal_form in krs_companies are returned.
 
         Returns zero-padded 10-char KRS strings.
         """
@@ -116,15 +116,14 @@ class RdfProgressStore:
                 rows = conn.execute("""
                     SELECT LPAD(CAST(bp.krs AS VARCHAR), 10, '0') AS krs_str
                     FROM batch_progress bp
-                    JOIN krs_entity_versions ev
-                        ON LPAD(CAST(bp.krs AS VARCHAR), 10, '0') = ev.krs
-                        AND ev.is_current = true
+                    JOIN krs_companies c
+                        ON LPAD(CAST(bp.krs AS VARCHAR), 10, '0') = c.krs
                     LEFT JOIN batch_rdf_progress rp
                         ON LPAD(CAST(bp.krs AS VARCHAR), 10, '0') = rp.krs
                     WHERE bp.status = 'found'
                       AND rp.krs IS NULL
                       AND bp.krs %% %s = %s
-                      AND ev.legal_form = ANY(%s)
+                      AND c.legal_form = ANY(%s)
                     ORDER BY bp.krs
                 """, [total_workers, worker_id, legal_forms]).fetchall()
             else:

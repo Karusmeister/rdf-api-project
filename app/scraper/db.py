@@ -51,30 +51,12 @@ def _ensure_schema() -> None:
 
 
 def _init_schema() -> None:
-    """Create tables if they don't exist. Idempotent."""
+    """Create tables if they don't exist. Idempotent.
+
+    Post-dedupe: krs_registry is gone — scraper scheduling columns live on
+    krs_companies (created by dedupe/003).
+    """
     conn = get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS krs_registry (
-            krs                 VARCHAR(10) PRIMARY KEY,
-            company_name        VARCHAR,
-            legal_form          VARCHAR,
-            is_active           BOOLEAN DEFAULT true,
-
-            first_seen_at       TIMESTAMP NOT NULL,
-            last_checked_at     TIMESTAMP,
-            last_download_at    TIMESTAMP,
-
-            check_priority      INTEGER DEFAULT 0,
-            check_error_count   INTEGER DEFAULT 0,
-            last_error_message  VARCHAR,
-
-            total_documents     INTEGER DEFAULT 0,
-            total_downloaded    INTEGER DEFAULT 0
-        )
-    """)
-
-    # DB-003: Legacy krs_documents table removed.
-    # All reads go through krs_documents_current view on krs_document_versions.
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scraper_runs (
@@ -177,10 +159,12 @@ def _init_schema() -> None:
         ).fetchall()
     }
 
+    # Scraper-scheduling indexes on krs_companies are created by dedupe/003
+    # (idx_krs_companies_last_checked, idx_krs_companies_priority). We don't
+    # recreate them here because krs_companies lives in that migration and
+    # may not exist when _init_schema() runs on a fresh DB (startup order:
+    # schema bootstrap → migrations).
     index_defs = [
-        ("idx_registry_last_checked", "CREATE INDEX idx_registry_last_checked ON krs_registry(last_checked_at)"),
-        ("idx_registry_priority", "CREATE INDEX idx_registry_priority ON krs_registry(check_priority DESC, last_checked_at ASC)"),
-        # DB-003: idx_documents_krs and idx_documents_not_downloaded removed (legacy krs_documents table dropped)
         ("idx_runs_started", "CREATE INDEX idx_runs_started ON scraper_runs(started_at DESC)"),
         ("idx_krs_doc_versions_doc_current", "CREATE INDEX idx_krs_doc_versions_doc_current ON krs_document_versions(document_id, is_current)"),
         # DB-005: Partial index — only indexes ~857K current rows instead of all 1.9M
@@ -341,21 +325,26 @@ def _append_document_version_if_changed(
 # ---------------------------------------------------------------------------
 
 def upsert_krs(krs: str, company_name: Optional[str], legal_form: Optional[str], is_active: bool) -> None:
-    """Insert or update a KRS in the registry."""
+    """Insert or update a KRS company. Scheduling fields live on krs_companies.
+
+    ``name`` is NOT NULL, so we coerce None → '' for the INSERT path. On
+    update we treat '' as "no information" via NULLIF so successive calls
+    that pass None preserve the current name instead of blanking it.
+    """
     conn = get_conn()
     now = datetime.now(timezone.utc)
     conn.execute("""
-        INSERT INTO krs_registry (krs, company_name, legal_form, is_active, first_seen_at)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO krs_companies (krs, name, legal_form, is_active, first_seen_at, synced_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (krs) DO UPDATE SET
-            company_name = COALESCE(excluded.company_name, krs_registry.company_name),
-            legal_form   = COALESCE(excluded.legal_form,   krs_registry.legal_form),
-            is_active    = excluded.is_active
-    """, [krs, company_name, legal_form, is_active, now])
+            name       = COALESCE(NULLIF(excluded.name, ''), krs_companies.name),
+            legal_form = COALESCE(excluded.legal_form, krs_companies.legal_form),
+            is_active  = excluded.is_active
+    """, [krs, company_name or "", legal_form, is_active, now, now])
 
 
 def get_krs_to_check(strategy: str, limit: int, error_backoff_hours: int) -> list[dict]:
-    """Return KRS entries to check, ordered by strategy. Skip recently-errored ones."""
+    """Return KRS companies to check, ordered by strategy. Skip recently-errored ones."""
     conn = get_conn()
 
     order_clause = {
@@ -367,9 +356,9 @@ def get_krs_to_check(strategy: str, limit: int, error_backoff_hours: int) -> lis
     }.get(strategy, "ORDER BY check_priority DESC, last_checked_at ASC NULLS FIRST")
 
     rows = conn.execute(f"""
-        SELECT krs, company_name, legal_form, is_active,
+        SELECT krs, name, legal_form, is_active,
                check_priority, check_error_count, last_checked_at, last_error_message
-        FROM krs_registry
+        FROM krs_companies
         WHERE is_active = true
           AND NOT (
               check_error_count >= %s
@@ -531,12 +520,12 @@ def mark_downloaded(
 
 
 def update_krs_checked(krs: str, total_docs: int, total_downloaded: int, error: Optional[str] = None) -> None:
-    """Update krs_registry after checking a KRS. Resets or increments error count."""
+    """Update krs_companies scheduling columns after checking a KRS."""
     conn = get_conn()
     now = datetime.now(timezone.utc)
     if error:
         conn.execute("""
-            UPDATE krs_registry SET
+            UPDATE krs_companies SET
                 last_checked_at     = %s,
                 check_error_count   = check_error_count + 1,
                 last_error_message  = %s
@@ -544,7 +533,7 @@ def update_krs_checked(krs: str, total_docs: int, total_downloaded: int, error: 
         """, [now, error, krs])
     else:
         conn.execute("""
-            UPDATE krs_registry SET
+            UPDATE krs_companies SET
                 last_checked_at     = %s,
                 last_download_at    = %s,
                 check_error_count   = 0,
@@ -605,7 +594,7 @@ def get_stats() -> dict:
             count(*) FILTER (WHERE check_error_count > 0)              AS with_errors,
             coalesce(sum(total_documents), 0)                          AS total_documents,
             coalesce(sum(total_downloaded), 0)                         AS total_downloaded
-        FROM krs_registry
+        FROM krs_companies
     """).fetchone()
     cols = ["total_krs", "krs_checked", "krs_unchecked", "krs_with_errors",
             "total_documents", "total_downloaded"]

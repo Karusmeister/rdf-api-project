@@ -1,18 +1,17 @@
 """PostgreSQL repository for KRS entity data and sync logging.
 
-Tables are created via _init_schema() at app startup. Company-level address
-fields used by the adapter contract are stored in columns; sensitive personal
-data stays only in the ``raw`` JSON payload.
+Post-dedupe (SCHEMA_DEDUPE_PLAN #2) there is a single ``krs_companies``
+table — no version history, no separate registry. Prior code carried an
+append-only ``krs_entity_versions`` table, but production had zero historical
+rows on it, so the versioning machinery was pure overhead.
 
-Entity writes use an append-only pattern: each change creates a new version
-in ``krs_entity_versions``. The ``krs_entities`` table is kept as a legacy
-cache and the ``krs_entities_current`` view provides the read path.
+Tables are created via ``_init_schema()`` at app startup for the bookkeeping
+state (``krs_sync_log``, ``krs_scan_cursor``, ``krs_scan_runs``).
+The ``krs_companies`` table itself comes from the dedupe/003 migration.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -30,7 +29,7 @@ _schema_initialized = False
 
 
 def connect() -> None:
-    """Ensure shared connection is open and KRS entity schema exists."""
+    """Ensure shared connection is open and KRS bookkeeping schema exists."""
     shared_conn.connect()
     _ensure_schema()
     _close_orphaned_runs()
@@ -52,66 +51,9 @@ def _ensure_schema() -> None:
 def _init_schema() -> None:
     conn = get_conn()
 
-    # DB-003: Legacy krs_entities table removed.
-    # All reads go through krs_entities_current view on krs_entity_versions.
-
-    # --- Append-only version history for KRS entities ---
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS seq_krs_entity_versions START 1
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS krs_entity_versions (
-            version_id           BIGINT PRIMARY KEY DEFAULT nextval('seq_krs_entity_versions'),
-            krs                  VARCHAR(10) NOT NULL,
-            name                 VARCHAR NOT NULL,
-            legal_form           VARCHAR,
-            status               VARCHAR,
-            registered_at        DATE,
-            last_changed_at      DATE,
-            nip                  VARCHAR(13),
-            regon                VARCHAR(14),
-            address_city         VARCHAR,
-            address_street       VARCHAR,
-            address_postal_code  VARCHAR,
-            raw                  JSON,
-            source               VARCHAR NOT NULL,
-
-            valid_from           TIMESTAMP NOT NULL,
-            valid_to             TIMESTAMP,
-            is_current           BOOLEAN NOT NULL DEFAULT true,
-            snapshot_hash        VARCHAR NOT NULL,
-            change_reason        VARCHAR,
-            observed_at          TIMESTAMP NOT NULL DEFAULT current_timestamp
-        )
-    """)
-
-    # Indexes for krs_entity_versions
-    existing_idx = {
-        row[0] for row in conn.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'public'").fetchall()
-    }
-    for idx_name, idx_sql in [
-        ("idx_krs_entity_versions_krs", "CREATE INDEX idx_krs_entity_versions_krs ON krs_entity_versions(krs)"),
-        # DB-004: idx_krs_entity_versions_current and idx_krs_entity_versions_valid_from removed (0 scans in production)
-        # DB-005: Partial index — only indexes current rows
-        ("idx_entity_versions_current_krs", "CREATE INDEX idx_entity_versions_current_krs ON krs_entity_versions(krs) WHERE is_current = true"),
-    ]:
-        if idx_name not in existing_idx:
-            conn.execute(idx_sql)
-
-    # DB-002: Simplified view — is_current is already maintained by the
-    # application (exactly one row per krs).  Removing the ROW_NUMBER()
-    # window function lets PostgreSQL push WHERE krs = ... filters into
-    # the base table via index scan.
-    conn.execute("""
-        CREATE OR REPLACE VIEW krs_entities_current AS
-        SELECT
-            krs, name, legal_form, status, registered_at, last_changed_at,
-            nip, regon, address_city, address_street, address_postal_code,
-            raw, source, valid_from AS synced_at
-        FROM krs_entity_versions
-        WHERE is_current = true
-    """)
+    # The authoritative krs_companies table is created by dedupe/003. We do
+    # NOT redeclare it here; that way a rollback of the migration surfaces
+    # cleanly (no silent table re-creation).
 
     conn.execute("""
         CREATE SEQUENCE IF NOT EXISTS seq_krs_sync_log START 1
@@ -139,7 +81,6 @@ def _init_schema() -> None:
             updated_at  TIMESTAMP NOT NULL DEFAULT current_timestamp
         )
     """)
-    # Seed the single-row cursor if it doesn't exist
     conn.execute("""
         INSERT INTO krs_scan_cursor (id, next_krs_int) VALUES (TRUE, 1)
         ON CONFLICT DO NOTHING
@@ -206,134 +147,7 @@ def _close_orphaned_runs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Append-only versioning helpers
-# ---------------------------------------------------------------------------
-
-# Columns included in the canonical snapshot for hash comparison.
-_ENTITY_SNAPSHOT_FIELDS = (
-    "name", "legal_form", "status", "registered_at", "last_changed_at",
-    "nip", "regon", "address_city", "address_street", "address_postal_code",
-    "raw",
-)
-
-
-def _normalize_entity_snapshot(
-    name: str,
-    *,
-    legal_form: str | None = None,
-    status: str | None = None,
-    registered_at: Any = None,
-    last_changed_at: Any = None,
-    nip: str | None = None,
-    regon: str | None = None,
-    address_city: str | None = None,
-    address_street: str | None = None,
-    address_postal_code: str | None = None,
-    raw: dict | None = None,
-) -> dict:
-    """Build a canonical dict from entity fields (deterministic key order)."""
-    return {
-        "name": name,
-        "legal_form": legal_form,
-        "status": status,
-        "registered_at": str(registered_at) if registered_at is not None else None,
-        "last_changed_at": str(last_changed_at) if last_changed_at is not None else None,
-        "nip": nip,
-        "regon": regon,
-        "address_city": address_city,
-        "address_street": address_street,
-        "address_postal_code": address_postal_code,
-        "raw": raw,
-    }
-
-
-def _entity_snapshot_hash(snapshot: dict) -> str:
-    """Compute a deterministic hash of an entity snapshot."""
-    canonical = json.dumps(snapshot, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.md5(canonical.encode()).hexdigest()
-
-
-def _append_entity_version_if_changed(
-    conn,
-    krs: str,
-    snapshot: dict,
-    snapshot_hash: str,
-    source: str,
-    now: str,
-    raw_json: str | None,
-) -> bool:
-    """Compare hash with current version; append new version if changed.
-
-    The read-close-insert cycle is wrapped in a transaction to prevent
-    multi-current races.  Returns True if a new version was created.
-    """
-    conn.execute("BEGIN")
-    try:
-        current = conn.execute(
-            """
-            SELECT version_id, snapshot_hash
-            FROM krs_entity_versions
-            WHERE krs = %s AND is_current = true
-            ORDER BY valid_from DESC, version_id DESC
-            LIMIT 1
-            """,
-            [krs],
-        ).fetchone()
-
-        if current is not None and current[1] == snapshot_hash:
-            conn.execute(
-                "UPDATE krs_entity_versions SET observed_at = %s WHERE version_id = %s",
-                [now, current[0]],
-            )
-            conn.execute("COMMIT")
-            return False
-
-        if current is not None:
-            conn.execute(
-                """
-                UPDATE krs_entity_versions
-                SET valid_to = %s, is_current = false
-                WHERE version_id = %s AND is_current = true
-                """,
-                [now, current[0]],
-            )
-
-        conn.execute(
-            """
-            INSERT INTO krs_entity_versions
-                (krs, name, legal_form, status, registered_at, last_changed_at,
-                 nip, regon, address_city, address_street, address_postal_code,
-                 raw, source, valid_from, is_current, snapshot_hash, observed_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, %s, %s)
-            """,
-            [
-                krs,
-                snapshot["name"],
-                snapshot["legal_form"],
-                snapshot["status"],
-                snapshot["registered_at"],
-                snapshot["last_changed_at"],
-                snapshot["nip"],
-                snapshot["regon"],
-                snapshot["address_city"],
-                snapshot["address_street"],
-                snapshot["address_postal_code"],
-                raw_json,
-                source,
-                now,
-                snapshot_hash,
-                now,
-            ],
-        )
-        conn.execute("COMMIT")
-        return True
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-
-# ---------------------------------------------------------------------------
-# CRUD — krs_entities (append-only via krs_entity_versions)
+# CRUD — krs_companies (plain upsert; no versioning)
 # ---------------------------------------------------------------------------
 
 
@@ -350,32 +164,50 @@ def upsert_entity(
     address_city: str | None = None,
     address_street: str | None = None,
     address_postal_code: str | None = None,
-    raw: dict | None = None,
+    raw: dict | None = None,  # retained in the signature, no longer stored
     source: str = "ms_gov",
 ) -> None:
-    """Append-only upsert: creates a new version only if data changed."""
+    """Insert-or-update a company in krs_companies.
+
+    The ``raw`` kwarg is accepted for signature compatibility with callers
+    that still pass the upstream payload. It is intentionally not persisted
+    — the plan dropped the raw JSON column because ``raw.podmiot.*`` fully
+    duplicates the flat columns.
+    """
+    del raw  # unused — see docstring
     conn = get_conn()
-    raw_json = json.dumps(raw, ensure_ascii=False) if raw is not None else None
     now = datetime.now(timezone.utc).isoformat()
 
-    snapshot = _normalize_entity_snapshot(
-        name,
-        legal_form=legal_form,
-        status=status,
-        registered_at=registered_at,
-        last_changed_at=last_changed_at,
-        nip=nip,
-        regon=regon,
-        address_city=address_city,
-        address_street=address_street,
-        address_postal_code=address_postal_code,
-        raw=raw,
+    conn.execute(
+        """
+        INSERT INTO krs_companies (
+            krs, name, legal_form, status,
+            registered_at, last_changed_at, nip, regon,
+            address_city, address_street, address_postal_code,
+            source, synced_at, first_seen_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (krs) DO UPDATE SET
+            name                = EXCLUDED.name,
+            legal_form          = COALESCE(EXCLUDED.legal_form, krs_companies.legal_form),
+            status              = COALESCE(EXCLUDED.status, krs_companies.status),
+            registered_at       = COALESCE(EXCLUDED.registered_at, krs_companies.registered_at),
+            last_changed_at     = COALESCE(EXCLUDED.last_changed_at, krs_companies.last_changed_at),
+            nip                 = COALESCE(EXCLUDED.nip, krs_companies.nip),
+            regon               = COALESCE(EXCLUDED.regon, krs_companies.regon),
+            address_city        = COALESCE(EXCLUDED.address_city, krs_companies.address_city),
+            address_street      = COALESCE(EXCLUDED.address_street, krs_companies.address_street),
+            address_postal_code = COALESCE(EXCLUDED.address_postal_code, krs_companies.address_postal_code),
+            source              = EXCLUDED.source,
+            synced_at           = EXCLUDED.synced_at
+        """,
+        [
+            krs, name, legal_form, status,
+            registered_at, last_changed_at, nip, regon,
+            address_city, address_street, address_postal_code,
+            source, now, now,
+        ],
     )
-    snap_hash = _entity_snapshot_hash(snapshot)
-
-    _append_entity_version_if_changed(conn, krs, snapshot, snap_hash, source, now, raw_json)
-
-    # DB-003: Legacy krs_entities write removed.
 
 
 def upsert_from_krs_entity(entity, *, source: str = "ms_gov") -> None:
@@ -397,38 +229,41 @@ def upsert_from_krs_entity(entity, *, source: str = "ms_gov") -> None:
     )
 
 
+_ENTITY_COLUMNS = (
+    "krs", "name", "legal_form", "status",
+    "registered_at", "last_changed_at",
+    "nip", "regon", "address_city", "address_street", "address_postal_code",
+    "source", "synced_at",
+)
+
+
 def get_entity(krs: str) -> Optional[dict]:
-    """Fetch current entity from krs_entities_current view. Returns None if not found."""
+    """Fetch a company by KRS. Returns None if not found."""
     conn = get_conn()
-    result = conn.execute(
-        "SELECT * FROM krs_entities_current WHERE krs = %s", [krs]
+    cols = ", ".join(_ENTITY_COLUMNS)
+    row = conn.execute(
+        f"SELECT {cols} FROM krs_companies WHERE krs = %s", [krs]
     ).fetchone()
-    if result is None:
+    if row is None:
         return None
-    columns = [desc[0] for desc in conn.execute(
-        "SELECT column_name FROM information_schema.columns WHERE table_name = 'krs_entities_current' AND table_schema = 'public' ORDER BY ordinal_position"
-    ).fetchall()]
-    row = dict(zip(columns, result))
-    raw = row.get("raw")
-    if isinstance(raw, str):
-        row["raw"] = json.loads(raw)
-    return row
+    return dict(zip(_ENTITY_COLUMNS, row))
 
 
 def list_stale(older_than: datetime) -> list[dict]:
-    """Return entities not synced since ``older_than``."""
+    """Return companies not synced since ``older_than``."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT krs, name, synced_at FROM krs_entities_current WHERE synced_at < %s ORDER BY synced_at",
+        "SELECT krs, name, synced_at FROM krs_companies "
+        "WHERE synced_at < %s ORDER BY synced_at",
         [older_than.isoformat()],
     ).fetchall()
     return [{"krs": r[0], "name": r[1], "synced_at": r[2]} for r in rows]
 
 
 def count_entities() -> int:
-    """Return total unique entity count."""
+    """Return total company count."""
     conn = get_conn()
-    return conn.execute("SELECT count(*) FROM krs_entities_current").fetchone()[0]
+    return conn.execute("SELECT count(*) FROM krs_companies").fetchone()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +436,7 @@ def get_last_scan_run() -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# CRUD — krs_sync_log
+# Lookup — most recent sync
 # ---------------------------------------------------------------------------
 
 

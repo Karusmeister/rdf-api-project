@@ -45,7 +45,7 @@ def stats_overview(user: CurrentUser) -> StatsOverviewResponse:
     conn = get_conn()
 
     # KRS entities
-    entity_count = conn.execute("SELECT COUNT(*) FROM krs_registry").fetchone()[0]
+    entity_count = conn.execute("SELECT COUNT(*) FROM krs_companies").fetchone()[0]
     entities_with_docs = conn.execute(
         "SELECT COUNT(DISTINCT krs) FROM krs_documents_current"
     ).fetchone()[0]
@@ -136,7 +136,7 @@ def krs_coverage(
     conn = get_conn()
 
     sort_clause = {
-        "name": "r.company_name ASC NULLS LAST",
+        "name": "r.name ASC NULLS LAST",
         "freshness": "r.last_checked_at ASC NULLS FIRST",
         "docs": "doc_types_count DESC",
     }[sort]
@@ -155,7 +155,7 @@ def krs_coverage(
     base_query = f"""
         SELECT
             r.krs,
-            r.company_name,
+            r.name AS company_name,
             r.legal_form,
             r.first_seen_at,
             r.last_checked_at,
@@ -164,9 +164,9 @@ def krs_coverage(
             ARRAY_AGG(DISTINCT d.rodzaj) FILTER (WHERE d.rodzaj IS NOT NULL) AS doc_types_present,
             COUNT(DISTINCT d.okres_end)
                 FILTER (WHERE d.rodzaj = '18') AS financial_periods
-        FROM krs_registry r
+        FROM krs_companies r
         LEFT JOIN krs_documents_current d ON d.krs = r.krs
-        GROUP BY r.krs, r.company_name, r.legal_form,
+        GROUP BY r.krs, r.name, r.legal_form,
                  r.first_seen_at, r.last_checked_at, r.check_error_count
         {filter_clause}
     """
@@ -216,13 +216,16 @@ def krs_detail(
 
     # Company info
     company_cur = conn.execute(
-        "SELECT * FROM krs_registry WHERE krs = %s", (krs,)
+        "SELECT * FROM krs_companies WHERE krs = %s", (krs,)
     )
     company_row = company_cur.fetchone()
     company = None
     if company_row:
         cols = [desc[0] for desc in company_cur.description]
         company = dict(zip(cols, company_row))
+        # Alias name -> company_name so legacy response consumers keep working.
+        if "name" in company and "company_name" not in company:
+            company["company_name"] = company["name"]
         for k, v in company.items():
             if hasattr(v, "isoformat"):
                 company[k] = v.isoformat()
@@ -339,19 +342,20 @@ async def _do_refresh(krs: str) -> None:
                 break
             page += 1
 
-        # Upsert into krs_registry
+        # Upsert into krs_companies (the post-dedupe unified entity table)
         podmiot = lookup.get("podmiot", {})
         with get_db() as conn:
             conn.execute(
                 """
-                INSERT INTO krs_registry (krs, company_name, legal_form, first_seen_at, last_checked_at)
-                VALUES (%s, %s, %s, current_timestamp, current_timestamp)
+                INSERT INTO krs_companies (krs, name, legal_form, first_seen_at, last_checked_at, synced_at)
+                VALUES (%s, %s, %s, current_timestamp, current_timestamp, current_timestamp)
                 ON CONFLICT (krs) DO UPDATE SET
-                    company_name = EXCLUDED.company_name,
+                    name = EXCLUDED.name,
                     legal_form = EXCLUDED.legal_form,
-                    last_checked_at = current_timestamp
+                    last_checked_at = current_timestamp,
+                    synced_at = current_timestamp
                 """,
-                (krs, podmiot.get("nazwaPodmiotu"), podmiot.get("formaPrawna")),
+                (krs, podmiot.get("nazwaPodmiotu", ""), podmiot.get("formaPrawna")),
             )
 
         # Persist documents via scraper_db.insert_documents (append-only/idempotent)

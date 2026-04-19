@@ -1,4 +1,9 @@
-"""Tests for batch/entity_store.py — append-only entity versioning."""
+"""Tests for batch/entity_store.py.
+
+Post SCHEMA_DEDUPE_PLAN #2 there is no append-only version history — a
+single krs_companies row captures the latest state. The filename is kept
+for git-history stability; the contents verify the collapsed contract.
+"""
 
 import pytest
 
@@ -8,7 +13,9 @@ from batch.entity_store import EntityStore
 
 @pytest.fixture()
 def store(pg_dsn, clean_pg):
-    return EntityStore(pg_dsn)
+    # init_schema=False because the krs_companies table is created by the
+    # dedupe/003 migration via the pg_schema_initialized session fixture.
+    return EntityStore(pg_dsn, init_schema=False)
 
 
 @pytest.fixture()
@@ -22,67 +29,53 @@ def db(store):
             finally:
                 conn.close()
 
-        def versions(self, krs):
-            rows = self.query(
-                "SELECT * FROM krs_entity_versions WHERE krs = %s ORDER BY version_id",
-                [krs],
-            )
+        def companies(self, krs):
             conn = make_connection(store._dsn)
-            cols = [d[0] for d in conn.execute("SELECT * FROM krs_entity_versions LIMIT 0").description]
-            conn.close()
-            return [dict(zip(cols, r)) for r in rows]
+            try:
+                cur = conn.execute("SELECT * FROM krs_companies WHERE krs = %s", [krs])
+                rows = cur.fetchall()
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in rows]
+            finally:
+                conn.close()
 
     return _DB()
 
 
-def test_first_upsert_creates_version(store, db):
+def test_first_upsert_creates_row(store, db):
     store.upsert_entity("0000000001", "Test Corp", legal_form="SA")
-    versions = db.versions("0000000001")
-    assert len(versions) == 1
-    assert versions[0]["is_current"] is True
-    assert versions[0]["name"] == "Test Corp"
+    rows = db.companies("0000000001")
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Test Corp"
+    assert rows[0]["legal_form"] == "SA"
 
 
-def test_identical_upsert_no_new_version(store, db):
+def test_identical_upsert_stays_single_row(store, db):
     store.upsert_entity("0000000002", "Stable Corp", raw={"a": 1})
     store.upsert_entity("0000000002", "Stable Corp", raw={"a": 1})
-    versions = db.versions("0000000002")
-    assert len(versions) == 1
+    rows = db.companies("0000000002")
+    assert len(rows) == 1
 
 
-def test_different_data_creates_new_version(store, db):
+def test_changed_data_overwrites_in_place(store, db):
     store.upsert_entity("0000000003", "Name A")
     store.upsert_entity("0000000003", "Name B")
-    versions = db.versions("0000000003")
-    assert len(versions) == 2
-    current = [v for v in versions if v["is_current"]]
-    assert len(current) == 1
-    assert current[0]["name"] == "Name B"
-    old = [v for v in versions if not v["is_current"]]
-    assert old[0]["valid_to"] is not None
-
-
-def test_krs_registry_still_populated(store, db):
-    store.upsert_entity("0000000004", "Registry Corp", legal_form="SP. Z O.O.")
-    rows = db.query("SELECT company_name FROM krs_registry WHERE krs = '0000000004'")
+    rows = db.companies("0000000003")
     assert len(rows) == 1
-    assert rows[0][0] == "Registry Corp"
+    assert rows[0]["name"] == "Name B"
 
 
-def test_legacy_cache_removed(store, db):
-    """DB-003: Legacy krs_entities table is no longer written to."""
-    store.upsert_entity("0000000005", "Cache Corp")
-    # Data should be in krs_entity_versions, not krs_entities
-    versions = db.versions("0000000005")
-    assert len(versions) == 1
-    assert versions[0]["name"] == "Cache Corp"
+def test_source_is_rdf_batch(store, db):
+    """EntityStore writes come from the batch scanner, source = 'rdf_batch'."""
+    store.upsert_entity("0000000004", "Registry Corp", legal_form="SP. Z O.O.")
+    rows = db.companies("0000000004")
+    assert len(rows) == 1
+    assert rows[0]["source"] == "rdf_batch"
 
 
-def test_multiple_changes_only_one_current(store, db):
+def test_multiple_changes_final_value_wins(store, db):
     for i in range(4):
         store.upsert_entity("0000000006", f"Name {i}")
-    versions = db.versions("0000000006")
-    assert len(versions) == 4
-    current = [v for v in versions if v["is_current"]]
-    assert len(current) == 1
-    assert current[0]["name"] == "Name 3"
+    rows = db.companies("0000000006")
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Name 3"

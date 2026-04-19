@@ -81,16 +81,20 @@ async def start_sync_task() -> bool:
 
 
 def _discover_new_krs_numbers(limit: int) -> list[str]:
-    """Return KRS numbers in krs_registry that aren't yet in krs_entities."""
+    """Return KRS numbers that the scanner found but the sync job hasn't enriched yet.
+
+    Post-dedupe (SCHEMA_DEDUPE_PLAN #2) there's a single krs_companies table.
+    Scanner rows land with source = 'rdf_batch'; the sync job upgrades them
+    by rewriting source = 'ms_gov' via krs_repo.upsert_from_krs_entity.
+    """
     conn = scraper_db.get_conn()
     rows = conn.execute(
         """
-        SELECT r.krs
-        FROM krs_registry r
-        LEFT JOIN krs_entities_current e ON r.krs = e.krs
-        WHERE e.krs IS NULL
-          AND r.is_active = true
-        ORDER BY r.check_priority DESC, r.first_seen_at ASC
+        SELECT krs
+        FROM krs_companies
+        WHERE is_active = true
+          AND source = 'rdf_batch'
+        ORDER BY check_priority DESC, first_seen_at ASC
         LIMIT %s
         """,
         [limit],

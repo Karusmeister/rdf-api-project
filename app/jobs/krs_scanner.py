@@ -18,7 +18,6 @@ from app.adapters.exceptions import AdapterError, EntityNotFoundError, RateLimit
 from app.adapters.registry import get as get_adapter
 from app.config import settings
 from app.repositories import krs_repo
-from app.scraper import db as scraper_db
 
 logger = logging.getLogger(__name__)
 
@@ -151,11 +150,9 @@ async def _run_scan_inner(batch_size: int | None = None) -> dict:
         try:
             entity = await adapter.get_entity(krs_str)
             if entity is not None:
+                # Post-dedupe: krs_repo + scraper scheduling share one table,
+                # so a single upsert covers what used to be two writes.
                 krs_repo.upsert_from_krs_entity(entity, source="ms_gov_scan")
-                # Also upsert into krs_registry so krs_sync can re-enrich later
-                scraper_db.upsert_krs(
-                    entity.krs, entity.name, entity.legal_form, is_active=True,
-                )
                 valid_count += 1
             consecutive_errors = 0
         except EntityNotFoundError:

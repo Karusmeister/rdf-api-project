@@ -46,6 +46,7 @@ _ALL_TABLES = [
     "bankruptcy_events",
     "krs_document_versions",
     "krs_documents",
+    "krs_companies",
     "krs_entity_versions",
     "krs_entities",
     "krs_registry",
