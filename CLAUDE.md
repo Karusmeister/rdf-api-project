@@ -176,22 +176,18 @@ data/
 
 ## Database: PostgreSQL tables
 
-### Scraper tables (app/scraper/db.py)
-- `krs_registry` - KRS master list, scraper priority/scheduling
-- `krs_documents` - Documents per KRS (legacy cache; reads via `krs_documents_current` view)
-- `krs_document_versions` - Append-only document history. PK = version_id. UNIQUE(document_id, version_no). Includes `file_type` (xml/pdf/other/unknown).
-- `scraper_runs` - Scraper run history
+### KRS entity + document tables (dedupe schema, v1.2.x)
+Collapsed from `krs_entity_versions`/`krs_registry`/`krs_document_versions` on 2026-04-19. Append-only versioning was overhead (0% of "versions" were real content changes) and is gone. PK is the natural key, writes are UPSERTs, FKs enforce referential integrity.
 
-### KRS entity tables (app/repositories/krs_repo.py)
-- `krs_entities` - Legacy cache of KRS entity data. PK = krs VARCHAR(10). Reads via `krs_entities_current` view.
-- `krs_entity_versions` - Append-only entity history. PK = version_id. Indexed on (krs, is_current).
+- `krs_companies` (app/repositories/krs_repo.py, migrations/dedupe/003) — one row per KRS. PK = `krs` VARCHAR(10). Holds both KRS Open API enrichment (name, legal_form, NIP, REGON, …) and the scraper scheduling fields (priority, last_checked_at, etc.) that used to live in `krs_registry`.
+- `krs_documents` (app/scraper/db.py, migrations/dedupe/006) — immutable document discovery record. PK = `document_id` VARCHAR. Columns: krs, rodzaj (SMALLINT), nazwa, okres_start/end (DATE), filename, is_ifrs, is_correction, date_filed (DATE), is_deleted (BOOLEAN), discovered_at.
+- `krs_document_downloads` (migrations/dedupe/006) — mutable download-state row per document. PK = `document_id` VARCHAR, FK → `krs_documents(document_id)` ON DELETE CASCADE. Columns: is_downloaded, downloaded_at, storage_path, file_size_bytes, file_count, file_type (populated at download time in `mark_downloaded`), download_error, metadata_fetched_at, updated_at. Partial index `idx_downloads_pending` on `(document_id) WHERE NOT is_downloaded` is the worker hot query.
+- `scraper_runs` - Scraper run history
 - `krs_sync_log` - Sync run history (started_at, counts, status).
 - `krs_scan_cursor` - Single-row table tracking next KRS integer to probe. PK = boolean TRUE.
 - `krs_scan_runs` - One row per scanner invocation (krs_from/to, probed/valid/error counts, stopped_reason).
 
 ### Views
-- `krs_entities_current` - Current entity snapshot from `krs_entity_versions` (read path for all entity queries).
-- `krs_documents_current` - Current document snapshot from `krs_document_versions` (read path for all document queries). Includes `file_type`.
 - `latest_successful_financial_reports` - Latest completed report per logical key (used by feature engine).
 
 ### Search tables (migration 005)
@@ -205,7 +201,7 @@ data/
 Full DDL in `docs/PREDICTION_SCHEMA_DESIGN.md`. Summary:
 
 **Layer 1 - Entities:**
-- `companies` - Extended company data. PK = krs VARCHAR(10). Joins to krs_registry.krs.
+- `companies` - Extended company data. PK = krs VARCHAR(10). Joins to krs_companies.krs.
 - `etl_attempts` - Tracks every ETL ingestion attempt (completed/failed/skipped). PK = attempt_id.
 
 **Layer 2 - Financial data:**
@@ -438,10 +434,10 @@ bash scripts/pull_cloud_data.sh
     - Preflight TCP-check runs at startup, removing unreachable proxies. Dead proxies stored in `dead_proxies` table (6h TTL).
     - Strict production: `BATCH_USE_VPN=true BATCH_USE_PUBLIC_PROXIES=true BATCH_REQUIRE_VPN_ONLY=true`
     - Permissive local: `BATCH_USE_VPN=false` (all workers use direct, no proxy pool loaded)
-26. Company search uses GIN trigram index on `krs_registry.company_name` (requires `pg_trgm` extension). Migration 005 creates it.
+26. Company search uses GIN trigram index on `krs_companies.company_name` (requires `pg_trgm` extension). Migration 005 created it on `krs_registry`; after the dedupe cutover (2026-04-19) the scheduling fields collapsed into `krs_companies` and the index moved with them.
 27. Search results are TTL-cached (10 min, max 1000 entries) via `cachetools.TTLCache` in the companies router.
 28. `POST /api/predictions/{krs}/generate` delegates to the existing assessment pipeline (`assessment_service`). Max 5 concurrent pipelines enforced globally.
-29. `data_coverage` on the prediction response requires migration 006 (`file_type` column on `krs_document_versions`). Degrades gracefully if migration not yet applied.
+29. `data_coverage` on the prediction response reads `file_type` on `krs_document_downloads` (populated at download time by `mark_downloaded`).
 30. Health metrics endpoint (`/api/companies/{krs}/health-metrics`) computes revenue_growth from year-over-year `RZiS.A` change — first year always has `null` growth.
 31. **XAdES envelopes**: `.xades` files are treated as XML throughout the pipeline. `_unwrap_xades()` in `xml_parser.py` handles both inline XML and base64-encoded content. `_find_xml_in_dir()` in `etl.py` recognizes `.xades` extensions and unwraps XAdES during statement marker check.
 32. **RZiS net profit**: Health metrics SQL uses `COALESCE(RZiS.N, RZiS.L)` for net profit to handle both porównawczy (variant N) and kalkulacyjny (variant L) RZiS layouts.

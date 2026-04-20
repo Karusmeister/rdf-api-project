@@ -187,7 +187,7 @@ Most useful settings from [`.env.example`](/Users/piotrkraus/piotr/rdf-api-proje
 
 PostgreSQL tables are split by responsibility but share one database:
 
-- Scraper control-plane tables: `krs_registry`, `krs_documents`, `scraper_runs`
+- Entity + document tables: `krs_companies` (PK=krs), `krs_documents` (PK=document_id, immutable discovery), `krs_document_downloads` (PK=document_id, mutable download state, FK→krs_documents), `scraper_runs`
 - Prediction/ETL tables: `financial_reports`, `raw_financial_data`, `financial_line_items`, `computed_features`, and related metadata tables
 
 Downloaded documents are stored under `data/documents` like this:

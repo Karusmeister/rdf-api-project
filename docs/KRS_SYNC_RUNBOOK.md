@@ -2,7 +2,7 @@
 
 ## Overview
 
-The KRS sync job runs on a cron schedule (default: 3 AM daily), discovers new KRS numbers from the scraper's `krs_registry` table, enriches them via the MS KRS Open API, and stores the results in `krs_entities`.
+The KRS sync job runs on a cron schedule (default: 3 AM daily), discovers new KRS numbers from `krs_companies` (rows the scraper has seen but not yet enriched), enriches them via the MS KRS Open API, and upserts the results back into `krs_companies`.
 
 ## Configuration
 
@@ -102,4 +102,4 @@ curl http://localhost:8000/metrics/krs
 - **Idempotent:** Running the job twice with no upstream changes produces the same result.
 - **Concurrent-safe:** Only one run can execute at a time. A second trigger returns HTTP 409.
 - **Half-budget split:** Discovery (new KRS numbers) gets half the batch budget; re-enrichment of stale entities gets the other half.
-- **No search:** The KRS Open API has no search endpoint. Discovery relies on KRS numbers already present in `krs_registry` (populated by the scraper).
+- **No search:** The KRS Open API has no search endpoint. Discovery relies on KRS numbers already present in `krs_companies` (populated by the scanner + RDF document-discovery worker).

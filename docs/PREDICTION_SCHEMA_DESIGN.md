@@ -11,10 +11,12 @@
 
 ## Relationship to Existing System
 
-The shared PostgreSQL database already has `krs_registry`, `krs_documents`, and `scraper_runs`. We extend this same database with new tables for the prediction pipeline. The `krs_registry.krs` field is the natural join key between scraper and prediction layers.
+> **Schema state (2026-04-19, v1.2.x):** The dedupe cutover collapsed `krs_entity_versions`/`krs_registry` → `krs_companies` and split `krs_document_versions` → `krs_documents` (immutable discovery) + `krs_document_downloads` (mutable download state). Sections below that still say `krs_registry` describe the pre-cutover design; the current code joins to `krs_companies.krs`.
+
+The shared PostgreSQL database has `krs_companies`, `krs_documents`, `krs_document_downloads`, and `scraper_runs`. We extend this same database with new tables for the prediction pipeline. `krs_companies.krs` is the natural join key between entity metadata and prediction layers.
 
 ```
-[RDF API] --> [Scraper] --> [krs_registry + krs_documents (existing)]
+[RDF API] --> [Scraper] --> [krs_companies + krs_documents + krs_document_downloads]
                                      |
                                      v
                             [ETL: XML Parser] --> [Prediction tables in PostgreSQL]
@@ -26,7 +28,7 @@ The shared PostgreSQL database already has `krs_registry`, `krs_documents`, and 
                                                                     [Predictions API] <-- [Auth: JWT + KRS access control]
 ```
 
-`krs_registry` and `scraper_runs` remain operational control-plane tables for scheduling and monitoring. The append-only requirement applies to analytical source data and derived data, where auditability and reproducibility matter most.
+`krs_companies` and `scraper_runs` remain operational control-plane tables for scheduling and monitoring. The append-only requirement applies to analytical source data and derived data, where auditability and reproducibility matter most.
 
 ---
 
@@ -39,10 +41,10 @@ The shared PostgreSQL database already has `krs_registry`, `krs_documents`, and 
 > ETL failure tracking moved to a dedicated `etl_attempts` table.
 
 ```sql
--- Extended company data beyond what krs_registry stores
--- krs_registry remains the scraper's table; this adds ML-relevant fields
+-- Extended company data beyond what krs_companies stores
+-- krs_companies is the canonical entity table; this adds ML-relevant fields
 CREATE TABLE IF NOT EXISTS companies (
-    krs             VARCHAR(10) PRIMARY KEY,       -- FK concept to krs_registry.krs
+    krs             VARCHAR(10) PRIMARY KEY,       -- FK concept to krs_companies.krs
     nip             VARCHAR(13),
     regon           VARCHAR(14),
     pkd_code        VARCHAR(10),                   -- primary PKD code - key for sector-based models
@@ -409,7 +411,7 @@ training_matrix = df.pivot_table(
 
 ```
 1. Scraper downloads ZIP (existing) --> raw XML files on disk
-   [krs_registry, krs_documents tables - already exist]
+   [krs_companies, krs_documents, krs_document_downloads tables - already exist]
 
 2. ETL picks up downloaded XMLs --> parses via xml_parser --> inserts into:
    - companies (extended metadata: PKD, NIP, incorporation_date)
